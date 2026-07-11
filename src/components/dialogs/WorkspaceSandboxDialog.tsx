@@ -67,6 +67,32 @@ export function WorkspaceSandboxDialog() {
 
   if (!wsId) return null;
 
+  // Remote (ssh) workspaces run on another machine; the seatbelt cage
+  // is a local macOS mechanism, so there is nothing to configure here.
+  // Short-circuit to an explanatory panel instead of a form whose Save
+  // could never apply.
+  if (ws?.ssh) {
+    const host = ws.ssh.user ? `${ws.ssh.user}@${ws.ssh.host}` : ws.ssh.host;
+    return (
+      <AppDialog
+        open={!!wsId}
+        onOpenChange={(v) => { if (!v) close(); }}
+        title={`Sandbox · ${ws.name}`}
+        className="max-w-md text-[13px]"
+      >
+        <p className="text-[13px] leading-relaxed text-[var(--color-fg-dim)]">
+          This workspace runs on <span className="font-mono">{host}</span>.
+          The sandbox only protects local workspaces, so the agent runs
+          unsandboxed on the remote host. Use the machine's own isolation
+          (a dedicated user, container, or VM) if you need one.
+        </p>
+        <div className="mt-4 flex justify-end">
+          <Button variant="secondary" onClick={close}>Close</Button>
+        </div>
+      </AppDialog>
+    );
+  }
+
   // Has the form drifted from the saved workspace? Compare textareas
   // by their normalized line-array form (trim, drop blanks) so that
   // whitespace-only edits (an extra newline at the end) don't count

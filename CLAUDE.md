@@ -61,6 +61,7 @@ Deeper references — read when working in that area:
 - [docs/data-model.md](docs/data-model.md) — data dirs, Project/Workspace/Settings/Tab entities
 - [docs/performance.md](docs/performance.md) — perf traps, sub-pixel/rendering hardening
 - [docs/sandbox.md](docs/sandbox.md) — sandbox-exec + CONNECT proxy, YOLO interaction, deny debugging
+- [docs/remote.md](docs/remote.md) — remote (SSH) projects: transport, ControlMaster, quoting seams, v1 degradations
 - [docs/shortcuts.md](docs/shortcuts.md) — shortcut system architecture, adding shortcuts, glyph rendering
 - [docs/ui.md](docs/ui.md) — UI conventions, window chrome/drag, right-panel footer, settled detection
 - [docs/gotchas.md](docs/gotchas.md) — common bugs (encountered + fixed), React/Zustand traps

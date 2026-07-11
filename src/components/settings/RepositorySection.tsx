@@ -6,14 +6,15 @@
 import { useEffect, useRef, useState } from "react";
 import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
-import { projectUpdate, projectRemove, projectSetMembers, pathIsGitRepo, repoConfigLoad, repoConfigSave } from "@/lib/ipc";
+import { projectUpdate, projectRemove, projectSetMembers, pathIsGitRepo, projectSshProbe, repoConfigLoad, repoConfigSave } from "@/lib/ipc";
 import { stopSpotlight } from "@/lib/spotlight";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import type { Project, ProjectMember, RepoConfig } from "@/lib/types";
+import type { Project, ProjectMember, RepoConfig, SshTarget } from "@/lib/types";
+import { sshLabel } from "@/lib/remote";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Checkbox } from "@/components/ui/Checkbox";
-import { Trash2, Check, Layers, X, AudioWaveform } from "lucide-react";
+import { Trash2, Check, Layers, X, AudioWaveform, Server } from "lucide-react";
 import { ExcludeEditor } from "./ExcludeEditor";
 import { cn, cleanLines } from "@/lib/utils";
 import { isTerminalEntry } from "@/lib/agents";
@@ -56,6 +57,12 @@ export function RepositorySection({ projectId }: { projectId: string }) {
   // point every time.
   const [subTab, setSubTab] = useState<SubTab>("scripts");
   useEffect(() => { setSubTab("scripts"); setSandboxTarget("yaml"); setScriptTarget("yaml"); }, [projectId]);
+  // Remote (SSH) projects: Test-connection state for the More tab.
+  // Reset whenever any connection field changes so a stale "Connected"
+  // can't vouch for edited settings.
+  const [probe, setProbe] = useState<
+    { state: "idle" } | { state: "busy" } | { state: "ok" | "err"; msg: string }
+  >({ state: "idle" });
   const saveTimer = useRef<number | null>(null);
   const rcSaveTimer = useRef<number | null>(null);
   // Pending `.termic.yaml` payload, kept in a ref so a debounced save
@@ -301,6 +308,7 @@ export function RepositorySection({ projectId }: { projectId: string }) {
   }
 
   const isMulti = (draft.type ?? "single") === "multi";
+  const isRemote = !!draft.ssh;
   // For single-repo, files-to-copy source depends on which tab is active.
   const filesArr = isMulti || scriptTarget === "personal"
     ? (Array.isArray(draft.files_to_copy) ? draft.files_to_copy : [])
@@ -502,7 +510,12 @@ export function RepositorySection({ projectId }: { projectId: string }) {
               Spotlight
             </div>
 
-            {isMulti ? (
+            {isRemote ? (
+              <p className="text-[13px] text-[var(--color-fg-faint)]">
+                Spotlight is not available for remote projects. It syncs a
+                workspace into your main checkout, which lives on {sshLabel(draft.ssh)}.
+              </p>
+            ) : isMulti ? (
               <p className="text-[13px] text-[var(--color-fg-faint)]">
                 Spotlight is not supported for multi-repo projects.
               </p>
@@ -560,7 +573,18 @@ export function RepositorySection({ projectId }: { projectId: string }) {
         </div>
       )}
 
-      {subTab === "sandbox" && (
+      {subTab === "sandbox" && isRemote && (
+        <div>
+          <h2 className="text-[16px] font-medium">Sandbox</h2>
+          <p className="mt-1 max-w-xl text-[13px] leading-relaxed text-[var(--color-fg-dim)]">
+            The sandbox runs locally only. Workspaces in this project run
+            on {sshLabel(draft.ssh)}, so the agent is not sandboxed by
+            Termic there. Use the remote machine's own isolation
+            (a dedicated user, container, or VM) if you need one.
+          </p>
+        </div>
+      )}
+      {subTab === "sandbox" && !isRemote && (
         <div>
           <h2 className="text-[16px] font-medium">Sandbox</h2>
           <p className="mt-1 text-[12.5px] text-[var(--color-fg-dim)]">
@@ -692,14 +716,92 @@ export function RepositorySection({ projectId }: { projectId: string }) {
           />
           <Field
             label="Root path"
-            hint="The git repo on disk. Do not move or delete this directory; remove the project in Termic instead."
+            hint={isRemote
+              ? `The git repo on ${sshLabel(draft.ssh)}. Do not move or delete it there; remove the project in Termic instead.`
+              : "The git repo on disk. Do not move or delete this directory; remove the project in Termic instead."}
             control={<Input value={draft.root_path} readOnly className="font-mono opacity-70 cursor-not-allowed" />}
           />
-          <Field
-            label="Workspaces path"
-            hint="Where each new worktree lives. Don't move or delete subdirectories; archive workspaces in Termic instead."
-            control={<Input value={draft.workspaces_path} onChange={(e) => patch("workspaces_path", e.target.value)} className={cn("font-mono", flashRing("workspaces_path"))} />}
-          />
+          {isRemote && draft.ssh && (
+            <div className="rounded-md border border-[var(--color-border-soft)] p-4">
+              <div className="flex items-center gap-1.5 text-[13.5px] font-medium">
+                <Server className="h-3.5 w-3.5 text-[var(--color-fg-dim)]" /> SSH connection
+              </div>
+              <div className="mt-0.5 text-[12.5px] text-[var(--color-fg-dim)]">
+                Applies to NEW workspaces. Existing workspaces keep the
+                connection they were created with, so edits here can't
+                silently repoint live worktrees at a different machine.
+              </div>
+              <div className="mt-3 grid grid-cols-[2fr_1fr_5rem] gap-2">
+                <Field label="Host" control={
+                  <Input value={draft.ssh.host}
+                    onChange={(e) => { patch("ssh", { ...draft.ssh!, host: e.target.value }); setProbe({ state: "idle" }); }}
+                    className={cn("font-mono", flashRing("ssh"))} placeholder="raspi.local" />
+                } />
+                <Field label="User" control={
+                  <Input value={draft.ssh.user}
+                    onChange={(e) => { patch("ssh", { ...draft.ssh!, user: e.target.value }); setProbe({ state: "idle" }); }}
+                    className={cn("font-mono", flashRing("ssh"))} placeholder="(ssh config)" />
+                } />
+                <Field label="Port" control={
+                  <Input value={draft.ssh.port || ""}
+                    onChange={(e) => { patch("ssh", { ...draft.ssh!, port: Number.parseInt(e.target.value.replace(/\D/g, ""), 10) || 0 }); setProbe({ state: "idle" }); }}
+                    className={cn("font-mono", flashRing("ssh"))} placeholder="22" />
+                } />
+              </div>
+              <div className="mt-3">
+                <Field
+                  label="Identity file"
+                  hint="A specific private key for this host, overriding your ssh config. Blank = config and agent."
+                  control={
+                    <Input value={draft.ssh.identity_file}
+                      onChange={(e) => { patch("ssh", { ...draft.ssh!, identity_file: e.target.value }); setProbe({ state: "idle" }); }}
+                      className={cn("font-mono", flashRing("ssh"))} placeholder="~/.ssh/id_ed25519" />
+                  }
+                />
+              </div>
+              <div className="mt-3">
+                <Field
+                  label="Workspaces path on the host"
+                  hint="Where each new worktree lives on the remote machine."
+                  control={
+                    <Input value={draft.ssh.remote_workspaces_path}
+                      onChange={(e) => patch("ssh", { ...draft.ssh!, remote_workspaces_path: e.target.value })}
+                      className={cn("font-mono", flashRing("ssh"))} placeholder="~/termic/workspaces" />
+                  }
+                />
+              </div>
+              <div className="mt-3 flex items-center gap-3">
+                <Button
+                  variant="secondary" size="sm"
+                  disabled={!draft.ssh.host.trim() || probe.state === "busy"}
+                  onClick={async () => {
+                    setProbe({ state: "busy" });
+                    try {
+                      const info = await projectSshProbe(draft.ssh as SshTarget);
+                      setProbe({ state: "ok", msg: `Connected. ${info.git_version}, ${info.os}` });
+                    } catch (e) {
+                      setProbe({ state: "err", msg: String(e) });
+                    }
+                  }}
+                >
+                  {probe.state === "busy" ? "Connecting…" : "Test connection"}
+                </Button>
+                {probe.state === "ok" && (
+                  <span className="text-[12.5px] text-[var(--color-ok)]">{probe.msg}</span>
+                )}
+                {probe.state === "err" && (
+                  <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--color-err)]" title={probe.msg}>{probe.msg}</span>
+                )}
+              </div>
+            </div>
+          )}
+          {!isRemote && (
+            <Field
+              label="Workspaces path"
+              hint="Where each new worktree lives. Don't move or delete subdirectories; archive workspaces in Termic instead."
+              control={<Input value={draft.workspaces_path} onChange={(e) => patch("workspaces_path", e.target.value)} className={cn("font-mono", flashRing("workspaces_path"))} />}
+            />
+          )}
           <Field
             label="Branch new workspaces from"
             hint="Each workspace is an isolated copy of your codebase, branched off here."

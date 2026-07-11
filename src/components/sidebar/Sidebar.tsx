@@ -6,7 +6,7 @@ import { useApp, useWorkspaceTabs, useActiveTabId } from "@/store/app";
 import { usePrefs } from "@/store/prefs";
 import { Button } from "@/components/ui/Button";
 import { Tip } from "@/components/ui/Tooltip";
-import { LayoutGrid, History, FolderPlus, Settings, Plus, Archive, Layers, Moon, Cog, MoreVertical, GitBranchPlus, FolderGit2, ChevronRight, ChevronDown, Bell, Bug, Mail, Zap, X, Pencil, Copy, ChevronsDownUp, ChevronsUpDown, Check, AudioWaveform, Radio, SquareChevronRight, Loader2, EyeOff, Trash2, FolderOpen, Megaphone, Keyboard } from "lucide-react";
+import { LayoutGrid, History, FolderPlus, Settings, Plus, Archive, Layers, Moon, Cog, MoreVertical, GitBranchPlus, FolderGit2, ChevronRight, ChevronDown, Bell, Bug, Mail, Zap, X, Pencil, Copy, ChevronsDownUp, ChevronsUpDown, Check, AudioWaveform, Radio, SquareChevronRight, Loader2, EyeOff, Trash2, FolderOpen, Megaphone, Keyboard, Server } from "lucide-react";
 import { DropdownRoot, DropdownTrigger, DropdownMenu, DropdownItem, DropdownSeparator, DropdownLabel } from "@/components/ui/Dropdown";
 import { ContextMenuRoot, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuLabel } from "@/components/ui/ContextMenu";
 import { ProjectActionsMenuItems } from "./ProjectActionsMenuItems";
@@ -518,6 +518,14 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                               <Layers className="h-3 w-3 shrink-0 text-[var(--color-accent)]" />
                             </Tip>
                           )}
+                          {/* Remote (SSH) marker: same after-the-name slot.
+                              Static markup derived from the project object,
+                              no extra store subscriptions. */}
+                          {p.ssh && (
+                            <Tip content={`Remote project on ${p.ssh.user ? `${p.ssh.user}@` : ""}${p.ssh.host}`}>
+                              <Server className="h-3 w-3 shrink-0 text-[var(--color-accent)]" />
+                            </Tip>
+                          )}
                         </div>
                         {/* Trio of project-row actions revealed on hover.
                             Settings + Open-repo-as-workspace are hover-only
@@ -631,10 +639,14 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                       {p.spotlight_enabled ? "Disable spotlight" : "Enable spotlight"}
                     </ContextMenuItem>
                   )}
-                  <ContextMenuItem onSelect={() => openPath(p.root_path).catch(() => {})}>
-                    <FolderOpen />
-                    Reveal in Finder
-                  </ContextMenuItem>
+                  {/* Remote projects: the repo lives on the ssh host, so
+                      there is nothing for the local Finder to reveal. */}
+                  {!p.ssh && (
+                    <ContextMenuItem onSelect={() => openPath(p.root_path).catch(() => {})}>
+                      <FolderOpen />
+                      Reveal in Finder
+                    </ContextMenuItem>
+                  )}
                   <ContextMenuItem onSelect={() => navigator.clipboard.writeText(p.root_path).catch(() => {})}>
                     <Copy />
                     Copy path

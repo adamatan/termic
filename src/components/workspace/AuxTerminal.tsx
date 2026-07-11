@@ -171,21 +171,30 @@ export function AuxTerminal({ wsId, wsPath, active, autoFocus, onExited, onTitle
       });
       if (cancelled) return;
       try { fit.fit(); } catch {}
-      const shell = await loginShell();
+      // Remote (ssh) workspace: the scratch shell opens ON THE HOST at
+      // the workspace path (a remote path a local shell couldn't cd
+      // into). Rust wraps the spawn in `ssh -t` when workspace_id
+      // resolves to a remote workspace and remote_kind is "shell".
+      const isRemote = !!(wsId && useApp.getState().workspaces.find(w => w.id === wsId)?.ssh);
+      const shell = isRemote ? "" : await loginShell();
       if (cancelled) return;
       try {
         const { id: ptyId } = await ipc.ptySpawn({
-          cwd: wsPath, cmd: shell, args: ["-l"],
+          cwd: wsPath, cmd: shell, args: isRemote ? [] : ["-l"],
+          remote_kind: isRemote ? "shell" : undefined,
           // Signal terminal theme so prompts / status bars that honor
           // COLORFGBG (oh-my-zsh themes, starship, etc.) pick the right
           // colors for the current chrome.
           env: { COLORFGBG: currentColorFgBg() },
-          // NEVER pass workspace_id here. The aux shell is a scratch
-          // zsh for the user's own git/grep/etc work - sandboxing it
-          // would block exactly the moves the user opened it for
-          // (`gh pr create`, `kubectl get pods`, etc.). The agent CLI
-          // is the only thing we sandbox; everything else inside the
-          // workspace runs with the user's normal permissions.
+          // NEVER pass workspace_id for LOCAL workspaces. The aux shell
+          // is a scratch zsh for the user's own git/grep/etc work -
+          // sandboxing it would block exactly the moves the user opened
+          // it for (`gh pr create`, `kubectl get pods`, etc.). The agent
+          // CLI is the only thing we sandbox; everything else inside the
+          // workspace runs with the user's normal permissions. Remote
+          // workspaces DO pass it: Rust needs the workspace to find the
+          // ssh target, and remote is never sandboxed anyway.
+          workspace_id: isRemote ? wsId : undefined,
           rows: Math.max(8, term.rows), cols: Math.max(40, term.cols),
         });
         if (cancelled) { ipc.ptyKill(ptyId).catch(() => {}); return; }

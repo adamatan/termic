@@ -7,9 +7,9 @@ import { useApp } from "@/store/app";
 import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { projectAdd, projectAddMulti, discoverRepos, settingsLoad, pathIsGitRepo } from "@/lib/ipc";
-import type { DiscoveredRepo, Project, ProjectMember } from "@/lib/types";
-import { Folder, FolderPlus, Layers, X } from "lucide-react";
+import { projectAdd, projectAddMulti, projectAddRemote, projectSshProbe, discoverRepos, settingsLoad, pathIsGitRepo } from "@/lib/ipc";
+import type { DiscoveredRepo, Project, ProjectMember, SshTarget } from "@/lib/types";
+import { Folder, FolderPlus, Layers, Server, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Where a non-git folder is being added — drives the confirm copy. We no
@@ -40,8 +40,9 @@ export function NewProjectDialog() {
   const setProjectCollapsed = useApp(s => s.setProjectCollapsed);
   // Project type picker — defaults to "repo" (today's single-repo
   // flow). Switching to "multi" swaps the body to the host-picker +
-  // member-multi-select form. Both flows reuse the same Add button.
-  const [mode, setMode] = useState<"repo" | "multi">("repo");
+  // member-multi-select form; "remote" swaps to the SSH host + repo
+  // form (issue #82). All flows reuse the same Add button slot.
+  const [mode, setMode] = useState<"repo" | "multi" | "remote">("repo");
   const [path, setPath] = useState("");
   // Issue #4: add a plain folder (not a git repo). In repo mode the
   // folder becomes a repo-root-only project (agent runs at the folder).
@@ -68,6 +69,16 @@ export function NewProjectDialog() {
   // auto-created host dir name when no host path is given, and the
   // sidebar label always).
   const [multiName, setMultiName] = useState("");
+  // Remote (SSH) project form. Port kept as a string so the field can
+  // be empty ("defer to ssh config"); parsed on submit.
+  const [remote, setRemote] = useState({
+    host: "", user: "", port: "", identity: "", repoPath: "", workspacesPath: "",
+  });
+  // Test-connection state. "ok" carries the probe summary; "err" the
+  // ssh error so the user can fix host/auth before adding.
+  const [probe, setProbe] = useState<
+    { state: "idle" } | { state: "busy" } | { state: "ok" | "err"; msg: string }
+  >({ state: "idle" });
 
   useEffect(() => {
     if (!open) return;
@@ -77,6 +88,8 @@ export function NewProjectDialog() {
     setConfirm(null);
     setMemberRows([]);
     setMultiName("");
+    setRemote({ host: "", user: "", port: "", identity: "", repoPath: "", workspacesPath: "" });
+    setProbe({ state: "idle" });
     (async () => {
       try {
         const s = await settingsLoad();
@@ -174,6 +187,39 @@ export function NewProjectDialog() {
     await addMulti(ng);
   }
 
+  // Remote (SSH): assemble the SshTarget from the form. Empty user /
+  // port / identity defer to the user's ~/.ssh/config.
+  function remoteTarget(): SshTarget {
+    return {
+      host: remote.host.trim(),
+      user: remote.user.trim(),
+      port: Number.parseInt(remote.port, 10) || 0,
+      identity_file: remote.identity.trim(),
+      remote_workspaces_path: remote.workspacesPath.trim(),
+    };
+  }
+
+  async function testConnection() {
+    setProbe({ state: "busy" });
+    try {
+      const info = await projectSshProbe(remoteTarget());
+      setProbe({ state: "ok", msg: `Connected. ${info.git_version}, ${info.os}` });
+    } catch (e) {
+      setProbe({ state: "err", msg: String(e) });
+    }
+  }
+
+  async function handleAddRemote() {
+    setBusy(true); setErr(null);
+    try {
+      const proj = await projectAddRemote(remoteTarget(), remote.repoPath.trim());
+      setProjectCollapsed(proj.id, false);
+      await loadAll();
+      pushToast(`Added remote project “${proj.name}”`, "success");
+      close();
+    } catch (e) { setErr(String(e)); } finally { setBusy(false); }
+  }
+
   // Add an inline member from an existing project — copies its path /
   // git status / base / scripts / sandbox lists into a self-contained
   // member. The source project is NOT referenced; nothing is registered.
@@ -246,10 +292,11 @@ export function NewProjectDialog() {
           and the user reads "choose one of two", not "primary CTA +
           afterthought". Two-line tiles (icon + name + descriptor) make
           the difference obvious before committing. */}
-      <div className="mb-5 grid grid-cols-2 gap-2 text-[13px]">
+      <div className="mb-5 grid grid-cols-3 gap-2 text-[13px]">
         {([
           { id: "repo",  icon: Folder, label: "Repository",  hint: "One git repo. Worktrees branch off it." },
           { id: "multi", icon: Layers, label: "Multi-repo project", hint: "Several repos in one workspace. Shared memory across them." },
+          { id: "remote", icon: Server, label: "Remote (SSH)", hint: "A repo on another machine. Agents and worktrees run there." },
         ] as const).map(opt => {
           const active = mode === opt.id;
           const Ic = opt.icon;
@@ -275,7 +322,128 @@ export function NewProjectDialog() {
         })}
       </div>
 
-      {mode === "multi" ? (
+      {mode === "remote" ? (
+        <>
+          <p className="mb-3 text-[12.5px] leading-snug text-[var(--color-fg-dim)]">
+            A remote project points at a git repo on another machine over
+            SSH. Workspaces create their worktrees on that host, and the
+            agent, shell, file tree, and git panel all operate there. Auth
+            uses your <code className="mono">~/.ssh/config</code>, keys,
+            and agent; fields left blank defer to it.
+          </p>
+
+          <div className="grid grid-cols-[2fr_1fr_5rem] gap-2">
+            <label className="block text-[13.5px]">
+              Host
+              <Input
+                value={remote.host}
+                onChange={e => { setRemote(r => ({ ...r, host: e.target.value })); setProbe({ state: "idle" }); }}
+                placeholder="raspi.local or ssh-config alias"
+                className="mt-1.5"
+                autoFocus
+                autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+              />
+            </label>
+            <label className="block text-[13.5px]">
+              User <span className="text-[var(--color-fg-faint)]">(optional)</span>
+              <Input
+                value={remote.user}
+                onChange={e => { setRemote(r => ({ ...r, user: e.target.value })); setProbe({ state: "idle" }); }}
+                placeholder="pi"
+                className="mt-1.5"
+                autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+              />
+            </label>
+            <label className="block text-[13.5px]">
+              Port
+              <Input
+                value={remote.port}
+                onChange={e => { setRemote(r => ({ ...r, port: e.target.value.replace(/\D/g, "") })); setProbe({ state: "idle" }); }}
+                placeholder="22"
+                className="mt-1.5"
+                autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+              />
+            </label>
+          </div>
+
+          <label className="mt-4 block text-[13.5px]">
+            Identity file <span className="text-[var(--color-fg-faint)]">(optional)</span>
+            <div className="mt-1.5 flex gap-2">
+              <Input
+                value={remote.identity}
+                onChange={e => { setRemote(r => ({ ...r, identity: e.target.value })); setProbe({ state: "idle" }); }}
+                placeholder="~/.ssh/id_ed25519"
+                autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+              />
+              <Button variant="secondary" size="lg" onClick={async () => {
+                const sel = await openDialog({ directory: false, multiple: false });
+                if (typeof sel === "string") { setRemote(r => ({ ...r, identity: sel })); setProbe({ state: "idle" }); }
+              }}>Browse…</Button>
+            </div>
+            <span className="mt-1 block text-[11.5px] text-[var(--color-fg-faint)]">
+              A specific private key for this host, overriding what your ssh
+              config would pick. Leave blank to use your config and agent.
+            </span>
+          </label>
+
+          <label className="mt-4 block text-[13.5px]">
+            Repository path on the host
+            <Input
+              value={remote.repoPath}
+              onChange={e => setRemote(r => ({ ...r, repoPath: e.target.value }))}
+              placeholder="~/projects/my-repo"
+              className="mt-1.5"
+              autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+            />
+          </label>
+
+          <label className="mt-4 block text-[13.5px]">
+            Workspaces path on the host <span className="text-[var(--color-fg-faint)]">(optional)</span>
+            <Input
+              value={remote.workspacesPath}
+              onChange={e => setRemote(r => ({ ...r, workspacesPath: e.target.value }))}
+              placeholder="~/termic/workspaces"
+              className="mt-1.5"
+              autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+            />
+            <span className="mt-1 block text-[11.5px] text-[var(--color-fg-faint)]">
+              Where worktrees are created on the host. Defaults to{" "}
+              <code className="mono">~/termic/workspaces</code>.
+            </span>
+          </label>
+
+          {/* Test connection: one bounded round trip (reachability, git,
+              OS). Inline result so auth problems surface before Add. */}
+          <div className="mt-4 flex items-center gap-3">
+            <Button
+              variant="secondary"
+              disabled={!remote.host.trim() || probe.state === "busy"}
+              onClick={testConnection}
+            >
+              {probe.state === "busy" ? "Connecting…" : "Test connection"}
+            </Button>
+            {probe.state === "ok" && (
+              <span className="text-[12.5px] text-[var(--color-ok)]">{probe.msg}</span>
+            )}
+            {probe.state === "err" && (
+              <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--color-err)]" title={probe.msg}>{probe.msg}</span>
+            )}
+          </div>
+
+          {err && <p className="mt-2 text-[13.5px] text-[var(--color-err)]">{err}</p>}
+
+          <div className="mt-4 flex justify-end gap-2">
+            <Button variant="ghost" onClick={close}>Cancel</Button>
+            <Button
+              variant="primary"
+              disabled={!remote.host.trim() || !remote.repoPath.trim() || busy}
+              onClick={handleAddRemote}
+            >
+              <Server className="h-4 w-4" /> {busy ? "Adding…" : "Add remote"}
+            </Button>
+          </div>
+        </>
+      ) : mode === "multi" ? (
         <>
           <p className="mb-3 text-[12.5px] leading-snug text-[var(--color-fg-dim)]">
             A multi-repo project groups several repos under one workspace

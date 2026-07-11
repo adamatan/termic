@@ -43,7 +43,7 @@ export function expandPreviewUrl(project: Project | null, ws: Workspace, yamlUrl
   // dead Open button is worse than none.
   if (!tmpl) return null;
   const port = String(ws.port);
-  return tmpl
+  let url = tmpl
     .replaceAll("${TERMIC_PORT}",            port)
     .replaceAll("$TERMIC_PORT",              port)
     .replaceAll("${CONDUCTOR_PORT}",         port)
@@ -54,6 +54,16 @@ export function expandPreviewUrl(project: Project | null, ws: Workspace, yamlUrl
     .replaceAll("$TERMIC_WORKSPACE_NAME",    ws.name)
     .replaceAll("${CONDUCTOR_WORKSPACE_NAME}", ws.name)
     .replaceAll("$CONDUCTOR_WORKSPACE_NAME",   ws.name);
+  // Remote (ssh) workspace: the server runs on the host, so a localhost
+  // preview URL would point at THIS machine. Substitute the ssh host,
+  // which works for LAN boxes and hosts with the port reachable (no
+  // tunneling in v1).
+  if (ws.ssh?.host) {
+    url = url
+      .replaceAll("//localhost", `//${ws.ssh.host}`)
+      .replaceAll("//127.0.0.1", `//${ws.ssh.host}`);
+  }
+  return url;
 }
 
 /** All run-kind tabs of a workspace ("run", not "setup"). */

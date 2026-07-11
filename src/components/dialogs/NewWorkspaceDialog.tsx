@@ -91,7 +91,8 @@ export function NewWorkspaceDialog() {
   // Derived: any cage on. Drives the 2-column layout + "send lists" gating.
   // Repo-root mode has no sandbox (workspace_open_repo takes no sandbox args),
   // so force it off there — keeps the layout single-column + the panel hidden.
-  const sandbox = sandboxMode !== "off" && mode === "worktree";
+  // Remote projects: the cage is local-only, never applicable.
+  const sandbox = sandboxMode !== "off" && mode === "worktree" && !project?.ssh;
   // The sandbox lists. Initialized from the
   // project's defaults whenever projectId changes; the user edits
   // freely until Create. Stored as multi-line text - we convert to
@@ -771,8 +772,19 @@ export function NewWorkspaceDialog() {
             creation - lists below freeze onto the workspace and can't be
             edited after (archive + recreate to change). */}
         {/* Sandbox is worktree-only here: workspace_open_repo (repo-root)
-            takes no sandbox args, and multi keeps mode="worktree". */}
-        {mode === "worktree" && (
+            takes no sandbox args, and multi keeps mode="worktree".
+            Remote projects: the cage is local-only, so show why there is
+            no sandbox control instead of a selector that can't apply. */}
+        {mode === "worktree" && project?.ssh && (
+          <Field label="Sandbox" hint="">
+            <p className="text-[12.5px] leading-snug text-[var(--color-fg-faint)]">
+              This workspace will run on {project.ssh.user ? `${project.ssh.user}@` : ""}{project.ssh.host}.
+              The sandbox only protects local workspaces, so the agent runs
+              unsandboxed on the remote host.
+            </p>
+          </Field>
+        )}
+        {mode === "worktree" && !project?.ssh && (
         <Field label="Sandbox" hint="Cage the agent's filesystem + network access. Pinned at creation.">
           <SandboxModeSelector value={sandboxMode} onChange={setSandboxMode} osUnavailable={osSandboxOk === false} compact />
         </Field>

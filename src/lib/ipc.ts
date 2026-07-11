@@ -7,7 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Project, ProjectMember, Workspace, CreateWorkspaceArgs, CreateMultiArgs, Settings, DiscoveredRepo,
   ImportableWorktree, CliInfo, ChangeFile, Changes, GitStatus, FileEntry, Agent, RepoConfig,
-  SandboxMode,
+  SandboxMode, SshTarget, SshProbeInfo,
 } from "./types";
 import {
   COMPLETION_SOUND_SUPPORTED,
@@ -28,6 +28,13 @@ export const projectAddMulti = (rootPath: string, name: string, members: Project
   invoke<Project>("project_add_multi", { rootPath, name, members, nonGit });
 export const projectSetMembers = (id: string, members: ProjectMember[]) =>
   invoke<void>("project_set_members", { id, members });
+/** Add a remote project: an SSH host + a repo path ON THAT HOST (issue #82). */
+export const projectAddRemote = (target: SshTarget, rootPath: string) =>
+  invoke<Project>("project_add_remote", { target, rootPath });
+/** One bounded round trip to a host: reachable, git present, OS, $HOME.
+ *  Backs the "Test connection" button. Rejects with an `ssh: ` message. */
+export const projectSshProbe = (target: SshTarget) =>
+  invoke<SshProbeInfo>("project_ssh_probe", { target });
 export const projectUpdate  = (p: Project) => invoke<void>("project_update", { p });
 export const projectRemove  = (id: string) => invoke<void>("project_remove", { id });
 export const projectReorder = (ids: string[]) => invoke<void>("project_reorder", { ids });
@@ -279,8 +286,10 @@ export const agentsDefaults = () => invoke<import("@/lib/types").Agent[]>("agent
 /** Run a shell command in `cwd` via `sh -lc` and return trimmed stdout.
  *  Used by post_launch_capture to harvest the CLI's session ID after the
  *  agent creates its first session. */
-export const runCaptureCommand = (cmd: string, cwd: string) =>
-  invoke<string>("run_capture_command", { cmd, cwd });
+/** `workspaceId` routes the command over ssh when that workspace is
+ *  remote (the CLI's session files live on the host). */
+export const runCaptureCommand = (cmd: string, cwd: string, workspaceId?: string) =>
+  invoke<string>("run_capture_command", { cmd, cwd, workspaceId });
 export const workspaceDiff     = (id: string) => invoke<string>("workspace_diff", { id });
 export const workspaceSendDiffToMain = (id: string) =>
   invoke<{ tracked_files: number; untracked_files: number }>("workspace_send_diff_to_main", { id });
@@ -361,6 +370,13 @@ export interface SpawnArgs {
    *  host-pattern set the rendered SBPL profile uses. Defaults to the
    *  workspace's `cli` when omitted. */
   agent_id?: string;
+  /** Remote (ssh) workspaces only: how Rust shapes the command that
+   *  runs on the host. "agent" (default) execs cmd/args through a
+   *  remote login shell; "shell" opens a remote login shell (cmd/args
+   *  ignored); "custom" runs `cmd` as a raw command string then drops
+   *  back into a shell; "custom-once" ends the tab with the command.
+   *  Ignored for local workspaces. */
+  remote_kind?: "agent" | "shell" | "custom" | "custom-once";
 }
 
 /** Sandbox status returned alongside the PTY id - tells the caller
