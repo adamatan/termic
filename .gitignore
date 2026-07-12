@@ -105,6 +105,7 @@ $RECYCLE.BIN/
 # settings.local.json and other per-machine state stay ignored.
 .claude/*
 !.claude/skills/
+!.claude/agents/
 .antigravitycli/
 .cursorrules.local
 NOTES.local.md
