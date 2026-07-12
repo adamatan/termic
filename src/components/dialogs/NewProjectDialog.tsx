@@ -218,14 +218,18 @@ export function NewProjectDialog() {
   // after a newer one and clobber its result (unreachable hosts take up
   // to the 10s ConnectTimeout while fast edits keep firing new probes).
   const probeSeq = useRef(0);
+  const probeBusyRef = useRef(false);
   async function testConnection() {
     const seq = ++probeSeq.current;
+    probeBusyRef.current = true;
     setProbe({ state: "busy" });
     try {
       const info = await projectSshProbe(remoteTarget());
       if (probeSeq.current === seq) setProbe({ state: "ok", msg: `Connected. ${info.git_version}, ${info.os}` });
     } catch (e) {
       if (probeSeq.current === seq) setProbe({ state: "err", msg: String(e) });
+    } finally {
+      if (probeSeq.current === seq) probeBusyRef.current = false;
     }
   }
 
@@ -238,8 +242,16 @@ export function NewProjectDialog() {
     if (!open || mode !== "remote") return;
     setRemoteBrowse(null);
     if (!remote.host.trim()) return;
-    const id = window.setTimeout(() => { void testConnection(); }, 300);
-    return () => window.clearTimeout(id);
+    // While a probe is in flight, poll instead of stacking a new ssh
+    // process per keystroke pause; the seq guard already discards the
+    // stale RESULT, this avoids the stale PROCESSES (each can hang up
+    // to ConnectTimeout on a half-typed hostname).
+    const id = window.setInterval(() => {
+      if (probeBusyRef.current) return;
+      window.clearInterval(id);
+      void testConnection();
+    }, 300);
+    return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, mode, remote.host, remote.user, remote.port, remote.identity]);
 

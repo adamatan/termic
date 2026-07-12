@@ -1468,6 +1468,10 @@ fn pty_spawn(
             envs.push_str(&format!(" {}={}", k, ssh_exec::shq(v)));
         }
         for (k, v) in &args.env {
+            // Values are shq-quoted; KEYS are inlined raw, so only accept
+            // valid env identifiers (a metacharacter-bearing key would
+            // break out of the assignment).
+            if !env_key_is_valid(k) { continue; }
             envs.push_str(&format!(" {}={}", k, ssh_exec::shq(v)));
         }
         let body = match args.remote_kind.as_deref().unwrap_or("agent") {
@@ -1501,6 +1505,8 @@ fn pty_spawn(
         sargs.push("-o".into());
         sargs.push("EscapeChar=none".into());
         sargs.push("-t".into());
+        // `--` ends option parsing (see ssh_exec::run_remote_raw).
+        sargs.push("--".into());
         sargs.push(t.destination());
         sargs.push(script);
         dlog(&format!("[pty_spawn] remote spawn via ssh to {} kind={:?}", t.label(), args.remote_kind));
@@ -2334,7 +2340,17 @@ async fn project_remove(id: String) -> Result<(), String> {
             // archive script, removing the worktree, and saving archived=true.
             // Errors per-task are logged but don't abort — we want a
             // best-effort full cleanup even if one worktree is borked.
+            // EXCEPT remote tasks on an unreachable host: deleting their
+            // JSON here would permanently orphan worktrees/branches on the
+            // host with no record left to retry cleanup from.
+            let is_remote = w.ssh.is_some();
             if let Err(e) = task_archive_sync(w.id.clone(), false) {
+                if is_remote {
+                    return Err(format!(
+                        "cannot remove the project: task \"{}\" could not be cleaned up on its host ({}). Bring the host back online and retry, or archive the task manually first.",
+                        w.name, e
+                    ));
+                }
                 eprintln!("project_remove: archive {} failed: {}", w.id, e);
             }
             // Hard-delete the JSON so it doesn't linger as a ghost archived
@@ -2358,7 +2374,16 @@ fn tasks_list() -> Vec<Task> { load_tasks() }
 /// Branch is read from `git symbolic-ref` so the UI shows whichever branch
 /// the user has checked out in the actual repo.
 #[tauri::command]
-fn task_open_repo(project_id: String, cli: Option<String>, name: Option<String>, command: Option<String>) -> Result<Task, String> {
+async fn task_open_repo(project_id: String, cli: Option<String>, name: Option<String>, command: Option<String>) -> Result<Task, String> {
+    // async + spawn_blocking: for remote projects the HEAD read below is a
+    // network round trip; an unreachable host must not block the IPC
+    // thread (docs/ipc.md discipline).
+    tauri::async_runtime::spawn_blocking(move || task_open_repo_sync(project_id, cli, name, command))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn task_open_repo_sync(project_id: String, cli: Option<String>, name: Option<String>, command: Option<String>) -> Result<Task, String> {
     let proj = load_projects().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
     // CLI is now explicit — frontend's "+ Open repo with <agent>" passes the
@@ -2983,6 +3008,16 @@ fn task_create_remote_sync(
     let repo = proj.root_path.clone();
 
     let slug = slugify(&args.name);
+    let proj_slug = slugify(&proj.name);
+    // CRITICAL guard (mirrors task_create_sync): an empty slug would make
+    // wt_path the project's whole remote tasks directory, and the orphan
+    // cleanup below would `rm -rf` every worktree in the project.
+    if slug.is_empty() {
+        return Err("Task name must contain at least one letter or number.".into());
+    }
+    if proj_slug.is_empty() {
+        return Err("Project name must contain at least one letter or number.".into());
+    }
     let branch = args.branch
         .as_ref()
         .map(|b| b.trim())
@@ -3000,7 +3035,7 @@ fn task_create_remote_sync(
         target.remote_workspaces_path.clone()
     };
     let base_dir = ssh_exec::expand_remote_tilde(&target, &base_dir).map_err(|e| e.to_string())?;
-    let wt_path = format!("{}/{}/{}", base_dir, slugify(&proj.name), slug);
+    let wt_path = format!("{}/{}/{}", base_dir, proj_slug, slug);
 
     let _ = ssh_exec::git_on(host, &["worktree", "prune"], &repo);
 
@@ -3018,23 +3053,50 @@ fn task_create_remote_sync(
             target.label()
         ));
     }
+    // Existence probe distinguishes three states in one round trip:
+    //   "git"  = dir exists AND contains .git. Registered-check above said
+    //            no, but path canonicalization can disagree between the
+    //            probed $HOME and git's own view (symlinked /home, macOS
+    //            /var) — NEVER rm a dir that still looks like a worktree.
+    //   "yes"  = plain orphan dir from a failed create — safe to clear.
+    //   "no"   = clean slate.
     let exists = ssh_exec::run_remote(
         &target,
-        &format!("test -e {} && echo yes || echo no", ssh_exec::shq(&wt_path)),
+        &format!(
+            "if [ -e {p}/.git ]; then echo git; elif [ -e {p} ]; then echo yes; else echo no; fi",
+            p = ssh_exec::shq(&wt_path),
+        ),
         ssh_exec::QUICK,
         None,
     ).map_err(|e| e.to_string())?;
-    if exists.trim() == "yes" {
-        // Orphan from a prior failed create — clear it like local does.
-        ssh_exec::run_remote(&target, &format!("rm -rf {}", ssh_exec::shq(&wt_path)), ssh_exec::SLOW, None)
-            .map_err(|e| format!("orphan directory at {} couldn't be removed: {}", wt_path, e))?;
+    match exists.trim() {
+        "git" => {
+            return Err(format!(
+                "{} already exists on {} and looks like a live worktree. Remove it there first, or pick a different name.",
+                wt_path,
+                target.label()
+            ));
+        }
+        "yes" => {
+            // Orphan from a prior failed create — clear it like local does.
+            ssh_exec::run_remote(&target, &format!("rm -rf {}", ssh_exec::shq(&wt_path)), ssh_exec::SLOW, None)
+                .map_err(|e| format!("orphan directory at {} couldn't be removed: {}", wt_path, e))?;
+        }
+        _ => {}
     }
     ssh_exec::run_remote(
         &target,
-        &format!("mkdir -p {}", ssh_exec::shq(&format!("{}/{}", base_dir, slugify(&proj.name)))),
+        &format!("mkdir -p {}", ssh_exec::shq(&format!("{}/{}", base_dir, proj_slug))),
         ssh_exec::QUICK,
         None,
     ).map_err(|e| e.to_string())?;
+
+    // Best-effort fetch of the base ref before branching (parity with the
+    // local create path, issue #79/#86): bounded, never fatal — offline
+    // simply branches from the stale local ref like before.
+    if let Some((remote_name, base_ref)) = base_full.split_once('/') {
+        let _ = ssh_exec::git_on(host, &["fetch", "--prune", remote_name, base_ref], &repo);
+    }
 
     // Branch + worktree add, same --no-track rationale as the local flow.
     let branch_exists = ssh_exec::git_on(host, &["rev-parse", "--verify", &branch], &repo).is_ok();
@@ -3056,9 +3118,15 @@ fn task_create_remote_sync(
 
     // From here on, roll the worktree back on failure so a half-created
     // task never persists.
+    let rollback_branch = branch.clone();
     let rollback = || {
         let _ = ssh_exec::git_on(host, &["worktree", "remove", "--force", &wt_path], &repo);
         let _ = ssh_exec::run_remote(&target, &format!("rm -rf {}", ssh_exec::shq(&wt_path)), ssh_exec::SLOW, None);
+        // Also drop a branch WE created this call, so a retry re-branches
+        // from the (freshly fetched) base instead of reusing a stale tip.
+        if !branch_exists {
+            let _ = ssh_exec::git_on(host, &["branch", "-D", &rollback_branch], &repo);
+        }
     };
 
     // files_to_copy: both ends live on the host, so this is a plain
@@ -3070,9 +3138,14 @@ fn task_create_remote_sync(
     if !pats.is_empty() {
         let mut script = format!("cd {} || exit 1\n", ssh_exec::shq(&repo));
         for pat in &pats {
-            // Reject patterns that could escape the quoting scheme;
-            // config-supplied, but be strict anyway.
-            if pat.contains('\'') || pat.contains('\n') { continue; }
+            // The pattern is the ONE token that must stay unquoted (the
+            // remote shell expands the glob), so it gets an allowlist
+            // instead of shq: glob syntax and path characters only. Any
+            // shell metacharacter ($ ` ; | & > < ( ) space quotes)
+            // skips the pattern. files_to_copy is the user's own project
+            // config, but the module's quoting invariant shouldn't have
+            // a trusted-input exception.
+            if !glob_pattern_is_safe(pat) { continue; }
             script.push_str(&format!(
                 "for f in {pat}; do if [ -e \"$f\" ] || [ -L \"$f\" ]; then mkdir -p {ws}/\"$(dirname \"$f\")\"; cp -R \"$f\" {ws}/\"$f\"; fi; done\n",
                 pat = pat,
@@ -4751,7 +4824,8 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
         if listed.lines().any(|l| l.strip_prefix("worktree ").map(|p| p == rpath).unwrap_or(false)) {
             return Err(format!("a worktree already lives at {} on {}", rpath, t.label()));
         }
-        let _ = ssh_exec::run_remote(&t, &format!("rm -rf {}", ssh_exec::shq(&rpath)), ssh_exec::SLOW, None);
+        ssh_exec::run_remote(&t, &format!("rm -rf {}", ssh_exec::shq(&rpath)), ssh_exec::SLOW, None)
+            .map_err(|e| format!("could not clear {} on {}: {}", rpath, t.label(), e))?;
         let parent = rpath.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or_default();
         if !parent.is_empty() {
             let _ = ssh_exec::run_remote(&t, &format!("mkdir -p {}", ssh_exec::shq(&parent)), ssh_exec::QUICK, None);
@@ -4959,7 +5033,10 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
 }
 
 #[tauri::command]
-fn task_run_script(id: String, which: String) -> Result<String, String> {
+async fn task_run_script(id: String, which: String) -> Result<String, String> {
+    // async + spawn_blocking: the remote path is a bounded ssh round trip,
+    // and even the local path can run arbitrarily long user scripts.
+    tauri::async_runtime::spawn_blocking(move || {
     let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no such task")?;
     let p = load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
     let (setup, run, archive) = effective_scripts(&p);
@@ -4973,6 +5050,9 @@ fn task_run_script(id: String, which: String) -> Result<String, String> {
         return Err("script empty".into());
     }
     run_script(w.ssh.as_ref(), &script, &w.path, w.port, &w.name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -5363,10 +5443,36 @@ async fn task_git_status(id: String) -> Result<GitStatus, String> {
         let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let remote = w.ssh.is_some();
 
+        // Remote tasks: ONE batched round trip for status + branch + last
+        // message (sentinel-delimited), instead of three sequential ssh
+        // execs per poll tick. Transport failure PROPAGATES as an error --
+        // swallowing it into empty output would render a clean-looking
+        // panel and clear the reconnect banner while the host is down.
+        let remote_batch: Option<(String, String, String)> = if let Some(t) = &w.ssh {
+            let raw = ssh_exec::run_remote(
+                t,
+                &format!(
+                    "cd {p} && git status --porcelain -uall; printf '\\n@@S@@\\n'; git -C {p} branch --show-current; printf '@@S@@\\n'; git -C {p} log -1 --pretty=%B 2>/dev/null || true",
+                    p = ssh_exec::shq(&w.path),
+                ),
+                ssh_exec::QUICK,
+                None,
+            ).map_err(|e| e.to_string())?;
+            let mut parts = raw.splitn(3, "@@S@@\n");
+            let status = parts.next().unwrap_or("").trim_end_matches('\n').to_string();
+            let branch = parts.next().unwrap_or("").trim().to_string();
+            let msg = parts.next().unwrap_or("").trim_end().to_string();
+            Some((status, branch, msg))
+        } else {
+            None
+        };
+
         let branch_of = |cwd: &str| -> String {
+            if let Some((_, b, _)) = &remote_batch { return b.clone(); }
             wgit(&w, &["branch", "--show-current"], cwd).map(|s| s.trim().to_string()).unwrap_or_default()
         };
         let last_msg = |cwd: &str| -> String {
+            if let Some((_, _, m)) = &remote_batch { return m.clone(); }
             wgit(&w, &["log", "-1", "--pretty=%B"], cwd).map(|s| s.trim_end().to_string()).unwrap_or_default()
         };
         let build = |name: String, dir_name: String, kind: &str, cwd: &str| -> GitRepo {
@@ -5374,7 +5480,11 @@ async fn task_git_status(id: String) -> Result<GitStatus, String> {
             // Without it git collapses a brand-new folder to a single
             // "docs/foo/" entry (trailing slash = directory), which the UI
             // then treats as a file: blank name in the tree, empty diff.
-            let out = wgit(&w, &["status", "--porcelain", "-uall"], cwd).unwrap_or_default();
+            let out = if let Some((st, _, _)) = &remote_batch {
+                st.clone()
+            } else {
+                wgit(&w, &["status", "--porcelain", "-uall"], cwd).unwrap_or_default()
+            };
             let mut staged = Vec::new();
             let mut unstaged = Vec::new();
             let mut seen = std::collections::HashSet::new();
@@ -5606,17 +5716,28 @@ fn remote_read_file(t: &SshTarget, abs: &str) -> Result<String, String> {
     }
 }
 
-/// Write a file on a remote task host: staged through a temp file
-/// + `mv` so a dropped connection can't leave a truncated file.
+/// Write a file on a remote task host: staged through a UNIQUE temp file,
+/// byte-count-verified, then `mv`'d into place. The count check means a
+/// dropped connection (remote cat sees EOF and exits 0 on a partial
+/// payload) can never install truncated content; the uuid temp name means
+/// concurrent saves of the same file can't corrupt each other's staging.
 fn remote_write_file(t: &SshTarget, abs: &str, content: &[u8]) -> Result<(), String> {
+    let tmp = format!("{abs}.{}.termic-tmp", Uuid::new_v4());
     let script = format!(
-        "cat > {tmp} && mv {tmp} {p}",
-        tmp = ssh_exec::shq(&format!("{abs}.termic-tmp")),
+        "cat > {tmp}; if [ \"$(wc -c < {tmp})\" -eq {n} ]; then mv {tmp} {p}; else rm -f {tmp}; exit 43; fi",
+        tmp = ssh_exec::shq(&tmp),
         p = ssh_exec::shq(abs),
+        n = content.len(),
     );
     ssh_exec::run_remote(t, &script, ssh_exec::QUICK, Some(content))
         .map(|_| ())
-        .map_err(|e| format!("write failed: {e}"))
+        .map_err(|e| {
+            if e.to_string().contains("exit 43") {
+                format!("write failed: the upload arrived incomplete on {} (connection dropped mid-save). The file was left untouched.", t.label())
+            } else {
+                format!("write failed: {e}")
+            }
+        })
 }
 
 /// Resolve a renderer-supplied path against a task root and verify the
@@ -5715,14 +5836,39 @@ fn check_task_path_existence(ws_path: &Path, rel: &str) -> Result<PathStat, Stri
 }
 
 #[tauri::command]
-fn task_path_stat(id: String, path: String) -> Result<PathStat, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no ws")?;
-    // Unlike a diff/read, "is this a directory" is a sensible question for a
-    // path that's exactly a composition member's own root (e.g. a markdown
-    // link's `..`/`/` resolves there per resolveTaskHref's member-floor
-    // scoping) — allow it rather than erroring.
-    let (cwd, rel) = resolve_task_git_path_ex(&w, &path, true)?;
-    check_task_path_existence(Path::new(&cwd), &rel)
+async fn task_path_stat(id: String, path: String) -> Result<PathStat, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no ws")?;
+        // Unlike a diff/read, "is this a directory" is a sensible question for a
+        // path that's exactly a composition member's own root (e.g. a markdown
+        // link's `..`/`/` resolves there per resolveTaskHref's member-floor
+        // scoping) — allow it rather than erroring.
+        let (cwd, rel) = resolve_task_git_path_ex(&w, &path, true)?;
+        if let Some(t) = &w.ssh {
+            // One bounded round trip; keeps markdown link clicks working
+            // for remote tasks.
+            let abs = if rel.is_empty() { cwd.clone() } else {
+                format!("{}/{}", cwd, safe_remote_rel(&rel)?)
+            };
+            let out = ssh_exec::run_remote(
+                t,
+                &format!(
+                    "if [ -d {p} ]; then echo d; elif [ -e {p} ]; then echo f; else echo n; fi",
+                    p = ssh_exec::shq(&abs),
+                ),
+                ssh_exec::QUICK,
+                None,
+            ).map_err(|e| e.to_string())?;
+            return Ok(match out.trim() {
+                "d" => PathStat { exists: true, is_dir: true },
+                "f" => PathStat { exists: true, is_dir: false },
+                _ => PathStat { exists: false, is_dir: false },
+            });
+        }
+        check_task_path_existence(Path::new(&cwd), &rel)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Read `abs` capped at `cap` bytes, TOCTOU-safe: the size/type check runs
@@ -5820,6 +5966,11 @@ struct Base64Read {
 /// `load_tasks()`.
 fn task_file_read_base64_for_task(w: &Task, path: &str, known_fp: Option<&str>) -> Result<Base64Read, String> {
     use base64::Engine as _;
+    if w.ssh.is_some() {
+        // v1 degradation: image/PDF preview reads the local disk; a clear
+        // message beats a confusing canonicalize error on a remote path.
+        return Err("Image and PDF preview is not available for remote tasks yet.".into());
+    }
     let (cwd, rel) = resolve_task_git_path(w, path)?;
     let abs = safe_task_path(Path::new(&cwd), &rel)?;
     let mime = preview_mime_for_ext(&abs).ok_or_else(|| format!("not previewable: {path}"))?;
@@ -5871,6 +6022,9 @@ async fn task_file_read_base64(id: String, path: String, known_fp: Option<String
 /// `task_file_read_base64_for_task`) so tests can exercise it with an
 /// in-memory `Task`.
 fn read_preview_file_for_task(w: &Task, path: &str) -> Result<(Vec<u8>, &'static str), String> {
+    if w.ssh.is_some() {
+        return Err("Image and PDF preview is not available for remote tasks yet.".into());
+    }
     let (cwd, rel) = resolve_task_git_path(w, path)?;
     let abs = safe_task_path(Path::new(&cwd), &rel)?;
     let mime = preview_mime_for_ext(&abs).ok_or_else(|| format!("not previewable: {path}"))?;
@@ -6504,6 +6658,25 @@ async fn task_list_files_for_finder(id: String) -> Result<Vec<String>, String> {
 
 // ───────────────────────────── helpers ─────────────────────────────
 
+/// Charset allowlist for a files_to_copy glob that is deliberately left
+/// unquoted in a remote shell (the shell must expand it). Glob syntax and
+/// path characters only — anything else (shell metacharacters, whitespace,
+/// control bytes) disqualifies the pattern.
+/// Valid POSIX env-var identifier: `[A-Za-z_][A-Za-z0-9_]*`. Keys that
+/// fail this are skipped when inlined into a remote command line.
+fn env_key_is_valid(k: &str) -> bool {
+    let mut chars = k.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn glob_pattern_is_safe(pat: &str) -> bool {
+    !pat.is_empty()
+        && pat.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '*' | '?' | '[' | ']' | '!')
+        })
+}
+
 fn slugify(s: &str) -> String {
     s.trim()
         .to_lowercase()
@@ -6629,11 +6802,15 @@ fn script_command_for(
             use std::fmt::Write;
             let mut remote = format!("cd {} && env", ssh_exec::shq(cwd));
             for (k, v) in envs {
+                // Keys are inlined raw (values are quoted) — identifier
+                // charset only, same rule as the PTY spawn.
+                if !env_key_is_valid(k) { continue; }
                 let _ = write!(&mut remote, " {}={}", k, ssh_exec::shq(v));
             }
             let _ = write!(&mut remote, " bash -lc {}", ssh_exec::shq(script));
             let mut cmd = Command::new("ssh");
             cmd.args(ssh_exec::ssh_base_args(t, true));
+            cmd.arg("--");
             cmd.arg(t.destination());
             // sh -c wrapper: the remote LOGIN shell may be fish/csh; the
             // single-quoted payload parses the same everywhere and then
@@ -6665,7 +6842,27 @@ fn run_script(ssh: Option<&SshTarget>, script: &str, cwd: &str, port: u16, name:
         ("TERMIC_WORKSPACE_NAME", name.to_string()),
         ("TERMIC_TASK", name.to_string()),
     ];
-    let mut cmd = script_command_for(ssh, script, cwd, &envs);
+    // Remote: go through run_remote_raw so the hard wall-clock deadline
+    // applies — a hung host must never pin a blocking thread forever
+    // (cmd.output() has no timeout).
+    if let Some(t) = ssh {
+        use std::fmt::Write;
+        let mut remote = format!("cd {} && env", ssh_exec::shq(cwd));
+        for (k, v) in &envs {
+            if env_key_is_valid(k) {
+                let _ = write!(&mut remote, " {}={}", k, ssh_exec::shq(v));
+            }
+        }
+        let _ = write!(&mut remote, " bash -lc {}", ssh_exec::shq(script));
+        let out = ssh_exec::run_remote_raw(t, &remote, ssh_exec::SLOW, None)?;
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        combined.push_str(&out.stderr);
+        if out.code != 0 {
+            return Err(anyhow!("script exit {}:\n{combined}", out.code));
+        }
+        return Ok(combined);
+    }
+    let mut cmd = script_command_for(None, script, cwd, &envs);
     let out = cmd.output().with_context(|| "run script")?;
     let mut s = String::new();
     s.push_str(&String::from_utf8_lossy(&out.stdout));
@@ -7602,6 +7799,7 @@ fn task_grep_start(
                     );
                     let mut c = std::process::Command::new("ssh");
                     c.args(ssh_exec::ssh_base_args(t, true));
+                    c.arg("--");
                     c.arg(t.destination());
                     // sh -c wrapper: login shell may be fish/csh.
                     c.arg(format!("sh -c {}", ssh_exec::shq(&script)));
@@ -9286,11 +9484,13 @@ fn cleanup_children(app: &tauri::AppHandle) {
     //    the app dies without reaching this.
     {
         let mut seen = HashSet::new();
-        for p in load_projects() {
-            if let Some(t) = &p.ssh {
-                if seen.insert(t.cache_key()) {
-                    ssh_exec::control_exit(t);
-                }
+        for t in load_projects().into_iter().filter_map(|p| p.ssh)
+            .chain(load_tasks().into_iter().filter_map(|w| w.ssh))
+        {
+            // Tasks carry FROZEN targets that can differ from their
+            // project's current one (edited or removed) — cover both.
+            if seen.insert(t.cache_key()) {
+                ssh_exec::control_exit(&t);
             }
         }
     }
@@ -9837,6 +10037,26 @@ mod tests {
         assert!(s.contains("secrets.env"));
         assert!(s.contains("/y"));
         assert!(!s.contains("/x"));
+    }
+
+    #[test]
+    fn glob_pattern_guard_blocks_shell_metacharacters() {
+        for ok in [".env*", ".venv", "node_modules", "src/config/*.json", "a-b_c.d", "[ab]?"] {
+            assert!(glob_pattern_is_safe(ok), "should allow {ok}");
+        }
+        for bad in ["$(id)", "`id`", "a;b", "a|b", "a&b", "a>b", "a<b", "a b", "a'b", "a\"b", "a\nb", "", "a\\b", "~x"] {
+            assert!(!glob_pattern_is_safe(bad), "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn env_key_guard_accepts_identifiers_only() {
+        for ok in ["TERMIC_PORT", "_X", "COLORFGBG", "a1"] {
+            assert!(env_key_is_valid(ok));
+        }
+        for bad in ["1X", "A B", "A;B", "A=B", "", "A-B", "A$B"] {
+            assert!(!env_key_is_valid(bad));
+        }
     }
 
     #[test]

@@ -4,15 +4,7 @@
 
 import { useEffect, useMemo } from "react";
 import { useApp } from "@/store/app";
-import type { Project, SshTarget, Task } from "@/lib/types";
-
-export function isRemoteProject(p: Project | null | undefined): boolean {
-  return !!p?.ssh;
-}
-
-export function isRemoteTask(t: Task | null | undefined): boolean {
-  return !!t?.ssh;
-}
+import type { SshTarget } from "@/lib/types";
 
 /** `user@host` (or just `host`) for badges, tooltips, and error copy. */
 export function sshLabel(t: SshTarget | null | undefined): string {

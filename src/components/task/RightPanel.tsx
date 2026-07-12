@@ -10,6 +10,7 @@ import {
   taskGitStatus, taskRunScriptStream, openPath, repoConfigLoad, repoConfigLoadAt,
   taskSpotlightResync,
 } from "@/lib/ipc";
+import { isSshError } from "@/lib/remote";
 import { startSpotlight, stopSpotlight } from "@/lib/spotlight";
 import { launchRunTabs, expandPreviewUrl } from "@/lib/runTabs";
 import type { GitStatus, Task, TaskMember, Project, TerminalTab } from "@/lib/types";
@@ -115,19 +116,25 @@ export function RightPanel() {
   // instead of silently swallowing errors forever.
   const isRemote = !!task?.ssh;
   const [connLost, setConnLost] = useState<string | null>(null);
+  // In-flight guard: a slow host must not stack overlapping status
+  // fetches when the interval outpaces the round trip.
+  const gitFetchInFlight = useRef(false);
   // Poll git status (staged/unstaged split) for the Git tab badges + panel.
   // The fetch is reused by GitPanel via the `refreshGit` callback so a
   // stage/unstage/commit reflects immediately instead of waiting for the
   // poll tick.
   const refreshGit = React.useCallback(() => {
     if (!task) return;
+    if (gitFetchInFlight.current) return;
+    gitFetchInFlight.current = true;
     taskGitStatus(task.id)
       .then(s => { setGitStatus(s); setConnLost(null); })
       .catch(e => {
         // Only the ssh transport error flips the banner; a plain git
         // failure (mid-rebase etc.) stays quiet like before.
-        if (typeof e === "string" && e.startsWith("ssh: ")) setConnLost(e);
-      });
+        if (isSshError(e)) setConnLost(e as string);
+      })
+      .finally(() => { gitFetchInFlight.current = false; });
   }, [task?.id]);
   // Clear + reload ONLY on a real task switch (task.id), not on every
   // task-object re-patch (window refocus, attention/settled updates re-create the

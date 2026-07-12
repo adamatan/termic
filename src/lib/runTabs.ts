@@ -59,9 +59,11 @@ export function expandPreviewUrl(project: Project | null, task: Task, yamlUrl = 
   // which works for LAN boxes and hosts with the port reachable (no
   // tunneling in v1).
   if (task.ssh?.host) {
+    // Anchored: only replace the WHOLE host token (followed by :, /, or
+    // end), so "localhost.example.com" and "127.0.0.100" are untouched.
     url = url
-      .replaceAll("//localhost", `//${task.ssh.host}`)
-      .replaceAll("//127.0.0.1", `//${task.ssh.host}`);
+      .replace(/\/\/localhost(?=[:/]|$)/g, `//${task.ssh.host}`)
+      .replace(/\/\/127\.0\.0\.1(?=[:/]|$)/g, `//${task.ssh.host}`);
   }
   return url;
 }

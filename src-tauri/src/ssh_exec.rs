@@ -207,6 +207,10 @@ pub fn run_remote_raw(
 ) -> Result<RemoteOutput> {
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_base_args(t, true));
+    // `--` ends option parsing so a host value that starts with `-`
+    // (typo or hostile paste, e.g. "-oProxyCommand=...") can never be
+    // read as an ssh option.
+    cmd.arg("--");
     cmd.arg(t.destination());
     cmd.arg(format!("sh -c {}", shq(script)));
     // Same env treatment as the local `git()` helper: a GUI-launched
@@ -232,16 +236,20 @@ pub fn run_remote_raw(
             // pipe drops here -> remote sees EOF
         })
     });
-    let mut out_pipe = child.stdout.take().expect("piped stdout");
-    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let out_pipe = child.stdout.take().expect("piped stdout");
+    let err_pipe = child.stderr.take().expect("piped stderr");
+    // Cap what we buffer: a runaway remote command (giant diff, binary
+    // spew) should degrade to truncated output, not unbounded memory.
+    const STDOUT_CAP: u64 = 64 * 1024 * 1024;
+    const STDERR_CAP: u64 = 1024 * 1024;
     let out_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = out_pipe.read_to_end(&mut buf);
+        let _ = out_pipe.take(STDOUT_CAP).read_to_end(&mut buf);
         buf
     });
     let err_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf);
+        let _ = err_pipe.take(STDERR_CAP).read_to_end(&mut buf);
         buf
     });
 
@@ -311,7 +319,10 @@ pub fn git_on(host: ExecHost, args: &[&str], cwd: &str) -> Result<String> {
     match host {
         ExecHost::Local => crate::git(args, std::path::Path::new(cwd)),
         ExecHost::Remote(t) => {
-            let mut script = format!("git -C {}", shq(cwd));
+            // LC_ALL=C pins git's message locale: task-create matches
+            // English error substrings ("already used by worktree"), and
+            // a de_DE/fr_FR host would silently break those checks.
+            let mut script = format!("LC_ALL=C git -C {}", shq(cwd));
             for a in args {
                 script.push(' ');
                 script.push_str(&shq(a));
@@ -395,6 +406,7 @@ pub fn control_exit(t: &SshTarget) {
     if t.port != 0 {
         cmd.arg("-p").arg(t.port.to_string());
     }
+    cmd.arg("--");
     cmd.arg(t.destination());
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     if let Ok(mut child) = cmd.spawn() {
@@ -441,6 +453,7 @@ mod tests {
         assert_eq!(shq("it's"), "'it'\\''s'");
         assert_eq!(shq("''"), "''\\'''\\'''");
         // Round-trip through a real shell to prove the escaping.
+        #[cfg(unix)]
         for nasty in ["it's a 'test'", "a\"b'c$d`e\\f", "x'; rm -rf / #"] {
             let out = std::process::Command::new("sh")
                 .arg("-c")
@@ -456,6 +469,7 @@ mod tests {
         let t = SshTarget { host: "pi".into(), ..Default::default() };
         let a = ssh_base_args(&t, true);
         assert!(a.iter().any(|s| s == "BatchMode=yes"));
+        #[cfg(not(windows))]
         assert!(a.iter().any(|s| s.starts_with("ControlPath=")));
         assert!(!a.iter().any(|s| s == "-p"));
         assert!(!a.iter().any(|s| s == "-i"));
