@@ -8647,6 +8647,23 @@ mod tests {
     }
 
     #[test]
+    fn safe_remote_rel_normalizes_and_contains() {
+        // Plain paths pass through normalized.
+        assert_eq!(safe_remote_rel("src/main.rs").unwrap(), "src/main.rs");
+        assert_eq!(safe_remote_rel("./a/./b").unwrap(), "a/b");
+        assert_eq!(safe_remote_rel("a//b/").unwrap(), "a/b");
+        // Interior .. resolves as long as it stays inside the workspace.
+        assert_eq!(safe_remote_rel("a/b/../c").unwrap(), "a/c");
+        // Escapes are rejected loudly.
+        assert!(safe_remote_rel("../etc/passwd").is_err());
+        assert!(safe_remote_rel("a/../../etc").is_err());
+        assert!(safe_remote_rel("/etc/passwd").is_err());
+        assert!(safe_remote_rel("~/secrets").is_err());
+        assert!(safe_remote_rel("").is_err());
+        assert!(safe_remote_rel(".").is_err());
+    }
+
+    #[test]
     fn resolve_workspace_git_path_uses_host_repo_for_host_paths() {
         let host = tempdir().unwrap();
         let member = tempdir().unwrap();
