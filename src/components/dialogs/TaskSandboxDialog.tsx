@@ -67,6 +67,32 @@ export function TaskSandboxDialog() {
 
   if (!taskId) return null;
 
+  // Remote (ssh) tasks run on another machine; the seatbelt cage is a
+  // local macOS mechanism, so there is nothing to configure here.
+  // Short-circuit to an explanatory panel instead of a form whose Save
+  // could never apply.
+  if (task?.ssh) {
+    const host = task.ssh.user ? `${task.ssh.user}@${task.ssh.host}` : task.ssh.host;
+    return (
+      <AppDialog
+        open={!!taskId}
+        onOpenChange={(v) => { if (!v) close(); }}
+        title={`Sandbox · ${task.name}`}
+        className="max-w-md text-[13px]"
+      >
+        <p className="text-[13px] leading-relaxed text-[var(--color-fg-dim)]">
+          This task runs on <span className="font-mono">{host}</span>.
+          The sandbox only protects local tasks, so the agent runs
+          unsandboxed on the remote host. Use the machine's own isolation
+          (a dedicated user, container, or VM) if you need one.
+        </p>
+        <div className="mt-4 flex justify-end">
+          <Button variant="secondary" onClick={close}>Close</Button>
+        </div>
+      </AppDialog>
+    );
+  }
+
   // Has the form drifted from the saved task? Compare textareas
   // by their normalized line-array form (trim, drop blanks) so that
   // whitespace-only edits (an extra newline at the end) don't count

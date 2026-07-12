@@ -65,6 +65,7 @@ Deeper references — read when working in that area:
 - [docs/tech-debt.md](docs/tech-debt.md) — index of temporary/removable scaffolding (e.g. the workspace→task migration) + purge checklists
 - [docs/performance.md](docs/performance.md) — perf traps, sub-pixel/rendering hardening
 - [docs/sandbox.md](docs/sandbox.md) — sandbox-exec + CONNECT proxy, YOLO interaction, deny debugging
+- [docs/remote.md](docs/remote.md) — remote (SSH) projects: transport, ControlMaster, quoting seams, v1 degradations
 - [docs/shortcuts.md](docs/shortcuts.md) — shortcut system architecture, adding shortcuts, glyph rendering
 - [docs/themes.md](docs/themes.md) — custom theme file format (`~/.config/termic/themes/*.json`), ui/terminal key reference
 - [docs/ui.md](docs/ui.md) — UI conventions, window chrome/drag, right-panel footer, settled detection

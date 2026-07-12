@@ -1045,6 +1045,13 @@ const captureArmedRef = useRef(false);
     // host lists apply), since both are user-configured on the entry.
     const isRegistryTerminal = !isShell && !isCustom && isTerminalCli(tab.cli);
     const isAgent = !isShell && !isCustom && !isRegistryTerminal;
+    // Remote (ssh) workspace: the PTY hosts a local `ssh -t` and the
+    // logical command runs on the workspace's host. Rust does the
+    // rewrite; here we only skip local-shell resolution, tag the spawn
+    // with remote_kind, and always pass task_id (Rust needs the task to
+    // find the ssh target; the sandbox concern behind the usual
+    // omission is moot since remote is never sandboxed).
+    const isRemote = !!task.ssh;
     const idCapable = isAgent && cliSupportsIdSession(tab.cli);
     const captureCapable = isAgent && cliSupportsCaptureResume(tab.cli);
     const taskTabsNow = useApp.getState().tabs[task.id] || [];
@@ -1131,7 +1138,9 @@ const captureArmedRef = useRef(false);
         // the user's login shell ($SHELL, falling back to bash/fish/sh),
         // mirroring the AuxTerminal scratch shell. Hard-coding zsh here
         // locked out users without it (#13).
-        const userShell = isAgent ? "" : await loginShell();
+        // Remote non-agent tabs never resolve a LOCAL shell — the remote
+        // host's own $SHELL is used on the other end of ssh.
+        const userShell = isAgent || isRemote ? "" : await loginShell();
         if (cancelled) return;
         const spawnCmd = isAgent ? spawnCommandForCli(tab.cli) : userShell;
         // Custom / registry terminal: run the launch command, then drop
@@ -1184,10 +1193,21 @@ const captureArmedRef = useRef(false);
           resumeOverride,
           task,
         });
+        // Remote shape: shell tabs need no command at all; custom /
+        // registry-terminal tabs send the RAW launch command string as
+        // `cmd` (Rust wraps it in the remote login shell, mirroring the
+        // local loginShellArgs contract); agents keep cmd/args verbatim
+        // (Rust wraps them in `ssh -t ... exec`).
+        const remoteKind = !isRemote ? undefined
+          : isAgent ? ("agent" as const)
+          : isShell ? ("shell" as const)
+          : (tab as TerminalTab).runTab ? ("custom-once" as const)
+          : ("custom" as const);
         const spawn = await ipc.ptySpawn({
           cwd: task.path,
-          cmd: spawnCmd,
-          args: spawnArgs,
+          cmd: isRemote && !isAgent ? (launchCmd ?? "") : spawnCmd,
+          args: isRemote && !isAgent ? [] : spawnArgs,
+          remote_kind: remoteKind,
           // Order matters: base TERMIC_*/COLORFGBG block first, then
           // the user's per-agent env block (Settings → Agents). The
           // per-agent values win on key collision so a power user can
@@ -1213,8 +1233,10 @@ const captureArmedRef = useRef(false);
           // cage: agents AND a custom-command task's own default tab (`cli:
           // "custom"`, no runTab) pass the id, since both run something
           // automated against the repo. Rust then gates on
-          // task.sandbox_enabled (a no-op when sandbox off).
-          task_id: (isShell || isRegistryTerminal || !!(tab as TerminalTab).runTab) ? undefined : task.id,
+          // task.sandbox_enabled (a no-op when sandbox off). Remote tasks
+          // ALWAYS pass the id: Rust needs the task to find the ssh
+          // target, and remote is never sandboxed anyway.
+          task_id: (isShell || isRegistryTerminal || !!(tab as TerminalTab).runTab) && !isRemote ? undefined : task.id,
           // The tab's CLI may differ from the task's primary CLI
           // (claude task with a gemini tab open, etc.). Send the
           // tab's agent id so the rendered SBPL profile uses THIS
@@ -1431,7 +1453,7 @@ const captureArmedRef = useRef(false);
             if (!liveTab?.sessionId) {
               const capture = postLaunchCaptureForCli(tab.cli);
               if (capture) {
-                ipc.runCaptureCommand(capture.command, task.path)
+                ipc.runCaptureCommand(capture.command, task.path, task.id)
                   .then(id => { if (id) useApp.getState().setTabSessionId(task.id, tab.id, id); })
                   .catch(() => {});
               }
@@ -1499,7 +1521,7 @@ const captureArmedRef = useRef(false);
                 if (capture) {
                   captureArmedRef.current = true;
                   window.setTimeout(() => {
-                    ipc.runCaptureCommand(capture.command, task.path)
+                    ipc.runCaptureCommand(capture.command, task.path, task.id)
                       .then(id => { if (id) useApp.getState().setTabSessionId(task.id, tab.id, id); })
                       .catch(() => {});
                   }, 5000);

@@ -13,6 +13,7 @@
 import { ContextMenuItem, ContextMenuSeparator } from "@/components/ui/ContextMenu";
 import { copyToClipboard, joinPath } from "@/lib/clipboard";
 import { openPath, revealPath } from "@/lib/ipc";
+import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
 import { IS_MAC } from "@/lib/shortcuts";
 import { Copy, CornerUpLeft, FolderOpen } from "lucide-react";
@@ -20,6 +21,11 @@ import { Copy, CornerUpLeft, FolderOpen } from "lucide-react";
 const FILE_MANAGER = IS_MAC ? "Finder" : "File Manager";
 
 export function CopyPathItems({ rel, root, isDir = false }: { rel: string; root: string; isDir?: boolean }) {
+  // Remote (ssh) workspace: the absolute path lives on another machine, so
+  // the local file-manager item is hidden (Copy path still works and is
+  // the useful action there). Detected here from the owning workspace so
+  // none of the call sites have to thread a flag through their row props.
+  const remote = useApp(s => !!s.tasks.find(w => w.path === root)?.ssh);
   const abs = joinPath(root, rel);
   const revealInFileManager = () => {
     // Folders open (show their contents); files are revealed/selected in
@@ -35,10 +41,14 @@ export function CopyPathItems({ rel, root, isDir = false }: { rel: string; root:
       <ContextMenuItem onSelect={() => copyToClipboard(abs, "path")}>
         <Copy /> Copy path (absolute)
       </ContextMenuItem>
-      <ContextMenuSeparator />
-      <ContextMenuItem onSelect={revealInFileManager}>
-        <FolderOpen /> {isDir ? `Open in ${FILE_MANAGER}` : `Show in ${FILE_MANAGER}`}
-      </ContextMenuItem>
+      {!remote && (
+        <>
+          <ContextMenuSeparator />
+          <ContextMenuItem onSelect={revealInFileManager}>
+            <FolderOpen /> {isDir ? `Open in ${FILE_MANAGER}` : `Show in ${FILE_MANAGER}`}
+          </ContextMenuItem>
+        </>
+      )}
     </>
   );
 }

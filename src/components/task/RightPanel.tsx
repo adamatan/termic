@@ -109,13 +109,25 @@ export function RightPanel() {
     return () => ro.disconnect();
   }, []);
 
+  // Remote (ssh) tasks: every status fetch is a network round trip,
+  // so the poll runs at 15s instead of 4s, and a transport failure keeps
+  // the LAST GOOD status on screen behind a slim reconnect banner
+  // instead of silently swallowing errors forever.
+  const isRemote = !!task?.ssh;
+  const [connLost, setConnLost] = useState<string | null>(null);
   // Poll git status (staged/unstaged split) for the Git tab badges + panel.
   // The fetch is reused by GitPanel via the `refreshGit` callback so a
   // stage/unstage/commit reflects immediately instead of waiting for the
-  // 4s tick.
+  // poll tick.
   const refreshGit = React.useCallback(() => {
     if (!task) return;
-    taskGitStatus(task.id).then(setGitStatus).catch(() => {});
+    taskGitStatus(task.id)
+      .then(s => { setGitStatus(s); setConnLost(null); })
+      .catch(e => {
+        // Only the ssh transport error flips the banner; a plain git
+        // failure (mid-rebase etc.) stays quiet like before.
+        if (typeof e === "string" && e.startsWith("ssh: ")) setConnLost(e);
+      });
   }, [task?.id]);
   // Clear + reload ONLY on a real task switch (task.id), not on every
   // task-object re-patch (window refocus, attention/settled updates re-create the
@@ -124,10 +136,9 @@ export function RightPanel() {
   useEffect(() => {
     if (!task) { setGitStatus(null); return; }
     setGitStatus(null);
-    taskGitStatus(task.id).then(setGitStatus).catch(() => {});
-    const id = window.setInterval(() => {
-      taskGitStatus(task.id).then(setGitStatus).catch(() => {});
-    }, 4000);
+    setConnLost(null);
+    refreshGit();
+    const id = window.setInterval(refreshGit, isRemote ? 15000 : 4000);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task?.id]);
@@ -427,6 +438,23 @@ export function RightPanel() {
         </div>
       </header>
 
+      {/* Remote workspace lost its connection: keep the last good data
+          on screen behind a slim banner instead of clearing to a
+          spinner. The poll keeps retrying; Retry is the manual nudge. */}
+      {connLost && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-warn)]/40 bg-[var(--color-warn)]/10 px-2 py-1 text-[11.5px] text-[var(--color-fg-dim)]">
+          <span className="min-w-0 flex-1 truncate" title={connLost}>
+            Cannot reach {task.ssh?.user ? `${task.ssh.user}@` : ""}{task.ssh?.host}. Retrying...
+          </span>
+          <button
+            onClick={refreshGit}
+            className="shrink-0 rounded px-1.5 py-0.5 text-[11.5px] font-medium hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* Files / Git — flexible, takes whatever's left after the footer.
           Files scrolls inside this wrapper; Git manages its own panes +
           scrolling so it gets the bare flex-1 height with no overflow. */}
@@ -616,7 +644,7 @@ export function RightPanel() {
                   zIndex: footTab === "term" ? 1 : 0,
                 }}
               >
-                <AuxTerminal taskPath={task.path} active={footTab === "term"} />
+                <AuxTerminal taskId={task.id} taskPath={task.path} active={footTab === "term"} />
               </div>
             )}
           </div>

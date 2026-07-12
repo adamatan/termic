@@ -175,21 +175,30 @@ export function AuxTerminal({ taskId, taskPath, active, autoFocus, onExited, onT
       await awaitTerminalFonts(term, fit, host, () => cancelled, () => ptyRef.current);
       if (cancelled) return;
       try { fit.fit(); } catch {}
-      const shell = await loginShell();
+      // Remote (ssh) workspace: the scratch shell opens ON THE HOST at
+      // the workspace path (a remote path a local shell couldn't cd
+      // into). Rust wraps the spawn in `ssh -t` when workspace_id
+      // resolves to a remote workspace and remote_kind is "shell".
+      const isRemote = !!(taskId && useApp.getState().tasks.find(w => w.id === taskId)?.ssh);
+      const shell = isRemote ? "" : await loginShell();
       if (cancelled) return;
       try {
         const { id: ptyId } = await ipc.ptySpawn({
-          cwd: taskPath, cmd: shell, args: ["-l"],
+          cwd: taskPath, cmd: shell, args: isRemote ? [] : ["-l"],
+          remote_kind: isRemote ? "shell" : undefined,
           // Signal terminal theme so prompts / status bars that honor
           // COLORFGBG (oh-my-zsh themes, starship, etc.) pick the right
           // colors for the current chrome.
           env: { COLORFGBG: currentColorFgBg() },
-          // NEVER pass task_id here. The aux shell is a scratch
-          // zsh for the user's own git/grep/etc work - sandboxing it
-          // would block exactly the moves the user opened it for
-          // (`gh pr create`, `kubectl get pods`, etc.). The agent CLI
-          // is the only thing we sandbox; everything else inside the
-          // task runs with the user's normal permissions.
+          // NEVER pass task_id for LOCAL tasks. The aux shell is a
+          // scratch zsh for the user's own git/grep/etc work -
+          // sandboxing it would block exactly the moves the user opened
+          // it for (`gh pr create`, `kubectl get pods`, etc.). The agent
+          // CLI is the only thing we sandbox; everything else inside the
+          // task runs with the user's normal permissions. Remote tasks
+          // DO pass it: Rust needs the task to find the ssh target, and
+          // remote is never sandboxed anyway.
+          task_id: isRemote ? taskId : undefined,
           rows: Math.max(8, term.rows), cols: Math.max(40, term.cols),
         });
         if (cancelled) { ipc.ptyKill(ptyId).catch(() => {}); return; }

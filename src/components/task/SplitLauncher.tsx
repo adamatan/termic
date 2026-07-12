@@ -10,6 +10,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Task } from "@/lib/types";
 import { useApp } from "@/store/app";
+import { useRemoteMissingClis } from "@/lib/remote";
 import { visibleCliIds, isTerminalEntry } from "@/lib/agents";
 import { CliIcon, CLI_BRAND_COLOR } from "@/icons/cli";
 import { cn } from "@/lib/utils";
@@ -27,6 +28,8 @@ export function SplitLauncher({ task, paneId }: { task: Task; paneId: string }) 
   const addPaneTab = useApp(s => s.addPaneTab);
   const closePane = useApp(s => s.closePane);
   const activeTaskId = useApp(s => s.activeTaskId);
+  // Remote tasks: gray out agents the HOST doesn't have.
+  const remoteMissing = useRemoteMissingClis(task.ssh ? task.project_id : null);
   const items = useMemo<LauncherItem[]>(() => {
     const visible = visibleCliIds(registry.map(a => a.id), registry, detectedClis);
     const out: LauncherItem[] = [
@@ -51,6 +54,8 @@ export function SplitLauncher({ task, paneId }: { task: Task; paneId: string }) 
 
   const choose = (it: LauncherItem | undefined) => {
     if (!it) return;
+    // Grayed rows (agent missing on the remote host) don't launch.
+    if (it.section === "agent" && remoteMissing.has(it.cli)) return;
     addPaneTab(task.id, paneId, it.cli);
   };
 
@@ -94,8 +99,10 @@ export function SplitLauncher({ task, paneId }: { task: Task; paneId: string }) 
               <button
                 onMouseMove={() => setSel(i)}
                 onClick={() => choose(it)}
+                disabled={it.section === "agent" && remoteMissing.has(it.cli)}
                 className={cn(
                   "flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px]",
+                  it.section === "agent" && remoteMissing.has(it.cli) && "cursor-not-allowed opacity-40 grayscale",
                   i === sel
                     ? "bg-[var(--color-sel)] text-[var(--color-fg)]"
                     : "text-[var(--color-fg-dim)]",
@@ -105,6 +112,9 @@ export function SplitLauncher({ task, paneId }: { task: Task; paneId: string }) 
                   <CliIcon cli={it.iconId} className="h-4 w-4" />
                 </span>
                 <span className="truncate">{it.label}</span>
+                {it.section === "agent" && remoteMissing.has(it.cli) && (
+                  <span className="ml-auto shrink-0 text-[9.5px] uppercase tracking-wider text-[var(--color-fg-faint)]">not on host</span>
+                )}
               </button>
             </div>
           );

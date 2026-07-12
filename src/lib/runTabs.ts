@@ -43,7 +43,7 @@ export function expandPreviewUrl(project: Project | null, task: Task, yamlUrl = 
   // dead Open button is worse than none.
   if (!tmpl) return null;
   const port = String(task.port);
-  return tmpl
+  let url = tmpl
     .replaceAll("${TERMIC_PORT}",            port)
     .replaceAll("$TERMIC_PORT",              port)
     .replaceAll("${CONDUCTOR_PORT}",         port)
@@ -54,6 +54,16 @@ export function expandPreviewUrl(project: Project | null, task: Task, yamlUrl = 
     .replaceAll("$TERMIC_WORKSPACE_NAME",    task.name)
     .replaceAll("${CONDUCTOR_WORKSPACE_NAME}", task.name)
     .replaceAll("$CONDUCTOR_WORKSPACE_NAME",   task.name);
+  // Remote (ssh) task: the server runs on the host, so a localhost
+  // preview URL would point at THIS machine. Substitute the ssh host,
+  // which works for LAN boxes and hosts with the port reachable (no
+  // tunneling in v1).
+  if (task.ssh?.host) {
+    url = url
+      .replaceAll("//localhost", `//${task.ssh.host}`)
+      .replaceAll("//127.0.0.1", `//${task.ssh.host}`);
+  }
+  return url;
 }
 
 /** All run-kind tabs of a task ("run", not "setup"). */

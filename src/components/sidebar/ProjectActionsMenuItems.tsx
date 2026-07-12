@@ -13,6 +13,7 @@ import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
 import { visibleCliIds } from "@/lib/agents";
 import { createQuickTask, readNewTaskMode, writeNewTaskMode, type NewTaskMode } from "@/lib/quickTask";
+import { useRemoteMissingClis } from "@/lib/remote";
 import { CliIcon, CLI_BRAND_COLOR } from "@/icons/cli";
 import { DropdownItem, DropdownSeparator } from "@/components/ui/Dropdown";
 import { GitBranch, GitBranchPlus, Link2, TerminalSquare, SquareChevronRight, Settings2 } from "lucide-react";
@@ -49,6 +50,10 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
   // drop the toggle.
   const isNonGit = !!project?.non_git;
   const visibleClis = visibleCliIds(agents.map(a => a.id), agents, detectedClis);
+  // Remote projects: agents the HOST doesn't have render grayed and
+  // unpressable (hiding them would read as a termic bug; the fix is on
+  // the host). Local detection above keeps its hide behavior.
+  const remoteMissing = useRemoteMissingClis(project?.ssh ? projectId : null);
 
   // App-wide remembered mode (same key the New Task dialog uses). Non-git
   // can't worktree, so it's pinned to the main checkout.
@@ -123,14 +128,22 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
         </div>
       )}
 
-      {agents.filter(a => visibleClis.has(a.id)).map(a => (
-        <DropdownItem key={a.id} onSelect={() => pick(a.id)}>
+      {agents.filter(a => visibleClis.has(a.id)).map(a => {
+        const notOnHost = remoteMissing.has(a.id);
+        return (
+        <DropdownItem key={a.id} disabled={notOnHost} onSelect={() => pick(a.id)}>
           <span className={cn("shrink-0", CLI_BRAND_COLOR[a.icon_id] || "text-[var(--color-fg-dim)]")}>
             <CliIcon cli={a.icon_id} className="h-4 w-4" />
           </span>
           <span className="truncate">{a.display_name}</span>
+          {notOnHost && (
+            <span className="ml-auto shrink-0 text-[10px] uppercase tracking-wider text-[var(--color-fg-faint)]">
+              not on host
+            </span>
+          )}
         </DropdownItem>
-      ))}
+        );
+      })}
 
       {/* Plain login-shell variant. In main-checkout mode a shell has no
           session to resume, so we skip the name prompt and create at once

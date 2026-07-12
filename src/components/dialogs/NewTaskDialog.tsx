@@ -10,6 +10,7 @@ import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { CliIcon, CLI_BRAND_COLOR } from "@/icons/cli";
+import { useRemoteMissingClis } from "@/lib/remote";
 import { visibleCliIds } from "@/lib/agents";
 import { taskCreate, taskCreateMulti, settingsLoad, taskImportableWorktrees, taskImportWorktree, sandboxAvailable, taskOpenRepo } from "@/lib/ipc";
 import { launchSetupTab } from "@/lib/runTabs";
@@ -58,6 +59,9 @@ export function NewTaskDialog() {
   // The TerminalPane / ensureDefaultTab paths already treat cli="shell"
   // as a login zsh, so this is a complete task shape, not a stub.
   const SHELL_CHOICE = { id: "shell", display_name: "Terminal", color: "" } as any;
+  // Remote projects: agents missing on the HOST render grayed and
+  // unpressable in the segmented picker below.
+  const remoteMissing = useRemoteMissingClis(project?.ssh ? projectId : null);
   const cliChoices = (() => {
     const list = agents.length
       ? agents
@@ -68,6 +72,15 @@ export function NewTaskDialog() {
 
   const [name, setName] = useState("");
   const [cli, setCli] = useState<string>("claude");
+  // If the selected agent turns out to be missing on the remote host
+  // (the probe resolves after the dialog seeded its default), move the
+  // selection to the first agent the host actually has, else Terminal.
+  useEffect(() => {
+    if (!remoteMissing.has(cli)) return;
+    const fallback = cliChoices.find(a => a.id !== "shell" && !remoteMissing.has(a.id))?.id ?? "shell";
+    setCli(fallback);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remoteMissing, cli]);
   const [branch, setBranch] = useState("");
   const [branchEdited, setBranchEdited] = useState(false);
   const [base, setBase] = useState("");
@@ -98,7 +111,8 @@ export function NewTaskDialog() {
   // Derived: any cage on. Drives the 2-column layout + "send lists" gating.
   // Repo-root mode has no sandbox (task_open_repo takes no sandbox args),
   // so force it off there — keeps the layout single-column + the panel hidden.
-  const sandbox = sandboxMode !== "off" && mode === "worktree";
+  // Remote projects: the cage is local-only, never applicable.
+  const sandbox = sandboxMode !== "off" && mode === "worktree" && !project?.ssh;
   // The sandbox lists. Initialized from the
   // project's defaults whenever projectId changes; the user edits
   // freely until Create. Stored as multi-line text - we convert to
@@ -185,6 +199,8 @@ export function NewTaskDialog() {
       const firstInstalled = list.find(a => !a.disabled && isInstalled(a.id))?.id;
       setCli(firstInstalled ?? "shell");
     }
+    // Remote projects: the host probe resolves async; the effect below
+    // bumps the selection off a host-missing agent when it lands.
     // Sandbox toggle defaults to project's preference OR the global
     // default (Settings → General). Either being true checks the box.
     // The user can still flip for THIS task - but once Create
@@ -654,11 +670,16 @@ export function NewTaskDialog() {
               and not-installed agents are filtered out (see cliChoices).
               "Terminal" (cli="shell") is appended as a no-agent fallback. */}
           <div className="inline-flex flex-wrap items-stretch gap-y-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-[3px]">
-            {cliChoices.map(a => (
+            {cliChoices.map(a => {
+              const notOnHost = remoteMissing.has(a.id);
+              return (
               <button
                 key={a.id} type="button" onClick={() => setCli(a.id)}
+                disabled={notOnHost}
+                title={notOnHost ? "Not installed on the remote host" : undefined}
                 className={cn(
                   "flex h-7 items-center gap-1.5 rounded-[5px] px-2.5 text-[12.5px] transition-colors",
+                  notOnHost && "cursor-not-allowed opacity-40 grayscale",
                   cli === a.id
                     ? "bg-[var(--color-accent-deep)] text-white"
                     : cn("text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]", CLI_BRAND_COLOR[a.icon_id]),
@@ -672,7 +693,8 @@ export function NewTaskDialog() {
                 <CliIcon cli={a.icon_id} className="h-3.5 w-3.5" />
                 {a.id === "agy" ? "Agy" : a.display_name}
               </button>
-            ))}
+              );
+            })}
           </div>
         </Field>
 
@@ -802,8 +824,19 @@ export function NewTaskDialog() {
             creation - lists below freeze onto the task and can't be
             edited after (archive + recreate to change). */}
         {/* Sandbox is worktree-only here: task_open_repo (repo-root)
-            takes no sandbox args, and multi keeps mode="worktree". */}
-        {mode === "worktree" && (
+            takes no sandbox args, and multi keeps mode="worktree".
+            Remote projects: the cage is local-only, so show why there is
+            no sandbox control instead of a selector that can't apply. */}
+        {mode === "worktree" && project?.ssh && (
+          <Field label="Sandbox" hint="">
+            <p className="text-[12.5px] leading-snug text-[var(--color-fg-faint)]">
+              This task will run on {project.ssh.user ? `${project.ssh.user}@` : ""}{project.ssh.host}.
+              The sandbox only protects local tasks, so the agent runs
+              unsandboxed on the remote host.
+            </p>
+          </Field>
+        )}
+        {mode === "worktree" && !project?.ssh && (
         <Field label="Sandbox" hint="Cage the agent's filesystem + network access. Pinned at creation.">
           <SandboxModeSelector value={sandboxMode} onChange={setSandboxMode} osUnavailable={osSandboxOk === false} compact />
         </Field>

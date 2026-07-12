@@ -99,6 +99,11 @@ export interface AppState {
    *  pickers are never stranded before/without detection. Drives the
    *  install badge in Settings and the hide-uninstalled picker filter. */
   detectedClis: Record<string, import("@/lib/types").CliInfo>;
+  /** Remote-host CLI detection, keyed by PROJECT id then agent id.
+   *  Only populated for remote (ssh) projects via `refreshRemoteClis`.
+   *  An absent project entry means "not probed yet" — pickers treat
+   *  that as all-available instead of stranding the user on a probe. */
+  remoteClis: Record<string, Record<string, import("@/lib/types").CliInfo>>;
   /** Per-project spotlight: project_id → ws_id of the currently spotlighted
    *  task, or absent if none. Updated by spotlight://status events and
    *  hydrated from the Rust side on app start. Session-only (not persisted). */
@@ -112,6 +117,12 @@ export interface AppState {
    *  startup (App mount) and whenever Settings → Agent CLIs opens —
    *  deliberately NOT on every window focus. */
   refreshClis: () => Promise<void>;
+  /** Probe which agents exist on a remote project's HOST (one ssh round
+   *  trip). Called whenever an agent picker opens; throttled to one
+   *  probe per project per 10s (plus in-flight dedup) so an agent the
+   *  user installs on the host mid-session ungreys on the next + click
+   *  without rapid open/close hammering ssh. */
+  refreshRemoteClis: (projectId: string) => Promise<void>;
   setActiveTask: (id: string | null) => void;
   setView: (page: View["page"]) => void;
   openSettings: (tab?: View["settingsTab"], repoId?: string, highlight?: string) => void;
@@ -343,6 +354,15 @@ function durablePersistedTabs(tabs: Tab[] | undefined): PersistedTab[] {
 }
 
 
+/** In-flight remote CLI probes (suppresses concurrent duplicates) and
+ *  the completion time of each project's last successful probe. The
+ *  probe re-runs when a picker opens AND the last result is older than
+ *  the TTL, so an agent installed on the host mid-session ungreys on
+ *  the next + click without ever hammering ssh on rapid open/close. */
+const remoteClisInflight = new Set<string>();
+const remoteClisProbedAt = new Map<string, number>();
+const REMOTE_CLIS_TTL_MS = 10_000;
+
 export const useApp = create<AppState>((set, get) => ({
   projects: [],
   tasks: [],
@@ -370,6 +390,7 @@ export const useApp = create<AppState>((set, get) => ({
   collapsedTasks: initialCollapsedTask as Record<string, boolean>,
   agents: [],
   detectedClis: {},
+  remoteClis: {},
   spotlightTaskId: {},
 
   setSpotlight: (projectId, taskId) =>
@@ -400,6 +421,27 @@ export const useApp = create<AppState>((set, get) => ({
       set({ detectedClis: map });
     } catch {
       // Keep prior results; an empty map just means "show all".
+    }
+  },
+
+  refreshRemoteClis: async (projectId) => {
+    // Stale-while-revalidate: the cached result keeps rendering while a
+    // fresh probe runs; within the TTL we serve the cache silently.
+    if (remoteClisInflight.has(projectId)) return;
+    const last = remoteClisProbedAt.get(projectId) ?? 0;
+    if (Date.now() - last < REMOTE_CLIS_TTL_MS) return;
+    remoteClisInflight.add(projectId);
+    try {
+      const list = await ipc.projectDetectRemoteClis(projectId);
+      const map: Record<string, import("@/lib/types").CliInfo> = {};
+      for (const c of list) map[c.name] = c;
+      remoteClisProbedAt.set(projectId, Date.now());
+      set(s => ({ remoteClis: { ...s.remoteClis, [projectId]: map } }));
+    } catch {
+      // Unknown stays unknown (all agents remain pressable); nothing is
+      // recorded so the next picker open retries immediately.
+    } finally {
+      remoteClisInflight.delete(projectId);
     }
   },
 

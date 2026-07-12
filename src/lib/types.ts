@@ -30,6 +30,46 @@ export function isSandboxEnforced(mode: SandboxMode): boolean {
   return mode === "enforce" || mode === "enforce-fs";
 }
 
+/** Connection descriptor for a remote (SSH host + repo) project. Mirrors
+ *  Rust's `SshTarget`. Empty / zero fields defer to the user's
+ *  `~/.ssh/config` for that setting. */
+export interface SshTarget {
+  /** Hostname, IP, or ssh-config alias. Required. */
+  host: string;
+  /** Login user. Empty = defer to ssh config. */
+  user: string;
+  /** Port. 0 = defer to ssh config (default 22). */
+  port: number;
+  /** Local path to a private key, passed as `-i` with IdentitiesOnly
+   *  when set, overriding the ssh config's pick for this host. */
+  identity_file: string;
+  /** Base directory ON THE HOST for worktrees. Empty = "~/termic/workspaces". */
+  remote_workspaces_path: string;
+}
+
+/** What `projectSshProbe` learns about a host. Mirrors Rust's `ProbeInfo`. */
+export interface SshProbeInfo {
+  os: string;
+  git_version: string;
+  home: string;
+}
+
+/** One subdirectory in a remote directory listing (`sshListDirs`).
+ *  Mirrors Rust's `RemoteDirEntry`. */
+export interface RemoteDirEntry {
+  name: string;
+  /** Looks like a git repo (`.git` present, file or dir). */
+  is_git: boolean;
+}
+
+/** Remote directory listing for the host browser. Mirrors Rust's
+ *  `RemoteDirListing`. `path` is the resolved absolute path listed. */
+export interface RemoteDirListing {
+  path: string;
+  parent?: string | null;
+  entries: RemoteDirEntry[];
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -81,6 +121,10 @@ export interface Project {
    *  that member when used INSIDE this multi-repo project. Empty
    *  scripts = skip. Only meaningful when `type == "multi"`. */
   members?: ProjectMember[];
+  /** When set, this project lives on a remote machine: `root_path` is a
+   *  path ON THAT HOST and every workspace runs there over ssh
+   *  (issue #82). Undefined = local project. */
+  ssh?: SshTarget | null;
 }
 
 /** Per-member entry on a multi-repo Project. Self-contained: a member is
@@ -212,6 +256,11 @@ export interface Task {
   persisted_tabs?: PersistedTab[];
   /** JSON-encoded SplitTree for the active tab's pane layout. Restored on relaunch. */
   split_layout?: string | null;
+  /** Frozen copy of the owning project's ssh target, taken at create
+   *  time (same freeze pattern as the sandbox lists). When set, `path`
+   *  is a path on that host and this workspace's terminals / git / file
+   *  ops all run over ssh. Undefined = local workspace. */
+  ssh?: SshTarget | null;
 }
 
 /** One durable agent tab persisted on a task. Mirror of
