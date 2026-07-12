@@ -138,14 +138,23 @@ fn control_path_opt() -> String {
 /// `batch = false` so ssh CAN prompt (passphrase, host key) inside the
 /// visible terminal, which also revives the shared ControlMaster.
 pub fn ssh_base_args(t: &SshTarget, batch: bool) -> Vec<String> {
-    let mut a: Vec<String> = vec![
-        "-o".into(), "ControlMaster=auto".into(),
-        "-o".into(), control_path_opt(),
-        "-o".into(), "ControlPersist=600".into(),
+    let mut a: Vec<String> = Vec::new();
+    // Windows OpenSSH has no ControlMaster support (no Unix domain
+    // sockets in its mux path); these options would make every ssh call
+    // error out there. Remote ops still work without them, each op just
+    // pays a full handshake instead of sharing the connection.
+    if !cfg!(windows) {
+        a.extend([
+            "-o".into(), "ControlMaster=auto".into(),
+            "-o".into(), control_path_opt(),
+            "-o".into(), "ControlPersist=600".into(),
+        ]);
+    }
+    a.extend([
         "-o".into(), "ConnectTimeout=10".into(),
         "-o".into(), "ServerAliveInterval=5".into(),
         "-o".into(), "ServerAliveCountMax=3".into(),
-    ];
+    ]);
     if batch {
         a.push("-o".into());
         a.push("BatchMode=yes".into());
