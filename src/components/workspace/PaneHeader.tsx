@@ -250,7 +250,11 @@ export function PaneHeader({ leaf, ws, onClose }: PaneHeaderProps) {
       </div>
 
       {/* + dropdown: same agent/shell menu as the main TabBar. */}
-      <DropdownRoot open={open} onOpenChange={setOpen}>
+      <DropdownRoot open={open} onOpenChange={(o) => {
+        setOpen(o);
+        // Same TTL-throttled host re-probe as the main TabBar + menu.
+        if (o && ws.ssh) void useApp.getState().refreshRemoteClis(ws.project_id);
+      }}>
         <DropdownTrigger asChild>
           <Button size="icon" variant="icon" className="h-8 w-8 shrink-0 self-center">
             <Plus className="h-4 w-4" />

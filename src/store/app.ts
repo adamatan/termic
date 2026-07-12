@@ -113,9 +113,10 @@ export interface AppState {
    *  deliberately NOT on every window focus. */
   refreshClis: () => Promise<void>;
   /** Probe which agents exist on a remote project's HOST (one ssh round
-   *  trip). Deduped: at most one in-flight probe per project, and a
-   *  completed probe is not repeated for the session (agents rarely
-   *  appear mid-session; reopening the app re-probes). */
+   *  trip). Called whenever an agent picker opens; throttled to one
+   *  probe per project per 10s (plus in-flight dedup) so an agent the
+   *  user installs on the host mid-session ungreys on the next + click
+   *  without rapid open/close hammering ssh. */
   refreshRemoteClis: (projectId: string) => Promise<void>;
   setActiveWorkspace: (id: string | null) => void;
   setView: (page: View["page"]) => void;
@@ -344,9 +345,14 @@ function durablePersistedTabs(tabs: Tab[] | undefined): PersistedTab[] {
 }
 
 
-/** Projects whose remote-host CLI probe has fired this session (also
- *  suppresses concurrent duplicates while one is in flight). */
-const remoteClisProbed = new Set<string>();
+/** In-flight remote CLI probes (suppresses concurrent duplicates) and
+ *  the completion time of each project's last successful probe. The
+ *  probe re-runs when a picker opens AND the last result is older than
+ *  the TTL, so an agent installed on the host mid-session ungreys on
+ *  the next + click without ever hammering ssh on rapid open/close. */
+const remoteClisInflight = new Set<string>();
+const remoteClisProbedAt = new Map<string, number>();
+const REMOTE_CLIS_TTL_MS = 10_000;
 
 export const useApp = create<AppState>((set, get) => ({
   projects: [],
@@ -410,20 +416,23 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   refreshRemoteClis: async (projectId) => {
-    // Session-scoped dedup: one probe per project, plus in-flight
-    // suppression (several pickers can mount at once). Module-level so
-    // the guard survives store updates.
-    if (remoteClisProbed.has(projectId)) return;
-    remoteClisProbed.add(projectId);
+    // Stale-while-revalidate: the cached result keeps rendering while a
+    // fresh probe runs; within the TTL we serve the cache silently.
+    if (remoteClisInflight.has(projectId)) return;
+    const last = remoteClisProbedAt.get(projectId) ?? 0;
+    if (Date.now() - last < REMOTE_CLIS_TTL_MS) return;
+    remoteClisInflight.add(projectId);
     try {
       const list = await ipc.projectDetectRemoteClis(projectId);
       const map: Record<string, import("@/lib/types").CliInfo> = {};
       for (const c of list) map[c.name] = c;
+      remoteClisProbedAt.set(projectId, Date.now());
       set(s => ({ remoteClis: { ...s.remoteClis, [projectId]: map } }));
     } catch {
-      // Unknown stays unknown (all agents remain pressable); allow a
-      // retry on the next picker open since nothing was recorded.
-      remoteClisProbed.delete(projectId);
+      // Unknown stays unknown (all agents remain pressable); nothing is
+      // recorded so the next picker open retries immediately.
+    } finally {
+      remoteClisInflight.delete(projectId);
     }
   },
 

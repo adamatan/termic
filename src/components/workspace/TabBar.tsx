@@ -198,7 +198,13 @@ export function TabBar({ ws }: { ws: Workspace }) {
 
         {/* New tab button — right after the last tab. When scrolling lands,
             move this back to the sticky right cluster. */}
-        <DropdownRoot open={open} onOpenChange={setOpen}>
+        <DropdownRoot open={open} onOpenChange={(o) => {
+          setOpen(o);
+          // Re-probe the host agents on every + open (TTL-throttled in
+          // the store) so an agent installed on the host mid-session
+          // ungreys without an app restart.
+          if (o && ws.ssh) void useApp.getState().refreshRemoteClis(ws.project_id);
+        }}>
           <DropdownTrigger asChild>
             <Button size="icon" variant="icon" className="ml-1 h-8 w-8 shrink-0 self-center"><Plus className="h-4 w-4" /></Button>
           </DropdownTrigger>
