@@ -54,6 +54,22 @@ export interface SshProbeInfo {
   home: string;
 }
 
+/** One subdirectory in a remote directory listing (`sshListDirs`).
+ *  Mirrors Rust's `RemoteDirEntry`. */
+export interface RemoteDirEntry {
+  name: string;
+  /** Looks like a git repo (`.git` present, file or dir). */
+  is_git: boolean;
+}
+
+/** Remote directory listing for the host browser. Mirrors Rust's
+ *  `RemoteDirListing`. `path` is the resolved absolute path listed. */
+export interface RemoteDirListing {
+  path: string;
+  parent?: string | null;
+  entries: RemoteDirEntry[];
+}
+
 export interface Project {
   id: string;
   name: string;

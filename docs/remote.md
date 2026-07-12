@@ -18,8 +18,17 @@ in `src-tauri/src/ssh_exec.rs`; nothing else builds ssh argv.
   `sun_path` at 104 bytes). `ControlPersist=600` keeps the master alive.
 - Background operations (git, file ops, scripts) run batched:
   `BatchMode=yes ConnectTimeout=10 ServerAliveInterval=5
-  ServerAliveCountMax=3`, plus a hard wall-clock kill in `run_remote` -
-  a dead host fails fast, never wedges a spawn_blocking thread.
+  ServerAliveCountMax=3 StrictHostKeyChecking=accept-new`, plus a hard
+  wall-clock kill in `run_remote` - a dead host fails fast, never wedges
+  a spawn_blocking thread. accept-new trusts an UNSEEN host key on first
+  use (BatchMode can't answer the interactive prompt) but still hard-fails
+  on a CHANGED key.
+- Every remote command line is wrapped `sh -c '<script>'` before it goes
+  over the wire: sshd hands the command to the user's LOGIN shell, which
+  may be fish/csh, and the POSIX constructs in our scripts don't parse
+  there (caught live against a fish login shell). The single-quoted
+  wrapper parses identically in every common shell; the payload then
+  always runs under POSIX sh.
 - PTY tabs use the same ControlPath WITHOUT BatchMode: an interactive
   passphrase / host-key prompt happens inside the visible terminal, and
   answering it revives the shared master for every background op.

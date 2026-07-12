@@ -149,6 +149,13 @@ pub fn ssh_base_args(t: &SshTarget, batch: bool) -> Vec<String> {
     if batch {
         a.push("-o".into());
         a.push("BatchMode=yes".into());
+        // First contact with a brand-new host would otherwise die on the
+        // interactive host-key prompt BatchMode suppresses. accept-new
+        // trusts an UNSEEN key on first use (what users answer "yes" to)
+        // but still hard-fails when a KNOWN host's key changes - the
+        // case that actually signals an attack.
+        a.push("-o".into());
+        a.push("StrictHostKeyChecking=accept-new".into());
     }
     if !t.identity_file.is_empty() {
         a.push("-i".into());
@@ -175,10 +182,13 @@ pub struct RemoteOutput {
     pub code: i32,
 }
 
-/// Run `script` on the target through `sh -c` remotely (sshd hands the
-/// script to the login shell; we keep the script itself POSIX). Returns
-/// the raw output without judging the exit code — most callers want
-/// `run_remote` below. `stdin` is streamed to the remote command's
+/// Run `script` on the target under POSIX `sh`. sshd hands the command
+/// line to the user's LOGIN shell, which may be fish/csh — so we send
+/// `sh -c '<script>'`: the single-quote escaping parses identically in
+/// every common shell, and the script itself always executes under sh.
+/// (Caught live: a fish login shell rejected `${f%/}` / `if..then`.)
+/// Returns the raw output without judging the exit code — most callers
+/// want `run_remote` below. `stdin` is streamed to the remote command's
 /// stdin (used for file writes and uploads).
 pub fn run_remote_raw(
     t: &SshTarget,
@@ -189,7 +199,7 @@ pub fn run_remote_raw(
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_base_args(t, true));
     cmd.arg(t.destination());
-    cmd.arg(script);
+    cmd.arg(format!("sh -c {}", shq(script)));
     // Same env treatment as the local `git()` helper: a GUI-launched
     // .app gets a bare launchd environment, so without the login env
     // ssh can't find SSH_AUTH_SOCK and agent auth silently fails.
@@ -267,7 +277,10 @@ pub fn run_remote(
 ) -> Result<String> {
     let out = run_remote_raw(t, script, timeout, stdin)?;
     if out.code == 255 {
+        // ssh's own stderr lines already start with "ssh: " half the
+        // time; strip it so our prefix doesn't read "ssh: ... ssh: ...".
         let line = out.stderr.lines().last().unwrap_or("connection failed").trim();
+        let line = line.strip_prefix("ssh: ").unwrap_or(line);
         return Err(anyhow!("ssh: cannot reach {}: {}", t.label(), line));
     }
     if out.code != 0 {

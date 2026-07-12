@@ -787,10 +787,10 @@ export function RepositorySection({ projectId }: { projectId: string }) {
                   {probe.state === "busy" ? "Connecting…" : "Test connection"}
                 </Button>
                 {probe.state === "ok" && (
-                  <span className="text-[12.5px] text-[var(--color-ok)]">{probe.msg}</span>
+                  <span className="min-w-0 flex-1 break-words text-[12.5px] leading-snug text-[var(--color-ok)]">{probe.msg}</span>
                 )}
                 {probe.state === "err" && (
-                  <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--color-err)]" title={probe.msg}>{probe.msg}</span>
+                  <span className="min-w-0 flex-1 break-words text-[12.5px] leading-snug text-[var(--color-err)]">{probe.msg}</span>
                 )}
               </div>
             </div>

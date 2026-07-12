@@ -7,9 +7,9 @@ import { useApp } from "@/store/app";
 import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { projectAdd, projectAddMulti, projectAddRemote, projectSshProbe, discoverRepos, settingsLoad, pathIsGitRepo, homeDir } from "@/lib/ipc";
-import type { DiscoveredRepo, Project, ProjectMember, SshTarget } from "@/lib/types";
-import { Folder, FolderPlus, Layers, Server, X } from "lucide-react";
+import { projectAdd, projectAddMulti, projectAddRemote, projectSshProbe, sshListDirs, discoverRepos, settingsLoad, pathIsGitRepo, homeDir } from "@/lib/ipc";
+import type { DiscoveredRepo, Project, ProjectMember, RemoteDirListing, SshTarget } from "@/lib/types";
+import { ChevronRight, CornerLeftUp, Folder, FolderGit2, FolderPlus, Layers, Server, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Where a non-git folder is being added — drives the confirm copy. We no
@@ -79,6 +79,14 @@ export function NewProjectDialog() {
   const [probe, setProbe] = useState<
     { state: "idle" } | { state: "busy" } | { state: "ok" | "err"; msg: string }
   >({ state: "idle" });
+  // Remote directory browser: which path field it fills, plus the
+  // current listing. Null = closed. Only usable once the probe is ok.
+  const [remoteBrowse, setRemoteBrowse] = useState<null | {
+    field: "repo" | "workspaces";
+    listing: RemoteDirListing | null;
+    loading: boolean;
+    err: string | null;
+  }>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -224,13 +232,46 @@ export function NewProjectDialog() {
   // Proactive test: fire automatically once the user pauses typing in any
   // connection field for 300ms. The manual button stays for re-testing
   // (e.g. after fixing keys on the host without touching the form).
+  // Connection-field edits also close the directory browser: its listing
+  // came from the OLD target and descending it would mix hosts.
   useEffect(() => {
     if (!open || mode !== "remote") return;
+    setRemoteBrowse(null);
     if (!remote.host.trim()) return;
     const id = window.setTimeout(() => { void testConnection(); }, 300);
     return () => window.clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, mode, remote.host, remote.user, remote.port, remote.identity]);
+
+  // Load a directory into the open browser. "" starts at the host's home.
+  async function browseTo(path: string) {
+    setRemoteBrowse(b => (b ? { ...b, loading: true, err: null } : b));
+    try {
+      const listing = await sshListDirs(remoteTarget(), path);
+      setRemoteBrowse(b => (b ? { ...b, listing, loading: false } : b));
+    } catch (e) {
+      setRemoteBrowse(b => (b ? { ...b, loading: false, err: String(e) } : b));
+    }
+  }
+  function openBrowser(field: "repo" | "workspaces") {
+    setRemoteBrowse({ field, listing: null, loading: true, err: null });
+    // Start from what's already typed in the field, else home. A typed
+    // path that doesn't exist on the host (yet) falls back to home
+    // instead of stranding the browser on an error.
+    const seed = (field === "repo" ? remote.repoPath : remote.workspacesPath).trim() || "~";
+    void (async () => {
+      try {
+        const listing = await sshListDirs(remoteTarget(), seed);
+        setRemoteBrowse(b => (b ? { ...b, listing, loading: false } : b));
+      } catch {
+        await browseTo("~");
+      }
+    })();
+  }
+  function pickBrowsePath(p: string) {
+    setRemote(r => (remoteBrowse?.field === "workspaces" ? { ...r, workspacesPath: p } : { ...r, repoPath: p }));
+    setRemoteBrowse(null);
+  }
 
   async function handleAddRemote() {
     setBusy(true); setErr(null);
@@ -413,56 +454,89 @@ export function NewProjectDialog() {
               300ms after the user stops typing in any connection field,
               so by the time they reach the repo path they already know
               whether the host works. The button re-tests on demand. */}
-          <div className="mt-4 flex items-center gap-3 rounded-md border border-[var(--color-border-soft)] bg-[var(--color-bg)] px-3 py-2">
+          <div className="mt-4 flex items-start gap-3 rounded-md border border-[var(--color-border-soft)] bg-[var(--color-bg)] px-3 py-2">
             <Button
               variant="secondary"
               size="sm"
+              className="shrink-0"
               disabled={!remote.host.trim() || probe.state === "busy"}
               onClick={testConnection}
             >
               {probe.state === "busy" ? "Connecting…" : "Test connection"}
             </Button>
+            {/* Status text WRAPS (min-w-0 + break-words): ssh errors are
+                long, and a non-wrapping line here forced the whole dialog
+                wider than the window. self-center keeps short one-liners
+                vertically aligned with the button. */}
             {probe.state === "idle" && (
-              <span className="text-[12.5px] text-[var(--color-fg-faint)]">
+              <span className="min-w-0 flex-1 self-center break-words text-[12.5px] leading-snug text-[var(--color-fg-faint)]">
                 {remote.host.trim() ? "Waiting to test…" : "Enter a host to test the connection."}
               </span>
             )}
             {probe.state === "busy" && (
-              <span className="text-[12.5px] text-[var(--color-fg-faint)]">Connecting to {remote.host.trim()}…</span>
+              <span className="min-w-0 flex-1 self-center break-words text-[12.5px] leading-snug text-[var(--color-fg-faint)]">Connecting to {remote.host.trim()}…</span>
             )}
             {probe.state === "ok" && (
-              <span className="text-[12.5px] text-[var(--color-ok)]">{probe.msg}</span>
+              <span className="min-w-0 flex-1 self-center break-words text-[12.5px] leading-snug text-[var(--color-ok)]">{probe.msg}</span>
             )}
             {probe.state === "err" && (
-              <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--color-err)]" title={probe.msg}>{probe.msg}</span>
+              <span className="min-w-0 flex-1 self-center break-words text-[12.5px] leading-snug text-[var(--color-err)]">{probe.msg}</span>
             )}
           </div>
 
           <label className="mt-4 block text-[13.5px]">
             Repository path on the host
-            <Input
-              value={remote.repoPath}
-              onChange={e => setRemote(r => ({ ...r, repoPath: e.target.value }))}
-              placeholder="~/projects/my-repo"
-              className="mt-1.5"
-              autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
-            />
+            <div className="mt-1.5 flex gap-2">
+              <Input
+                value={remote.repoPath}
+                onChange={e => setRemote(r => ({ ...r, repoPath: e.target.value }))}
+                placeholder="~/projects/my-repo"
+                autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+              />
+              {/* Browse the HOST's filesystem like a local picker. Only
+                  once the connection is verified: the listing reuses the
+                  authenticated ControlMaster, so it's snappy. */}
+              <Button variant="secondary" size="lg" disabled={probe.state !== "ok"}
+                title={probe.state !== "ok" ? "Test the connection first" : undefined}
+                onClick={() => openBrowser("repo")}>Browse…</Button>
+            </div>
           </label>
+          {remoteBrowse?.field === "repo" && (
+            <RemoteDirBrowser
+              browse={remoteBrowse}
+              forRepo
+              onNavigate={browseTo}
+              onPick={pickBrowsePath}
+              onClose={() => setRemoteBrowse(null)}
+            />
+          )}
 
           <label className="mt-4 block text-[13.5px]">
             Workspaces path on the host <span className="text-[var(--color-fg-faint)]">(optional)</span>
-            <Input
-              value={remote.workspacesPath}
-              onChange={e => setRemote(r => ({ ...r, workspacesPath: e.target.value }))}
-              placeholder="~/termic/workspaces"
-              className="mt-1.5"
-              autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
-            />
+            <div className="mt-1.5 flex gap-2">
+              <Input
+                value={remote.workspacesPath}
+                onChange={e => setRemote(r => ({ ...r, workspacesPath: e.target.value }))}
+                placeholder="~/termic/workspaces"
+                autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+              />
+              <Button variant="secondary" size="lg" disabled={probe.state !== "ok"}
+                title={probe.state !== "ok" ? "Test the connection first" : undefined}
+                onClick={() => openBrowser("workspaces")}>Browse…</Button>
+            </div>
             <span className="mt-1 block text-[11.5px] text-[var(--color-fg-faint)]">
               Where worktrees are created on the host. Defaults to{" "}
               <code className="mono">~/termic/workspaces</code>.
             </span>
           </label>
+          {remoteBrowse?.field === "workspaces" && (
+            <RemoteDirBrowser
+              browse={remoteBrowse}
+              onNavigate={browseTo}
+              onPick={pickBrowsePath}
+              onClose={() => setRemoteBrowse(null)}
+            />
+          )}
 
           {err && <p className="mt-2 text-[13.5px] text-[var(--color-err)]">{err}</p>}
 
@@ -717,6 +791,84 @@ export function NewProjectDialog() {
       )}
     </AppDialog>
     </>
+  );
+}
+
+/** Inline remote directory browser for the SSH project form. Rows are
+ *  the host's subdirectories; clicking one descends into it; git repos
+ *  get a badge + a Select action; the footer selects the directory
+ *  currently listed. Everything is one round trip per navigation over
+ *  the already-authenticated connection. */
+function RemoteDirBrowser({ browse, forRepo = false, onNavigate, onPick, onClose }: {
+  browse: { listing: RemoteDirListing | null; loading: boolean; err: string | null };
+  /** Repo picking: highlight git repos and put Select on them. */
+  forRepo?: boolean;
+  onNavigate: (path: string) => void;
+  onPick: (path: string) => void;
+  onClose: () => void;
+}) {
+  const { listing, loading, err } = browse;
+  const join = (dir: string, name: string) => (dir === "/" ? `/${name}` : `${dir}/${name}`);
+  return (
+    <div className="mt-2 overflow-hidden rounded-md border border-[var(--color-border-soft)]">
+      <div className="flex items-center gap-2 border-b border-[var(--color-border-soft)] bg-[var(--color-bg)] px-2.5 py-1.5">
+        <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-[var(--color-fg-dim)]" title={listing?.path ?? ""}>
+          {listing?.path ?? "…"}
+        </span>
+        {loading && <span className="shrink-0 text-[11px] text-[var(--color-fg-faint)]">Loading…</span>}
+        <button type="button" onClick={onClose} aria-label="Close browser"
+          className="shrink-0 rounded p-0.5 text-[var(--color-fg-faint)] hover:text-[var(--color-fg)]">
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+      <div className="max-h-52 overflow-auto">
+        {err && (
+          <div className="break-words px-3 py-2 text-[12px] leading-snug text-[var(--color-err)]">{err}</div>
+        )}
+        {listing?.parent && (
+          <button type="button" onClick={() => onNavigate(listing.parent!)} disabled={loading}
+            className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[12.5px] text-[var(--color-fg-dim)] hover:bg-[var(--color-hover)] disabled:opacity-50">
+            <CornerLeftUp className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-faint)]" />
+            ..
+          </button>
+        )}
+        {listing && listing.entries.length === 0 && !err && (
+          <div className="px-3 py-2 text-[12px] text-[var(--color-fg-faint)]">No subdirectories.</div>
+        )}
+        {listing?.entries.map(e => (
+          <div key={e.name} className="group flex w-full items-center gap-2 hover:bg-[var(--color-hover)]">
+            <button type="button" disabled={loading}
+              onClick={() => onNavigate(join(listing.path, e.name))}
+              className="flex min-w-0 flex-1 items-center gap-2 px-2.5 py-1.5 text-left text-[12.5px] disabled:opacity-50">
+              {e.is_git
+                ? <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-[var(--color-accent)]" />
+                : <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-faint)]" />}
+              <span className="truncate">{e.name}</span>
+              {forRepo && e.is_git && (
+                <span className="shrink-0 rounded bg-[var(--color-accent-deep)]/20 px-1 text-[10px] uppercase tracking-wider text-[var(--color-accent)]">git</span>
+              )}
+              <ChevronRight className="ml-auto h-3 w-3 shrink-0 text-[var(--color-fg-faint)] opacity-0 group-hover:opacity-100" />
+            </button>
+            {forRepo && e.is_git && (
+              <button type="button" disabled={loading}
+                onClick={() => onPick(join(listing.path, e.name))}
+                className="mr-2 shrink-0 rounded px-1.5 py-0.5 text-[11.5px] font-medium text-[var(--color-accent)] opacity-0 hover:bg-[var(--color-accent-deep)]/20 group-hover:opacity-100">
+                Select
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center justify-between border-t border-[var(--color-border-soft)] bg-[var(--color-bg)] px-2.5 py-1.5">
+        <span className="text-[11px] text-[var(--color-fg-faint)]">
+          {forRepo ? "Click a folder to open it; Select a git repo." : "Click a folder to open it."}
+        </span>
+        <Button variant="secondary" size="sm" disabled={!listing || loading}
+          onClick={() => listing && onPick(listing.path)}>
+          Use this directory
+        </Button>
+      </div>
+    </div>
   );
 }
 

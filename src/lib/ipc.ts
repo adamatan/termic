@@ -7,7 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Project, ProjectMember, Workspace, CreateWorkspaceArgs, CreateMultiArgs, Settings, DiscoveredRepo,
   ImportableWorktree, CliInfo, ChangeFile, Changes, GitStatus, FileEntry, Agent, RepoConfig,
-  SandboxMode, SshTarget, SshProbeInfo,
+  SandboxMode, SshTarget, SshProbeInfo, RemoteDirListing,
 } from "./types";
 import {
   COMPLETION_SOUND_SUPPORTED,
@@ -35,6 +35,10 @@ export const projectAddRemote = (target: SshTarget, rootPath: string) =>
  *  Backs the "Test connection" button. Rejects with an `ssh: ` message. */
 export const projectSshProbe = (target: SshTarget) =>
   invoke<SshProbeInfo>("project_ssh_probe", { target });
+/** List subdirectories of a path on a remote host (tilde OK; "" = home),
+ *  marking git repos. Backs the remote directory browser. */
+export const sshListDirs = (target: SshTarget, path: string) =>
+  invoke<RemoteDirListing>("ssh_list_dirs", { target, path });
 export const projectUpdate  = (p: Project) => invoke<void>("project_update", { p });
 export const projectRemove  = (id: string) => invoke<void>("project_remove", { id });
 export const projectReorder = (ids: string[]) => invoke<void>("project_reorder", { ids });

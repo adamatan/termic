@@ -1073,7 +1073,13 @@ fn pty_spawn(
                 format!("exec {envs} \"$SHELL\" -lc {}", ssh_exec::shq(&inner))
             }
         };
-        let script = format!("cd {} && {}", ssh_exec::shq(&args.cwd), body);
+        // sh -c wrapper: the remote LOGIN shell may be fish/csh; wrap so
+        // the command line parses under POSIX sh everywhere ("$SHELL"
+        // still expands to the user's real shell for the exec'd process).
+        let script = format!(
+            "sh -c {}",
+            ssh_exec::shq(&format!("cd {} && {}", ssh_exec::shq(&args.cwd), body)),
+        );
         let mut sargs = ssh_exec::ssh_base_args(t, false);
         // `~.`-style escapes could tear down the session on a stray
         // newline+tilde in agent output; the tab's X button is the way
@@ -1451,6 +1457,64 @@ fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, Stri
     list.push(p.clone());
     save_projects(&list).map_err(|e| e.to_string())?;
     Ok(p)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteDirEntry {
+    pub name: String,
+    /// True when the directory looks like a git repo (`.git` present,
+    /// file or dir - covers worktrees too). The browser highlights
+    /// these as selectable repositories.
+    pub is_git: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteDirListing {
+    /// Resolved ABSOLUTE path that was listed (tilde already expanded
+    /// host-side), so the frontend can breadcrumb + descend from it.
+    pub path: String,
+    pub parent: Option<String>,
+    pub entries: Vec<RemoteDirEntry>,
+}
+
+/// Browse a directory on a prospective remote host (the "Browse host"
+/// picker in the remote-project dialog). One bounded round trip:
+/// resolve the path, list its subdirectories (hidden dirs skipped,
+/// like a file picker), and mark which ones are git repos. Runs BEFORE
+/// a project exists, so it takes the raw target rather than an id.
+#[tauri::command]
+async fn ssh_list_dirs(target: SshTarget, path: String) -> Result<RemoteDirListing, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let raw = path.trim();
+        let start = if raw.is_empty() { "~" } else { raw };
+        let expanded = ssh_exec::expand_remote_tilde(&target, start).map_err(|e| e.to_string())?;
+        // `cd -P` + pwd resolves symlinks/relative segments host-side so
+        // the breadcrumb and `parent` math work on a canonical path. The
+        // `*/` glob matches only directories (and symlinks to them).
+        let script = format!(
+            "cd -P {} || exit 1; pwd; for f in */; do d=${{f%/}}; [ -d \"$d\" ] || continue; if [ -e \"$d/.git\" ]; then printf 'g\\t%s\\n' \"$d\"; else printf 'd\\t%s\\n' \"$d\"; fi; done",
+            ssh_exec::shq(&expanded),
+        );
+        let out = ssh_exec::run_remote(&target, &script, ssh_exec::QUICK, None)
+            .map_err(|e| e.to_string())?;
+        let mut lines = out.lines();
+        let resolved = lines.next().unwrap_or(&expanded).trim().to_string();
+        let mut entries = Vec::new();
+        for line in lines {
+            if let Some((kind, name)) = line.split_once('\t') {
+                entries.push(RemoteDirEntry { name: name.to_string(), is_git: kind == "g" });
+            }
+        }
+        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        let parent = match resolved.rsplit_once('/') {
+            Some(("", _)) if resolved != "/" => Some("/".to_string()),
+            Some((p, _)) if !p.is_empty() && resolved != "/" => Some(p.to_string()),
+            _ => None,
+        };
+        Ok(RemoteDirListing { path: resolved, parent, entries })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// One bounded round trip to a prospective remote host: reachable, git
@@ -4991,7 +5055,11 @@ fn remote_read_file(t: &SshTarget, abs: &str) -> Result<String, String> {
             let size = out.stderr.trim().strip_prefix("TOOBIG:").unwrap_or("?").to_string();
             Err(format!("file too large to preview ({} bytes)", size))
         }
-        Ok(out) if out.code == 255 => Err(format!("ssh: cannot reach {}: {}", t.label(), out.stderr.lines().last().unwrap_or("connection failed").trim())),
+        Ok(out) if out.code == 255 => {
+            let line = out.stderr.lines().last().unwrap_or("connection failed").trim();
+            let line = line.strip_prefix("ssh: ").unwrap_or(line);
+            Err(format!("ssh: cannot reach {}: {}", t.label(), line))
+        }
         Ok(out) => Err(format!("read failed: {}", out.stderr.trim())),
         Err(e) => Err(e.to_string()),
     }
@@ -5769,7 +5837,10 @@ fn script_command_for(
             let mut cmd = Command::new("ssh");
             cmd.args(ssh_exec::ssh_base_args(t, true));
             cmd.arg(t.destination());
-            cmd.arg(remote);
+            // sh -c wrapper: the remote LOGIN shell may be fish/csh; the
+            // single-quoted payload parses the same everywhere and then
+            // executes under POSIX sh (see ssh_exec::run_remote_raw).
+            cmd.arg(format!("sh -c {}", ssh_exec::shq(&remote)));
             // Login env locally so ssh finds SSH_AUTH_SOCK (agent auth).
             cmd.env("PATH", shell_env::resolved_path());
             for (k, v) in shell_env::login_env() {
@@ -6734,7 +6805,8 @@ fn workspace_grep_start(
                     let mut c = std::process::Command::new("ssh");
                     c.args(ssh_exec::ssh_base_args(t, true));
                     c.arg(t.destination());
-                    c.arg(script);
+                    // sh -c wrapper: login shell may be fish/csh.
+                    c.arg(format!("sh -c {}", ssh_exec::shq(&script)));
                     c.env("PATH", shell_env::resolved_path());
                     for (k, v) in shell_env::login_env() {
                         c.env(k, v);
@@ -8129,7 +8201,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            projects_list, project_add, project_add_multi, project_add_remote, project_ssh_probe, project_set_members, project_update, project_remove, project_reorder,
+            projects_list, project_add, project_add_multi, project_add_remote, project_ssh_probe, ssh_list_dirs, project_set_members, project_update, project_remove, project_reorder,
             workspaces_list, workspace_create, workspace_create_multi, workspace_open_repo, workspace_importable_worktrees, workspace_import_worktree, workspace_archive, workspace_set_cli, workspace_set_custom_command, workspace_set_resume_override, workspace_set_sandbox, workspace_set_yolo,
             sandbox_available, sandbox_deny_counts, sandbox_recent_denied_hosts, sandbox_recent_denied_paths, sandbox_access_counts, sandbox_recent_access_hosts, sandbox_recent_access_paths, sandbox_set_monitor_filters, workspace_sandbox_add_allowed_host, workspace_sandbox_add_allowed_path, workspace_sandbox_remove_allowed_path, agent_sandbox_add_allowed_path, agent_sandbox_add_allowed_host, workspace_recent_denials,
             repo_config_load, repo_config_load_at, repo_config_save, repo_config_scaffold, repo_config_add_allowed_host, repo_config_add_allowed_path,
