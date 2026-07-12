@@ -10,6 +10,7 @@ import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { CliIcon, CLI_BRAND_COLOR } from "@/icons/cli";
+import { useRemoteMissingClis } from "@/lib/remote";
 import { visibleCliIds } from "@/lib/agents";
 import { workspaceCreate, workspaceCreateMulti, settingsLoad, workspaceImportableWorktrees, workspaceImportWorktree, sandboxAvailable, workspaceOpenRepo } from "@/lib/ipc";
 import { slugify, branchify, cn } from "@/lib/utils";
@@ -57,6 +58,9 @@ export function NewWorkspaceDialog() {
   // The TerminalPane / ensureDefaultTab paths already treat cli="shell"
   // as a login zsh, so this is a complete workspace shape, not a stub.
   const SHELL_CHOICE = { id: "shell", display_name: "Terminal", color: "" } as any;
+  // Remote projects: agents missing on the HOST render grayed and
+  // unpressable in the segmented picker below.
+  const remoteMissing = useRemoteMissingClis(project?.ssh ? projectId : null);
   const cliChoices = (() => {
     const list = agents.length
       ? agents
@@ -67,6 +71,15 @@ export function NewWorkspaceDialog() {
 
   const [name, setName] = useState("");
   const [cli, setCli] = useState<string>("claude");
+  // If the selected agent turns out to be missing on the remote host
+  // (the probe resolves after the dialog seeded its default), move the
+  // selection to the first agent the host actually has, else Terminal.
+  useEffect(() => {
+    if (!remoteMissing.has(cli)) return;
+    const fallback = cliChoices.find(a => a.id !== "shell" && !remoteMissing.has(a.id))?.id ?? "shell";
+    setCli(fallback);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remoteMissing, cli]);
   const [branch, setBranch] = useState("");
   const [branchEdited, setBranchEdited] = useState(false);
   const [base, setBase] = useState("");
@@ -179,6 +192,8 @@ export function NewWorkspaceDialog() {
       const firstInstalled = list.find(a => !a.disabled && isInstalled(a.id))?.id;
       setCli(firstInstalled ?? "shell");
     }
+    // Remote projects: the host probe resolves async; the effect below
+    // bumps the selection off a host-missing agent when it lands.
     // Sandbox toggle defaults to project's preference OR the global
     // default (Settings → General). Either being true checks the box.
     // The user can still flip for THIS workspace - but once Create
@@ -627,11 +642,16 @@ export function NewWorkspaceDialog() {
               and not-installed agents are filtered out (see cliChoices).
               "Terminal" (cli="shell") is appended as a no-agent fallback. */}
           <div className="inline-flex flex-wrap items-stretch gap-y-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-[3px]">
-            {cliChoices.map(a => (
+            {cliChoices.map(a => {
+              const notOnHost = remoteMissing.has(a.id);
+              return (
               <button
                 key={a.id} type="button" onClick={() => setCli(a.id)}
+                disabled={notOnHost}
+                title={notOnHost ? "Not installed on the remote host" : undefined}
                 className={cn(
                   "flex h-7 items-center gap-1.5 rounded-[5px] px-2.5 text-[12.5px] transition-colors",
+                  notOnHost && "cursor-not-allowed opacity-40 grayscale",
                   cli === a.id
                     ? "bg-[var(--color-accent-deep)] text-white"
                     : cn("text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]", CLI_BRAND_COLOR[a.icon_id]),
@@ -645,7 +665,8 @@ export function NewWorkspaceDialog() {
                 <CliIcon cli={a.icon_id} className="h-3.5 w-3.5" />
                 {a.id === "agy" ? "Agy" : a.display_name}
               </button>
-            ))}
+              );
+            })}
           </div>
         </Field>
 

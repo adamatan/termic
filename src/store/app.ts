@@ -94,6 +94,11 @@ export interface AppState {
    *  pickers are never stranded before/without detection. Drives the
    *  install badge in Settings and the hide-uninstalled picker filter. */
   detectedClis: Record<string, import("@/lib/types").CliInfo>;
+  /** Remote-host CLI detection, keyed by PROJECT id then agent id.
+   *  Only populated for remote (ssh) projects via `refreshRemoteClis`.
+   *  An absent project entry means "not probed yet" — pickers treat
+   *  that as all-available instead of stranding the user on a probe. */
+  remoteClis: Record<string, Record<string, import("@/lib/types").CliInfo>>;
   /** Per-project spotlight: project_id → ws_id of the currently spotlighted
    *  workspace, or absent if none. Updated by spotlight://status events and
    *  hydrated from the Rust side on app start. Session-only (not persisted). */
@@ -107,6 +112,11 @@ export interface AppState {
    *  startup (App mount) and whenever Settings → Agent CLIs opens —
    *  deliberately NOT on every window focus. */
   refreshClis: () => Promise<void>;
+  /** Probe which agents exist on a remote project's HOST (one ssh round
+   *  trip). Deduped: at most one in-flight probe per project, and a
+   *  completed probe is not repeated for the session (agents rarely
+   *  appear mid-session; reopening the app re-probes). */
+  refreshRemoteClis: (projectId: string) => Promise<void>;
   setActiveWorkspace: (id: string | null) => void;
   setView: (page: View["page"]) => void;
   openSettings: (tab?: View["settingsTab"], repoId?: string) => void;
@@ -334,6 +344,10 @@ function durablePersistedTabs(tabs: Tab[] | undefined): PersistedTab[] {
 }
 
 
+/** Projects whose remote-host CLI probe has fired this session (also
+ *  suppresses concurrent duplicates while one is in flight). */
+const remoteClisProbed = new Set<string>();
+
 export const useApp = create<AppState>((set, get) => ({
   projects: [],
   workspaces: [],
@@ -361,6 +375,7 @@ export const useApp = create<AppState>((set, get) => ({
   collapsedWorkspaces: initialCollapsedWs as Record<string, boolean>,
   agents: [],
   detectedClis: {},
+  remoteClis: {},
   spotlightWsId: {},
 
   setSpotlight: (projectId, wsId) =>
@@ -391,6 +406,24 @@ export const useApp = create<AppState>((set, get) => ({
       set({ detectedClis: map });
     } catch {
       // Keep prior results; an empty map just means "show all".
+    }
+  },
+
+  refreshRemoteClis: async (projectId) => {
+    // Session-scoped dedup: one probe per project, plus in-flight
+    // suppression (several pickers can mount at once). Module-level so
+    // the guard survives store updates.
+    if (remoteClisProbed.has(projectId)) return;
+    remoteClisProbed.add(projectId);
+    try {
+      const list = await ipc.projectDetectRemoteClis(projectId);
+      const map: Record<string, import("@/lib/types").CliInfo> = {};
+      for (const c of list) map[c.name] = c;
+      set(s => ({ remoteClis: { ...s.remoteClis, [projectId]: map } }));
+    } catch {
+      // Unknown stays unknown (all agents remain pressable); allow a
+      // retry on the next picker open since nothing was recorded.
+      remoteClisProbed.delete(projectId);
     }
   },
 

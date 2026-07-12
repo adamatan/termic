@@ -20,6 +20,7 @@ import {
 import { CliIcon, CLI_BRAND_COLOR } from "@/icons/cli";
 import { Plus, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useRemoteMissingClis } from "@/lib/remote";
 import { visibleCliIds, isTerminalEntry } from "@/lib/agents";
 import { focusPaneTab } from "@/lib/tabFocus";
 import { requestClosePaneTab } from "@/lib/closeTab";
@@ -198,6 +199,8 @@ export function PaneHeader({ leaf, ws, onClose }: PaneHeaderProps) {
     () => registry.filter(a => visibleClis.has(a.id)),
     [registry, visibleClis],
   );
+  // Remote workspaces: gray out agents the HOST doesn't have.
+  const remoteMissing = useRemoteMissingClis(ws.ssh ? ws.project_id : null);
 
   const [open, setOpen]               = useState(false);
   const suppressDropdownReturn        = useRef(false);
@@ -281,14 +284,20 @@ export function PaneHeader({ leaf, ws, onClose }: PaneHeaderProps) {
             <>
               <DropdownSeparator />
               <DropdownLabel>New agent</DropdownLabel>
-              {agentEntries.map(a => (
-                <DropdownItem key={a.id} onSelect={() => spawnPaneTab(a.id)}>
+              {agentEntries.map(a => {
+                const notOnHost = remoteMissing.has(a.id);
+                return (
+                <DropdownItem key={a.id} disabled={notOnHost} onSelect={() => spawnPaneTab(a.id)}>
                   <span className={cn("shrink-0", CLI_BRAND_COLOR[a.icon_id] || "text-[var(--color-fg-dim)]")}>
                     <CliIcon cli={a.icon_id} className="h-4 w-4" />
                   </span>
                   {a.display_name}
+                  {notOnHost && (
+                    <span className="ml-auto shrink-0 text-[10px] uppercase tracking-wider text-[var(--color-fg-faint)]">not on host</span>
+                  )}
                 </DropdownItem>
-              ))}
+                );
+              })}
             </>
           )}
         </DropdownMenu>

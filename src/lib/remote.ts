@@ -2,6 +2,8 @@
 // (issue #82). Frontend counterpart of src-tauri/src/ssh_exec.rs; keep
 // the label logic in sync with SshTarget::label().
 
+import { useEffect, useMemo } from "react";
+import { useApp } from "@/store/app";
 import type { Project, SshTarget, Workspace } from "@/lib/types";
 
 export function isRemoteProject(p: Project | null | undefined): boolean {
@@ -23,4 +25,21 @@ export function sshLabel(t: SshTarget | null | undefined): string {
  *  Rust side prefixes exactly these with "ssh: ". */
 export function isSshError(err: unknown): boolean {
   return typeof err === "string" && err.startsWith("ssh: ");
+}
+
+/** Agent ids known to be MISSING on a remote project's host. Kicks off
+ *  the (deduped) host probe as a side effect. Empty set for local
+ *  projects, unknown projects, and while the probe is in flight — the
+ *  pickers only gray agents once a probe positively reported them
+ *  absent, never on "don't know yet". */
+export function useRemoteMissingClis(projectId: string | null | undefined): Set<string> {
+  const isRemote = useApp(s => !!(projectId && s.projects.find(p => p.id === projectId)?.ssh));
+  const map = useApp(s => (projectId ? s.remoteClis[projectId] : undefined));
+  useEffect(() => {
+    if (isRemote && projectId) void useApp.getState().refreshRemoteClis(projectId);
+  }, [isRemote, projectId]);
+  return useMemo(() => {
+    if (!isRemote || !map) return new Set<string>();
+    return new Set(Object.values(map).filter(c => !c.found).map(c => c.name));
+  }, [isRemote, map]);
 }

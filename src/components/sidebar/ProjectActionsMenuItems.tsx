@@ -11,6 +11,7 @@ import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
 import { workspaceOpenRepo } from "@/lib/ipc";
 import { visibleCliIds } from "@/lib/agents";
+import { useRemoteMissingClis } from "@/lib/remote";
 import { CliIcon, CLI_BRAND_COLOR } from "@/icons/cli";
 import { DropdownItem, DropdownSeparator } from "@/components/ui/Dropdown";
 
@@ -62,6 +63,10 @@ export function ProjectActionsMenuItems({ projectId, onPickRepoCli }: {
   const isNonGit = !!project?.non_git;
   // Hide disabled / not-installed agents from the Open-repo list.
   const visibleClis = visibleCliIds(agents.map(a => a.id), agents, detectedClis);
+  // Remote projects: agents the HOST doesn't have render grayed and
+  // unpressable (hiding them would read as a termic bug; the fix is on
+  // the host). Local detection above keeps its hide behavior.
+  const remoteMissing = useRemoteMissingClis(project?.ssh ? projectId : null);
 
   return (
     <>
@@ -72,8 +77,10 @@ export function ProjectActionsMenuItems({ projectId, onPickRepoCli }: {
           : "No worktree, launch the agent in the repo's current branch."}
         tone={isMulti ? "warn" : "dim"}
       />
-      {agents.filter(a => visibleClis.has(a.id)).map(a => (
-        <DropdownItem key={a.id} onSelect={async () => {
+      {agents.filter(a => visibleClis.has(a.id)).map(a => {
+        const notOnHost = remoteMissing.has(a.id);
+        return (
+        <DropdownItem key={a.id} disabled={notOnHost} onSelect={async () => {
           if (onPickRepoCli) { onPickRepoCli(a.id); return; }
           try {
             const w = await workspaceOpenRepo(projectId, a.id);
@@ -87,8 +94,14 @@ export function ProjectActionsMenuItems({ projectId, onPickRepoCli }: {
             <CliIcon cli={a.icon_id} className="h-4 w-4" />
           </span>
           <span className="truncate">{a.display_name}</span>
+          {notOnHost && (
+            <span className="ml-auto shrink-0 text-[10px] uppercase tracking-wider text-[var(--color-fg-faint)]">
+              not on host
+            </span>
+          )}
         </DropdownItem>
-      ))}
+        );
+      })}
       {/* Plain login-shell variant of "Run in repo" — same workspace
           shape (no worktree, current branch), but the default tab is
           a shell instead of an agent. cli="shell" is the same sentinel

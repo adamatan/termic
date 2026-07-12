@@ -15,6 +15,7 @@ import { Tip } from "@/components/ui/Tooltip";
 import { useUI } from "@/store/ui";
 import { requestCloseTab } from "@/lib/closeTab";
 import { focusMainTab } from "@/lib/tabFocus";
+import { useRemoteMissingClis } from "@/lib/remote";
 import { visibleCliIds, agentDisplayName, isTerminalEntry } from "@/lib/agents";
 import { cn } from "@/lib/utils";
 import { fileIconUrl } from "@/lib/explorer/iconResolver";
@@ -24,15 +25,25 @@ const CLIS = ["claude", "codex", "agy", "grok", "opencode"] as const;
 /** Registry entries rendered as dropdown rows — shared by the main strip's
  *  and the right strip's + menus (both their "New terminal" custom entries
  *  and their "New agent" lists) so the two menus can't drift apart. */
-function CliMenuItems({ entries, onSpawn }: { entries: Agent[]; onSpawn: (cli: string) => void }) {
+function CliMenuItems({ entries, onSpawn, missing }: {
+  entries: Agent[]; onSpawn: (cli: string) => void;
+  /** Agent ids absent on a remote workspace's host: grayed, unpressable. */
+  missing?: Set<string>;
+}) {
   return (
     <>
-      {entries.map(a => (
-        <DropdownItem key={a.id} onSelect={() => onSpawn(a.id)}>
+      {entries.map(a => {
+        const notOnHost = missing?.has(a.id) ?? false;
+        return (
+        <DropdownItem key={a.id} disabled={notOnHost} onSelect={() => onSpawn(a.id)}>
           <span className={cn("shrink-0", CLI_BRAND_COLOR[a.icon_id] || "text-[var(--color-fg-dim)]")}><CliIcon cli={a.icon_id} className="h-4 w-4" /></span>
           {a.display_name}
+          {notOnHost && (
+            <span className="ml-auto shrink-0 text-[10px] uppercase tracking-wider text-[var(--color-fg-faint)]">not on host</span>
+          )}
         </DropdownItem>
-      ))}
+        );
+      })}
     </>
   );
 }
@@ -66,6 +77,8 @@ export function TabBar({ ws }: { ws: Workspace }) {
   const registry = useApp(s => s.agents);
   const detectedClis = useApp(s => s.detectedClis);
   const visibleClis = visibleCliIds(registry.map(a => a.id), registry, detectedClis);
+  // Remote workspaces: gray out agents the HOST doesn't have.
+  const remoteMissing = useRemoteMissingClis(ws.ssh ? ws.project_id : null);
   const customTerminals = useMemo(
     () => registry.filter(a => isTerminalEntry(a) && !a.disabled),
     [registry],
@@ -203,7 +216,7 @@ export function TabBar({ ws }: { ws: Workspace }) {
             <CliMenuItems entries={customTerminals} onSpawn={spawnTab} />
             <DropdownSeparator />
             <DropdownLabel>New agent</DropdownLabel>
-            <CliMenuItems entries={registry.filter(a => visibleClis.has(a.id))} onSpawn={spawnTab} />
+            <CliMenuItems entries={registry.filter(a => visibleClis.has(a.id))} onSpawn={spawnTab} missing={remoteMissing} />
           </DropdownMenu>
         </DropdownRoot>
       </div>

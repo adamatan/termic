@@ -1517,6 +1517,57 @@ async fn ssh_list_dirs(target: SshTarget, path: String) -> Result<RemoteDirListi
     .map_err(|e| e.to_string())?
 }
 
+/// Probe which agent CLIs exist ON A REMOTE PROJECT'S HOST, in one
+/// bounded round trip. Mirrors `detect_clis` but resolves through the
+/// host's login shell (`"$SHELL" -lc 'command -v <bin>'`) — exactly how
+/// a remote PTY spawn resolves the binary, so found here means the
+/// spawn will find it too. Pickers gray out agents reported missing.
+/// Version probing is skipped (a second shell spawn per agent for a
+/// string only the Settings page shows).
+#[tauri::command]
+async fn project_detect_remote_clis(project_id: String) -> Result<Vec<CliInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let proj = load_projects().into_iter().find(|p| p.id == project_id)
+            .ok_or("project not found")?;
+        let Some(target) = proj.ssh else {
+            return Err("not a remote project".to_string());
+        };
+        let agents = {
+            let a = load_settings_inner().agents;
+            if a.is_empty() { default_agents() } else { a }
+        };
+        let mut script = String::new();
+        for a in &agents {
+            let bin = a.command.trim();
+            if bin.is_empty() { continue; }
+            // One line per agent: `<id>\t<0|1>\t<path>`. The lookup runs
+            // inside the user's login shell so PATH additions from the
+            // host's rc files count, matching the PTY spawn.
+            script.push_str(&format!(
+                "if p=$(\"${{SHELL:-sh}}\" -lc {probe} 2>/dev/null) && [ -n \"$p\" ]; then printf '%s\\t1\\t%s\\n' {id} \"$p\"; else printf '%s\\t0\\t\\n' {id}; fi\n",
+                probe = ssh_exec::shq(&format!("command -v {}", ssh_exec::shq(bin))),
+                id = ssh_exec::shq(&a.id),
+            ));
+        }
+        let out = ssh_exec::run_remote(&target, &script, ssh_exec::SLOW, None)
+            .map_err(|e| e.to_string())?;
+        let mut infos = Vec::new();
+        for line in out.lines() {
+            let mut it = line.splitn(3, '\t');
+            let (Some(name), Some(found), path) = (it.next(), it.next(), it.next()) else { continue };
+            infos.push(CliInfo {
+                name: name.to_string(),
+                found: found == "1",
+                path: path.unwrap_or("").trim().to_string(),
+                version: String::new(),
+            });
+        }
+        Ok(infos)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// One bounded round trip to a prospective remote host: reachable, git
 /// present, OS + $HOME. Backs the "Test connection" button in the
 /// remote-project dialog. async + spawn_blocking: this is network IO
@@ -8201,7 +8252,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            projects_list, project_add, project_add_multi, project_add_remote, project_ssh_probe, ssh_list_dirs, project_set_members, project_update, project_remove, project_reorder,
+            projects_list, project_add, project_add_multi, project_add_remote, project_ssh_probe, ssh_list_dirs, project_detect_remote_clis, project_set_members, project_update, project_remove, project_reorder,
             workspaces_list, workspace_create, workspace_create_multi, workspace_open_repo, workspace_importable_worktrees, workspace_import_worktree, workspace_archive, workspace_set_cli, workspace_set_custom_command, workspace_set_resume_override, workspace_set_sandbox, workspace_set_yolo,
             sandbox_available, sandbox_deny_counts, sandbox_recent_denied_hosts, sandbox_recent_denied_paths, sandbox_access_counts, sandbox_recent_access_hosts, sandbox_recent_access_paths, sandbox_set_monitor_filters, workspace_sandbox_add_allowed_host, workspace_sandbox_add_allowed_path, workspace_sandbox_remove_allowed_path, agent_sandbox_add_allowed_path, agent_sandbox_add_allowed_host, workspace_recent_denials,
             repo_config_load, repo_config_load_at, repo_config_save, repo_config_scaffold, repo_config_add_allowed_host, repo_config_add_allowed_path,

@@ -39,6 +39,10 @@ export const projectSshProbe = (target: SshTarget) =>
  *  marking git repos. Backs the remote directory browser. */
 export const sshListDirs = (target: SshTarget, path: string) =>
   invoke<RemoteDirListing>("ssh_list_dirs", { target, path });
+/** Which agent CLIs exist on a remote project's host (one round trip,
+ *  resolved through the host's login shell). Pickers gray out missing. */
+export const projectDetectRemoteClis = (projectId: string) =>
+  invoke<CliInfo[]>("project_detect_remote_clis", { projectId });
 export const projectUpdate  = (p: Project) => invoke<void>("project_update", { p });
 export const projectRemove  = (id: string) => invoke<void>("project_remove", { id });
 export const projectReorder = (ids: string[]) => invoke<void>("project_reorder", { ids });
