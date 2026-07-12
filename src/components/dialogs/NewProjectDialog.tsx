@@ -1,13 +1,13 @@
 // Add Project dialog with discovered-repos shortcut.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useUI } from "@/store/ui";
 import { useApp } from "@/store/app";
 import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { projectAdd, projectAddMulti, projectAddRemote, projectSshProbe, discoverRepos, settingsLoad, pathIsGitRepo } from "@/lib/ipc";
+import { projectAdd, projectAddMulti, projectAddRemote, projectSshProbe, discoverRepos, settingsLoad, pathIsGitRepo, homeDir } from "@/lib/ipc";
 import type { DiscoveredRepo, Project, ProjectMember, SshTarget } from "@/lib/types";
 import { Folder, FolderPlus, Layers, Server, X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -90,6 +90,13 @@ export function NewProjectDialog() {
     setMultiName("");
     setRemote({ host: "", user: "", port: "", identity: "", repoPath: "", workspacesPath: "" });
     setProbe({ state: "idle" });
+    // Default the SSH user to the local username (most home-lab setups
+    // mirror it). Derived from $HOME's basename; the user can clear it
+    // to defer to their ssh config instead.
+    homeDir().then(h => {
+      const name = h.replace(/\/+$/, "").split("/").pop() ?? "";
+      if (name) setRemote(r => (r.user ? r : { ...r, user: name }));
+    }).catch(() => {});
     (async () => {
       try {
         const s = await settingsLoad();
@@ -199,15 +206,31 @@ export function NewProjectDialog() {
     };
   }
 
+  // Monotonic sequence so a slow probe for an OLD host/user can't land
+  // after a newer one and clobber its result (unreachable hosts take up
+  // to the 10s ConnectTimeout while fast edits keep firing new probes).
+  const probeSeq = useRef(0);
   async function testConnection() {
+    const seq = ++probeSeq.current;
     setProbe({ state: "busy" });
     try {
       const info = await projectSshProbe(remoteTarget());
-      setProbe({ state: "ok", msg: `Connected. ${info.git_version}, ${info.os}` });
+      if (probeSeq.current === seq) setProbe({ state: "ok", msg: `Connected. ${info.git_version}, ${info.os}` });
     } catch (e) {
-      setProbe({ state: "err", msg: String(e) });
+      if (probeSeq.current === seq) setProbe({ state: "err", msg: String(e) });
     }
   }
+
+  // Proactive test: fire automatically once the user pauses typing in any
+  // connection field for 300ms. The manual button stays for re-testing
+  // (e.g. after fixing keys on the host without touching the form).
+  useEffect(() => {
+    if (!open || mode !== "remote") return;
+    if (!remote.host.trim()) return;
+    const id = window.setTimeout(() => { void testConnection(); }, 300);
+    return () => window.clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, mode, remote.host, remote.user, remote.port, remote.identity]);
 
   async function handleAddRemote() {
     setBusy(true); setErr(null);
@@ -386,6 +409,35 @@ export function NewProjectDialog() {
             </span>
           </label>
 
+          {/* Connection status sits ABOVE the repo fields: it auto-tests
+              300ms after the user stops typing in any connection field,
+              so by the time they reach the repo path they already know
+              whether the host works. The button re-tests on demand. */}
+          <div className="mt-4 flex items-center gap-3 rounded-md border border-[var(--color-border-soft)] bg-[var(--color-bg)] px-3 py-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!remote.host.trim() || probe.state === "busy"}
+              onClick={testConnection}
+            >
+              {probe.state === "busy" ? "Connecting…" : "Test connection"}
+            </Button>
+            {probe.state === "idle" && (
+              <span className="text-[12.5px] text-[var(--color-fg-faint)]">
+                {remote.host.trim() ? "Waiting to test…" : "Enter a host to test the connection."}
+              </span>
+            )}
+            {probe.state === "busy" && (
+              <span className="text-[12.5px] text-[var(--color-fg-faint)]">Connecting to {remote.host.trim()}…</span>
+            )}
+            {probe.state === "ok" && (
+              <span className="text-[12.5px] text-[var(--color-ok)]">{probe.msg}</span>
+            )}
+            {probe.state === "err" && (
+              <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--color-err)]" title={probe.msg}>{probe.msg}</span>
+            )}
+          </div>
+
           <label className="mt-4 block text-[13.5px]">
             Repository path on the host
             <Input
@@ -411,24 +463,6 @@ export function NewProjectDialog() {
               <code className="mono">~/termic/workspaces</code>.
             </span>
           </label>
-
-          {/* Test connection: one bounded round trip (reachability, git,
-              OS). Inline result so auth problems surface before Add. */}
-          <div className="mt-4 flex items-center gap-3">
-            <Button
-              variant="secondary"
-              disabled={!remote.host.trim() || probe.state === "busy"}
-              onClick={testConnection}
-            >
-              {probe.state === "busy" ? "Connecting…" : "Test connection"}
-            </Button>
-            {probe.state === "ok" && (
-              <span className="text-[12.5px] text-[var(--color-ok)]">{probe.msg}</span>
-            )}
-            {probe.state === "err" && (
-              <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--color-err)]" title={probe.msg}>{probe.msg}</span>
-            )}
-          </div>
 
           {err && <p className="mt-2 text-[13.5px] text-[var(--color-err)]">{err}</p>}
 
