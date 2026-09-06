@@ -10,7 +10,7 @@ import type {
   ImportableWorktree, CliInfo, ChangeFile, Changes, GitStatus, CheckoutResult, UpdateMode, UpdateResult, UpdateInfo, FileEntry, Agent, RepoConfig,
   SandboxMode, TaskDiffSummary, CliInstallStatus, McpStatus, BranchContext, BlameFile, GitCommit, GitCompare, GitFile, GitLogPage, GitRef,
   ForgeCliStatus, PrLookup, PrComment, IssueLookup, AgentHookStatus, HookPlan,
-  ProfileView, ProfilesView, ProfileDeletePreview,
+  ProfileView, ProfilesView, ProfileDeletePreview, AgentAccountsView,
 } from "./types";
 import type { CustomThemeFile } from "./customTheme";
 import {
@@ -22,6 +22,38 @@ import {
   readCompletionSoundId,
   type CompletionSoundId,
 } from "./notificationSounds";
+
+// ───────────────────────── agent accounts ─────────────────────────
+// GH #278. All login verbs; none of them takes a path, because where a login
+// lives is derived from the account's NAME and never stored.
+
+export const agentAccounts = (agentId: string, docker: boolean) =>
+  invoke<AgentAccountsView>("agent_accounts", { agentId, docker });
+export const accountAdd = (agentId: string, name: string) =>
+  invoke<void>("account_add", { agentId, name });
+export const accountRemove = (agentId: string, name: string) =>
+  invoke<void>("account_remove", { agentId, name });
+/** Close this window unless it is the last one open (GH #280).
+ *
+ *  The last-window check is Rust's, deliberately: the difference between
+ *  closing a window and quitting the app must not rest on a frontend store
+ *  that a just-closed sibling can leave stale. Resolves false when it declined.
+ */
+export const windowCloseIfNotLast = () => invoke<boolean>("window_close_if_not_last");
+
+/** Turn the automatic switch on or off for one agent (GH #278). Rejected by
+ *  Rust for an agent with no usage feed, rather than stored and never fired. */
+export const accountSetAutoSwitch = (agentId: string, on: boolean) =>
+  invoke<void>("account_set_auto_switch", { agentId, on });
+export const accountSetDefault = (agentId: string, name: string | null) =>
+  invoke<void>("account_set_default", { agentId, name });
+/** Point ONE task at a different account. The running PTY keeps its old login
+ *  (a process cannot have its environment changed underneath it); the next
+ *  spawn picks the new one up, which is what makes switch-and-resume work. */
+export const taskSetAccount = (id: string, agentId: string, name: string | null) =>
+  invoke<void>("task_set_account", { id, agentId, name });
+export const taskAccount = (id: string, agentId: string) =>
+  invoke<string | null>("task_account", { id, agentId });
 
 // ───────────────────────────── profiles ─────────────────────────────
 // GH #280. `profilesList` returns the calling WINDOW's view: `current` is
@@ -281,9 +313,13 @@ export const sandboxAvailable = () => invoke<boolean>("sandbox_available");
 export const usageStatusLineOwner = (agentId: string, cwd: string) =>
   invoke<StatusLineOwner>("usage_status_line_owner", { agentId, cwd });
 
-export const agentUsageCodex = (agentId: string, docker: boolean) =>
+/** `account` is the login to ASK, not a label: codex answers for whichever
+ *  `CODEX_HOME` it is pointed at, so omitting it reported the primary
+ *  account's quota under every account's name. `null` is the agent's ordinary
+ *  login, which is also what the adopted account resolves to. */
+export const agentUsageCodex = (agentId: string, docker: boolean, account: string | null) =>
   invoke<AgentUsage & { planType: string | null; accountId: string | null }>(
-    "agent_usage_codex", { agentId, docker });
+    "agent_usage_codex", { agentId, docker, account });
 
 /** Per-task deny counters surfaced in the TerminalPane footer
  *  chip. Currently only `network` (the proxy bumps it on every CONNECT
@@ -884,6 +920,11 @@ export interface SandboxStatus {
 export interface SpawnResult {
   id: string;
   sandbox: SandboxStatus;
+  /** The account this process was actually spawned with, `null` for the
+   *  agent's ordinary login (GH #278). Returned by Rust rather than derived
+   *  here, because a switch applies on the NEXT spawn and the configured
+   *  account therefore names something this process may not be using. */
+  account: string | null;
 }
 export const ptySpawn  = (a: SpawnArgs) => invoke<SpawnResult>("pty_spawn", { args: a });
 export const ptyWrite  = (ptyId: string, data: number[]) => invoke<void>("pty_write", { ptyId, data });

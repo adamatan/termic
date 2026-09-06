@@ -1,3 +1,14 @@
+// The task footer's agent control: which account it runs as, what that
+// account has spent, and one panel behind it (GH #277 + GH #278).
+//
+// ONE chip, not two. The account pill used to sit immediately left of this
+// with its own trigger and its own panel, and its own header said it "forms
+// one unit" with the usage chip, because the numbers here are THAT account's
+// numbers. Two controls that form one unit are one control: merging them
+// answers "which account, and how much is left" in a single click, and
+// removed a duplicated auto-switch checkbox that had already caused one
+// two-panels-disagree bug.
+//
 // Subscription usage in the task footer (GH #277).
 //
 // Two numbers per account, a fill bar, and the agent's own brand icon. It sits
@@ -15,15 +26,22 @@ import { PopoverRoot, PopoverTrigger, PopoverContent } from "@/components/ui/Pop
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
 import { CircleSlash, Copy, Check } from "lucide-react";
 import * as ipc from "@/lib/ipc";
+import { Checkbox } from "@/components/ui/Checkbox";
 import { cn } from "@/lib/utils";
-import { useAgentUsage, type UsageEntry } from "@/store/agentUsage";
+import { useAgentUsage, usageKey, costTotal, costChipVisible, type UsageEntry } from "@/store/agentUsage";
 import {
-  formatPercent, formatReset, usageLevel, drivingWindow,
+  formatPercent, formatReset, formatUsd, usageLevel, drivingWindow,
   USAGE_WARN_PERCENT, USAGE_CRITICAL_PERCENT,
   blocksUsageFeed, blockedReason, statusLineAgentPrompt,
   type UsageLevel, type UsageWindow, type StatusLineOwner,
 } from "@/lib/agentUsage";
 import { builtinBaseId, agentDisplayName } from "@/lib/agents";
+import type { AgentAccounts } from "@/hooks/useAgentAccounts";
+import { useAccountSwitching } from "@/hooks/useAccountSwitching";
+import { AccountSwitcher } from "@/components/task/AccountSwitcher";
+import { pillVisible } from "@/lib/accountPill";
+import { KeyRound, ArrowRightLeft } from "lucide-react";
+import type { AgentAccountsView } from "@/lib/types";
 import { useApp } from "@/store/app";
 
 /** How long a codex reading stands before the chip asks again.
@@ -39,9 +57,17 @@ const CODEX_REFRESH_MS = 120_000;
  *  otherwise present last night's number as current. */
 const STALE_AFTER_MS = 15 * 60_000;
 
-export function UsageChip({ agentId, cwd, docker, visible }: {
-  /** The agent ENTRY id (a clone keeps its own), which is the account key. */
+export function AgentChip({ taskId, agentId, cwd, docker, accounts, visible }: {
+  taskId: string;
+  /** The agent ENTRY id (a clone keeps its own). Half of the account key: the
+   *  other half is `liveAccount`, because one entry can now hold several
+   *  logins (GH #278). */
   agentId: string;
+  /** The footer's shared account state. `accounts.account` is the login these
+   *  numbers were spent on, which is the RUNNING one and not the configured
+   *  one: a switch applies on the next spawn, so between the click and the
+   *  restart the two differ. */
+  accounts: AgentAccounts;
   /** The task's worktree. A project can ship its own status line, which
    *  outranks the one termic installs, so the answer is per TASK. */
   cwd?: string;
@@ -55,7 +81,12 @@ export function UsageChip({ agentId, cwd, docker, visible }: {
    *  open task would spawn its own app-server on the same timer. */
   visible: boolean;
 }) {
-  const entry = useAgentUsage(s => s.byAgent[agentId]);
+  const { account: liveAccount, view: accountsView, refresh: refreshAccounts } = accounts;
+  const entry = useAgentUsage(s => s.byAgent[usageKey(agentId, liveAccount)]);
+  // Everything this account has spent since termic launched. A NUMBER, not the
+  // entry, so this chip re-renders when its own total moves and not when some
+  // other account's does.
+  const spend = useAgentUsage(s => costTotal(s.cost[usageKey(agentId, liveAccount)]));
   const agents = useApp(a => a.agents);
   // A clone of codex runs codex, so the base decides the transport, not the
   // entry id. `docker.rs` documents the same distinction on the Rust side.
@@ -66,6 +97,11 @@ export function UsageChip({ agentId, cwd, docker, visible }: {
   // agent whose usage arrives through a status line, so it is the only one
   // that can be shadowed by somebody else's. Asked once, and only while there
   // is nothing to show anyway, so a working feed never pays for it.
+  const [detailOpen, setDetailOpen] = useState(false);
+  // Held HERE rather than in the panel: the automatic switch fires when an
+  // account passes its limit, which is exactly a moment nobody has a panel
+  // open. The panel is unmounted most of the time; this chip is not.
+  const sw = useAccountSwitching(taskId, agentId, accounts, visible);
   const [owner, setOwner] = useState<StatusLineOwner | null>(null);
   const known = !!entry && (!!entry.session || !!entry.weekly);
   useEffect(() => {
@@ -83,12 +119,19 @@ export function UsageChip({ agentId, cwd, docker, visible }: {
     if (!isCodex || !visible) return;
     let cancelled = false;
     const ask = () => {
-      ipc.agentUsageCodex(agentId, docker)
+      ipc.agentUsageCodex(agentId, docker, liveAccount)
         .then(u => {
           if (cancelled) return;
           // `report` bails on an unchanged reading, so a refresh that moved
           // nothing costs no store write and no re-render.
-          useAgentUsage.getState().report(agentId, { session: u.session, weekly: u.weekly }, "rpc");
+          useAgentUsage.getState().report(
+            agentId, liveAccount,
+            // No cost from codex: `account/rateLimits/read` answers plan
+            // windows, and codex's own spend data is a TOKEN count. Turning
+            // that into dollars would mean a per-model price table in termic,
+            // which goes silently wrong the day prices move.
+            { session: u.session, weekly: u.weekly, sessionCostUsd: null },
+            "rpc");
         })
         // No banner: codex may not be installed, may not be logged in, or may
         // be an older build without the method, and none of those is worth
@@ -101,7 +144,7 @@ export function UsageChip({ agentId, cwd, docker, visible }: {
     ask();
     const id = window.setInterval(ask, CODEX_REFRESH_MS);
     return () => { cancelled = true; window.clearInterval(id); };
-  }, [agentId, docker, isCodex, visible]);
+  }, [agentId, docker, isCodex, liveAccount, visible]);
 
   // Nothing known yet: render nothing at all rather than a placeholder. An
   // account that has not spoken has no honest number to show, and a row of
@@ -110,20 +153,38 @@ export function UsageChip({ agentId, cwd, docker, visible }: {
   // The ONE exception is a positively detected blocker, below: "we know why
   // this will never report" is a fact worth showing, where "nothing yet" is
   // not.
-  if (!entry || (!entry.session && !entry.weekly)) {
+  // The two halves self-hide independently: an agent with no usage feed still
+  // has accounts to switch, and an agent with no named account still has
+  // numbers. The chip renders when EITHER has something.
+  const hasNumbers = !!entry && (!!entry.session || !!entry.weekly || costChipVisible(entry, spend));
+  const hasAccounts = pillVisible(accountsView);
+  if (!hasNumbers && !hasAccounts) {
     return blocksUsageFeed(owner) ? <BlockedChip owner={owner!} /> : null;
   }
 
-  const stale = Date.now() - entry.updatedAt > STALE_AFTER_MS;
+  const stale = !!entry && Date.now() - entry.updatedAt > STALE_AFTER_MS;
   // The bar tracks the window closest to its limit, which is not always the
   // session one: 30% of five hours next to 95% of the week has to read as a
   // warning, not as comfort. `drivingWindow` is where that is decided.
-  const driver = drivingWindow(entry)!;
-  const level = usageLevel(driver.window.usedPercent);
+  // Both null on an API-key account: it has no plan to be a percentage OF.
+  const driver = entry ? drivingWindow(entry) : null;
+  const level = driver ? usageLevel(driver.window.usedPercent) : "normal";
   const iconId = resolveIconId(agentId, agents);
 
   return (
-    <PopoverRoot>
+    // Re-read the accounts when this opens: the opt-in below has a second
+    // surface (the account pill carries the same checkbox) and nothing pushes
+    // a change between them.
+    <PopoverRoot
+      open={detailOpen}
+      onOpenChange={o => {
+        setDetailOpen(o);
+        // Re-read on OPEN so a set added in Settings is there; clear the
+        // notice on CLOSE, never on open, or the one thing the user opened
+        // the panel to read is unmounted as they look at it.
+        if (o) refreshAccounts(); else sw.clearNotice();
+      }}
+    >
       <PopoverTrigger asChild>
         <button
           type="button"
@@ -132,15 +193,35 @@ export function UsageChip({ agentId, cwd, docker, visible }: {
           // user reads rather than the store field behind it. Percentages are
           // rounded here exactly as they are rendered.
           data-usage-agent={agentId}
-          data-usage-session={entry.session ? String(Math.round(entry.session.usedPercent)) : ""}
-          data-usage-weekly={entry.weekly ? String(Math.round(entry.weekly.usedPercent)) : ""}
-          data-usage-source={entry.source}
+          data-usage-session={entry?.session ? String(Math.round(entry.session.usedPercent)) : ""}
+          data-usage-weekly={entry?.weekly ? String(Math.round(entry.weekly.usedPercent)) : ""}
+          data-usage-source={entry?.source ?? ""}
           data-usage-level={level}
-          title={`${agentDisplayName(agentId, agents)} plan usage`}
+          // The ACCOUNT half's state, on the same element: one chip, so one
+          // set of attributes for a spec to read.
+          data-testid-account={hasAccounts ? "1" : ""}
+          data-account={sw.label ?? ""}
+          data-offering={sw.offering ? sw.candidate! : ""}
+          data-usage-account={accounts.account ?? ""}
+          data-auto={sw.auto ? "on" : "off"}
+          title={
+            sw.offering
+              ? `${sw.shown.now} is nearly out of plan. Switch to ${sw.candidate}.`
+              : sw.shown.next
+                ? `${agentId} is running as ${sw.shown.now}. It switches to ${sw.shown.next} when it next starts.`
+                : hasAccounts
+                  ? `${agentDisplayName(agentId, agents)}, signed in as ${sw.shown.now}`
+                  : `${agentDisplayName(agentId, agents)} plan usage`
+          }
           className={cn(
             "flex shrink-0 items-center gap-1.5 rounded px-1.5 py-0.5 tabular-nums",
             "hover:bg-[var(--color-bg-2)] hover:text-[var(--color-fg)]",
-            stale ? "text-[var(--color-fg-faint)]" : "text-[var(--color-fg-dim)]",
+            // Deliberately NOT `transition-colors`: a themed colour set from
+            // React state never repaints under that shorthand in WKWebView
+            // (docs/gotchas.md), which is how this would light up amber
+            // everywhere except the machine it ships on.
+            sw.alert ? "text-[var(--color-warn)]"
+              : stale ? "text-[var(--color-fg-faint)]" : "text-[var(--color-fg-dim)]",
           )}
         >
           {/* The agent's own brand icon, not a generic gauge. Two DIFFERENT
@@ -152,29 +233,52 @@ export function UsageChip({ agentId, cwd, docker, visible }: {
           <span className={cn("shrink-0", CLI_BRAND_COLOR[iconId] || "text-[var(--color-fg-dim)]")}>
             <CliIcon cli={iconId} className="h-4 w-4" />
           </span>
-          <UsageBar percent={driver.window.usedPercent} level={level} stale={stale} />
+          {/* The account, when there is one to name. A key glyph only while
+              something needs attention: the brand icon already says which
+              agent this is, so a second permanent icon would be width spent
+              on nothing. */}
+          {hasAccounts && (
+            <>
+              {sw.alert && <ArrowRightLeft className="h-3.5 w-3.5 shrink-0" />}
+              <span className="max-w-[14ch] truncate">{sw.shown.now}</span>
+              {hasNumbers && <span className="text-[var(--color-fg-faint)]">·</span>}
+            </>
+          )}
+          {driver && <UsageBar percent={driver.window.usedPercent} level={level} stale={stale} />}
           {/* Two fixed labels rather than one adaptive string: the footer must
               not reflow as the numbers tick, and "58% 5h" next to "41% wk" is
               read as two things at a glance where "58/41" is read as neither.
               The DRIVING window's number takes the colour too, so a red bar is
               never ambiguous about which of the two it means. */}
-          {entry.session && (
-            <span className={driver.label === "5h" ? LEVEL_TEXT[level] : undefined}>
+          {entry?.session && (
+            <span className={driver?.label === "5h" ? LEVEL_TEXT[level] : undefined}>
               {formatPercent(entry.session)} <Unit>5h</Unit>
             </span>
           )}
-          {entry.session && entry.weekly && <span className="text-[var(--color-fg-faint)]">·</span>}
-          {entry.weekly && (
-            <span className={driver.label === "wk" ? LEVEL_TEXT[level] : undefined}>
+          {entry?.session && entry?.weekly && <span className="text-[var(--color-fg-faint)]">·</span>}
+          {entry?.weekly && (
+            <span className={driver?.label === "wk" ? LEVEL_TEXT[level] : undefined}>
               {formatPercent(entry.weekly)} <Unit>wk</Unit>
             </span>
+          )}
+          {/* Spend since launch, and ONLY for an account with no plan, which
+              is the case this feed exists for. On a subscription the
+              percentages are the readout: a dollar figure beside them is a
+              second number competing for the same glance, and showing it
+              before the first `rate_limits` arrives made the chip flip from
+              money to a bar mid-turn. The popover still carries the spend. */}
+          {costChipVisible(entry, spend) && (
+            <>
+              {(entry?.session || entry?.weekly) && <span className="text-[var(--color-fg-faint)]">·</span>}
+              <span data-usage-spend={spend.toFixed(4)}>{formatUsd(spend)}</span>
+            </>
           )}
         </button>
       </PopoverTrigger>
       <PopoverContent
         side="top"
         align="end"
-        className="w-72 p-0"
+        className="w-80 p-0"
         // Nothing in here is interactive, so taking focus would be pure theft:
         // the user is typing at an agent, and Radix's default is to move focus
         // into the panel on open. Escape still closes it (the dismissable
@@ -183,7 +287,21 @@ export function UsageChip({ agentId, cwd, docker, visible }: {
         onOpenAutoFocus={e => e.preventDefault()}
         onCloseAutoFocus={e => e.preventDefault()}
       >
-        <UsageDetail agentId={agentId} entry={entry} level={level} driver={driver} />
+        <UsageDetail
+          agentId={agentId} entry={entry} level={level} driver={driver} spend={spend}
+          accountsView={accountsView} refreshAccounts={refreshAccounts}
+          onNavigate={() => setDetailOpen(false)}
+        />
+        {/* The credentials half of the same panel. Rendered here rather than
+            in its own popover: one control, one panel. */}
+        {hasAccounts && accountsView && (
+          <AccountSwitcher
+            agentId={agentId}
+            view={accountsView}
+            sw={sw}
+            onNavigate={() => setDetailOpen(false)}
+          />
+        )}
       </PopoverContent>
     </PopoverRoot>
   );
@@ -196,16 +314,27 @@ export function UsageChip({ agentId, cwd, docker, visible }: {
  *  used, resets Wed 10:00 Reported by the agent as it works."), which is
  *  unreadable at exactly the moment you went looking for it. Rows, a bar per
  *  window, and the reset clock in its own column. */
-function UsageDetail({ agentId, entry, level, driver }: {
+function UsageDetail({ agentId, entry, level, driver, spend, accountsView, refreshAccounts, onNavigate }: {
   agentId: string;
-  entry: UsageEntry;
+  /** Undefined for an account that has never reported: the panel is then
+   *  purely the credentials half, and the usage rows are skipped rather than
+   *  rendered as blanks. */
+  entry: UsageEntry | undefined;
   level: UsageLevel;
-  driver: { window: UsageWindow; label: "5h" | "wk" };
+  /** `null` on an account with no plan windows, which has no driving one. */
+  driver: { window: UsageWindow; label: "5h" | "wk" } | null;
+  /** USD spent on this account since launch. */
+  spend: number;
+  accountsView: AgentAccountsView | null;
+  refreshAccounts: () => void;
+  /** Close the popover: a row that navigates away must not leave it hanging
+   *  over the page it just opened. */
+  onNavigate: () => void;
 }) {
   const agents = useApp(a => a.agents);
   const iconId = resolveIconId(agentId, agents);
-  const age = Date.now() - entry.updatedAt;
-  const stale = age > STALE_AFTER_MS;
+  const age = entry ? Date.now() - entry.updatedAt : 0;
+  const stale = !!entry && age > STALE_AFTER_MS;
   const display = agentDisplayName(agentId, agents);
 
   return (
@@ -225,14 +354,42 @@ function UsageDetail({ agentId, entry, level, driver }: {
       </div>
 
       <div className="flex flex-col gap-2.5 px-3 py-2.5">
-        <UsageRow label="Session" sub="rolling 5 hours" window={entry.session}
-          driving={driver.label === "5h"} level={level} source={entry.source} />
-        <UsageRow label="Weekly" sub="rolling 7 days" window={entry.weekly}
-          driving={driver.label === "wk"} level={level} source={entry.source} />
+        {!entry ? null : (entry.session || entry.weekly) ? (
+          <>
+            <UsageRow label="Session" sub="rolling 5 hours" window={entry.session}
+              driving={driver?.label === "5h"} level={level} source={entry.source} />
+            <UsageRow label="Weekly" sub="rolling 7 days" window={entry.weekly}
+              driving={driver?.label === "wk"} level={level} source={entry.source} />
+          </>
+        ) : (
+          // No plan at all: say so, rather than showing two empty bars. This
+          // is the API-key account, and its whole readout is the spend below.
+          <div className="text-[var(--color-fg-faint)]">
+            This account is billed per token, so it has no plan limits.
+          </div>
+        )}
+        {spend > 0 && (
+          <div
+            data-testid="usage-spend-row"
+            className="flex items-baseline justify-between border-t border-[var(--color-border-soft)] pt-2.5"
+          >
+            <span className="text-[var(--color-fg-dim)]">
+              Spent since launch
+              {/* Said out loud, because the number resets when termic does and
+                  someone comparing it against a provider dashboard needs to
+                  know that before they trust it. */}
+              <span className="block text-[11px] text-[var(--color-fg-faint)]">
+                this agent, this account
+              </span>
+            </span>
+            <span className="tabular-nums font-medium text-[var(--color-fg)]">{formatUsd(spend)}</span>
+          </div>
+        )}
       </div>
 
+      {entry && (
       <div className="border-t border-[var(--color-border-soft)] px-3 py-2 text-[var(--color-fg-faint)]">
-        {level !== "normal" && (
+        {level !== "normal" && driver && (
           <div className={cn("mb-1", LEVEL_TEXT[level])}>
             Over {level === "critical" ? USAGE_CRITICAL_PERCENT : USAGE_WARN_PERCENT}% of the{" "}
             {driver.label === "5h" ? "session" : "weekly"} limit.
@@ -248,7 +405,64 @@ function UsageDetail({ agentId, entry, level, driver }: {
           {stale ? ` Last updated ${describeAge(age)} ago.` : ""}
         </div>
       </div>
+      )}
+      {/* Only the "add a second set" nudge survives here: once accounts exist
+          the switcher below IS the credentials UI, and the auto-switch
+          checkbox lives there. Two copies of that checkbox is what the merge
+          removed. */}
+      <AccountRow agentId={agentId} view={accountsView} refresh={refreshAccounts} onNavigate={onNavigate} />
     </div>
+  );
+}
+
+/** The account row under the numbers: the one discovery vector that fires at
+ *  the moment of need (GH #278).
+ *
+ *  Someone opens this popover when they are near a limit, which is exactly
+ *  when a second account becomes interesting. It is the only surface where
+ *  that thought and this affordance meet, and it shows whichever of the two
+ *  steps the user has not taken yet:
+ *
+ *    no second account  ->  add one
+ *    a second account   ->  let termic move to it on its own
+ *
+ *  Never both, and never a disabled control for the step that is not reachable
+ *  yet. An always-visible toggle that cannot do anything until some other
+ *  thing exists teaches people to ignore the row.
+ *
+ *  It cannot be the ONLY vector, and that is why the agent card carries one
+ *  too: this chip renders nothing until an account has actually reported
+ *  usage, which today means claude and codex alone. The other six built-ins
+ *  never show it. The footer pill carries the same toggle, for the user who
+ *  reaches for the account menu rather than the numbers.
+ */
+function AccountRow({ agentId, view, refresh, onNavigate }: {
+  agentId: string;
+  view: AgentAccountsView | null;
+  refresh: () => void;
+  onNavigate: () => void;
+}) {
+  // Only the nudge toward a SECOND set. Once one exists the switcher section
+  // below is the credentials UI, and the auto-switch checkbox lives there:
+  // this row used to carry its own copy, and toggling one left the other
+  // stale until something remounted it.
+  if (!view || !view.supported || view.accounts.length >= 1) return null;
+
+  return (
+    <button
+      type="button"
+      data-testid="usage-add-credentials"
+      onClick={() => {
+        // Close first, then navigate: the panel is fixed-position and would
+        // otherwise sit over the page it just opened. And carry the AGENT, so
+        // Settings lands on the right card with the control focused.
+        onNavigate();
+        useApp.getState().openSettings("agents", undefined, `${agentId}:accounts`);
+      }}
+      className="w-full border-t border-[var(--color-border-soft)] px-3 py-2 text-left text-[12px] text-[var(--color-fg-dim)] hover:bg-[var(--color-bg-2)] hover:text-[var(--color-fg)]"
+    >
+      Running low? Add a second account...
+    </button>
   );
 }
 
@@ -399,7 +613,9 @@ function BlockedChip({ owner }: { owner: StatusLineOwner }) {
  *  good news, and a window of green bars trains you to ignore the one that
  *  turns amber. */
 const LEVEL_FILL: Record<UsageLevel, string> = {
-  normal:   "bg-[var(--color-fg-faint)]",
+  // `--color-fg-dim`, not `--color-fg-faint`: faint against the new track was
+  // two greys a shade apart, which is not a reading you can take at a glance.
+  normal:   "bg-[var(--color-fg-dim)]",
   warn:     "bg-[var(--color-warn)]",
   critical: "bg-[var(--color-err)]",
 };
@@ -430,12 +646,16 @@ function UsageBar({ percent, level, stale }: {
   return (
     <span
       aria-hidden
-      // 8px tall in a 36px (`h-9`) footer, and 56px wide. Sized to be READ at a
-      // glance from across the desk rather than to be tidy: a 4px hairline is
-      // the kind of thing you only notice once you already know it is there,
-      // which defeats the point of putting a bar next to a number that is
-      // already written out in words.
-      className="h-2 w-14 shrink-0 overflow-hidden rounded-full bg-[var(--color-bg-3)]"
+      // SHORT and THICK: 10px tall, 32px wide. It shares the chip with an
+      // account name now, so length is the wrong axis to spend on, and a long
+      // thin bar reads as a divider rather than as a gauge.
+      //
+      // The track is `--color-border`, not `--color-bg-3`: against the footer
+      // the old track was nearly invisible, so a low percentage looked like a
+      // bar that had failed to render rather than one that was nearly empty. A
+      // gauge has to show its EMPTY part too, or the fill has nothing to be a
+      // fraction of.
+      className="h-2.5 w-8 shrink-0 overflow-hidden rounded-full bg-[var(--color-border)]"
     >
       <span
         data-testid="usage-bar-fill"
@@ -456,11 +676,16 @@ function UsageBar({ percent, level, stale }: {
 /** The unit beside a percentage, one step dimmer than the number.
  *
  *  The number is the DATA and the unit is the label, and at 12.5px in a footer
- *  they otherwise read as one four-character word. Its own explicit colour, so
- *  it stays quiet even inside a percentage that has gone amber or red: a unit
- *  is never the thing that turned urgent. */
+ *  they otherwise read as one four-character word.
+ *
+ *  OPACITY, not its own colour. A fixed `--color-fg-faint` kept the unit quiet
+ *  in the wrong way: it did not brighten with the chip on hover, so pointing
+ *  at the control made the numbers step forward and left "5h" and "wk"
+ *  behind, and it was too dim to read at rest besides. Opacity subdues it
+ *  RELATIVE to whatever the number is doing, which also keeps a unit from
+ *  ever being the thing that turned amber or red. */
 function Unit({ children }: { children: string }) {
-  return <span className="text-[var(--color-fg-faint)]">{children}</span>;
+  return <span className="opacity-70">{children}</span>;
 }
 
 function describeAge(ms: number): string {

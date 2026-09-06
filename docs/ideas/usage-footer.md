@@ -30,8 +30,23 @@ free, but it is a different number and would need its own label.
   agent hooks (schema v7). It prints nothing and writes one OSC 777 on the
   hook channel, so the agent looks unchanged.
 - **codex** is asked, over `account/rateLimits/read` on `codex app-server`.
-- Both are keyed by AGENT ENTRY id, so a clone holding a second login gets its
-  own number and two tasks on one clone share one.
+- **claude also reports SESSION COST in USD**, `cost.total_cost_usd`, from the
+  same status line payload. It arrives on every turn, on an account with or
+  without a plan, and reading it costs nothing extra: the script was already
+  draining that stdin and throwing the field away. Codex gets no equivalent,
+  and deliberately: its own spend data is a TOKEN count, so dollars would mean
+  a per-model price table inside termic that goes silently wrong the day
+  prices move. A wrong number is worse than no number here.
+- The cost rides as a FIFTH field on the same `usage` body, appended and never
+  inserted, so a running app with an older status line installed sends four
+  and the missing fifth reads as absent.
+- Both are keyed by AGENT ENTRY id AND ACCOUNT, so two tasks spending one quota
+  share a number and two on different logins never do. The account half arrived
+  with the switcher (GH #278) and was a real defect until it did: an agent
+  entry used to BE a login, and once one entry could hold several accounts the
+  two wrote into a single slot. The account in the key is the one the PROCESS
+  was spawned with, never the configured one. See
+  [agent-accounts.md](../agent-accounts.md#usage-is-keyed-by-account-and-was-not).
 - The chip is leftmost in the footer's right group, so it and the "N blocked"
   chip grow leftwards and the sandbox status stays pinned rightmost. It
   self-hides until an account has actually reported, so an agent with no source

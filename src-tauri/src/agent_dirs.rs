@@ -105,6 +105,7 @@ fn expand_home(raw: &str, home: &std::path::Path) -> std::path::PathBuf {
 /// `id`, `extends`, `display_name` and `builtin` are the clone's OWN identity
 /// and are never inherited. Resolution walks the chain, so a clone of a clone
 /// works, and is depth-capped because ids are user-editable.
+
 /// Per-LIST capability merge. Wholesale replacement would mean a clone that
 /// overrides one flag list stops tracking the parent on every other, which is
 /// the freeze this change exists to remove, one field down.
@@ -127,28 +128,6 @@ fn merge_caps(child: &mut crate::AgentCapabilities, parent: &crate::AgentCapabil
         child.signals.pending = parent.signals.pending.clone();
     }
 }
-
-/// A clone resolved against what it extends: every field it left EMPTY comes
-/// from the parent, live, at read time.
-///
-/// A clone used to be a full COPY of the parent, made once. That is a snapshot
-/// that rots: when a vendor renames a flag the built-in entry moves with the
-/// app and every clone keeps the old value forever, silently, with no way for
-/// the user to tell which of its seventeen fields they actually chose. It had
-/// already happened here, a clone carrying the parent's literal `$HOME/.claude`
-/// sandbox paths while its own config lived elsewhere, so the cage denied it
-/// its own login.
-///
-/// EMPTY MEANS INHERIT, which is the rule `classifyAgentTitle` already uses for
-/// per-field signal fallback, extended to the whole record rather than a second
-/// convention. Cost of the choice, and it is the same one that doc records: "no
-/// value at all" stops being expressible by clearing a field, because clearing
-/// is how you ask for the parent's.
-///
-/// `id`, `extends`, `display_name` and `builtin` are the clone's OWN identity
-/// and are never inherited. Resolution walks the chain, so a clone of a clone
-/// works, and is depth-capped because ids are user-editable.
-
 
 pub fn resolve_agent(agents: &[crate::Agent], id: &str) -> Option<crate::Agent> {
     let mut out = agents.iter().find(|a| a.id == id)?.clone();
@@ -181,6 +160,7 @@ pub fn resolve_agent(agents: &[crate::Agent], id: &str) -> Option<crate::Agent> 
     }
     Some(out)
 }
+
 
 /// The env var that relocates an agent's ENTIRE config dir, when it has one.
 ///
@@ -228,10 +208,6 @@ pub enum LoginStore {
     /// wholesale") look like one and are not, and conflating them is how the
     /// Docker mount would silently break.
     SelfHostingDir { env: &'static str },
-    /// A token variable that takes precedence over whatever is stored, so no
-    /// directory is involved at all. The cheapest shape, and the only one
-    /// that is genuinely credentials-only.
-    TokenVar { env: &'static str },
 }
 
 /// Where this agent's LOGIN can be relocated to, or `None` when nobody has
@@ -250,12 +226,36 @@ pub fn login_store(base_id: &str) -> Option<LoginStore> {
         // PATH, which is what lets two accounts be live at once.
         "claude" => Some(ConfigDir { env: "CLAUDE_CONFIG_DIR" }),
         "codex" => Some(ConfigDir { env: "CODEX_HOME" }),
-        // COPILOT_HOME relocates the dir; COPILOT_GITHUB_TOKEN would skip the
-        // directory entirely. The dir is chosen for consistency with the other
-        // seven, and because it is the shape `copilot login` writes into.
-        "copilot" => Some(ConfigDir { env: "COPILOT_HOME" }),
+        // NOT SUPPORTED, and this is a correction rather than an omission.
+        //
+        // copilot keeps its credential in the OS keyring under a FIXED service
+        // name (`copilot-cli`; libsecret on Linux, Keychain on macOS), so
+        // COPILOT_HOME moves the config dir and the plaintext fallback but NOT
+        // the credential. Two "accounts" would share one login, silently,
+        // which is the exact failure this table exists to prevent. Its own
+        // docs point at `/user switch` for multiple logins.
+        //
+        // `COPILOT_GITHUB_TOKEN` would isolate, but taking that route means
+        // termic HOLDING a token, and the one rule this feature is built on is
+        // that termic never handles a secret (docs/agent-accounts.md).
+        //
+        // Also never measured: copilot was not installed when the rest of the
+        // fleet was, and signing in needs a real GitHub account.
+        "copilot" => None,
         // Measured: GEMINI_CLI_HOME=<tmp> created `<tmp>/.gemini/`. The var is
         // a PARENT. Pointing it at the config dir would nest.
+        //
+        // The variable alone is NOT enough, and the measurement that said it
+        // was is a trap worth naming: gemini stores its OAuth credential in
+        // the OS keyring under a fixed service (`gemini-cli-oauth`), so
+        // relocating the dir removes `settings.json` and the agent complains
+        // about a missing auth method WHILE THE TOKEN STAYS SHARED. "It said
+        // signed out" is therefore not proof the credential moved.
+        //
+        // `GEMINI_FORCE_FILE_STORAGE` pins it to the file backend, which does
+        // live in the relocated dir. Carried as a COMPANION so the isolation
+        // is real. See `login_companion_env`, and the caveat there: that flag
+        // is in gemini's source but not its docs.
         "agy" | "antigravity" => Some(ParentDir { env: "GEMINI_CLI_HOME", child: ".gemini" }),
         // Measured: the login follows GROK_HOME. But the BINARY (`~/.grok/bin`)
         // and bundled skills live in that same tree, so relocating the auth is
@@ -264,14 +264,149 @@ pub fn login_store(base_id: &str) -> Option<LoginStore> {
         // Measured: only XDG_DATA_HOME moved it. Generic, shared with other
         // tools in the same environment.
         "opencode" => Some(XdgRoot { env: "XDG_DATA_HOME", child: "opencode" }),
-        // Measured: XDG_CONFIG_HOME moves the metadata index, which is enough
-        // to isolate. Whether the KEYCHAIN item behind it is keyed per dir is
-        // unresolved, so muse may be serial-switch only. See the plan.
-        "muse" => Some(XdgRoot { env: "XDG_CONFIG_HOME", child: "muse" }),
+        // NOT SUPPORTED until the keychain question is answered.
+        //
+        // Measured that XDG_CONFIG_HOME moves muse's metadata INDEX, and the
+        // agent then reports itself signed out. That is not the same as the
+        // credential moving: the index says `storage: "keychain"`, so the
+        // secret is in the OS store and may well be one item shared by both
+        // "accounts". A probe that only watches for "signed out" cannot tell
+        // those apart, which is precisely how a silent shared login gets
+        // shipped. Resolve the keying, then enable this.
+        "muse" => None,
         // Measured: no dedicated variable exists; a HOME override does isolate
         // it (`ready` became `credentials_not_configured`).
         "pi" => Some(HomeOnly { child: ".pi" }),
         _ => None,
+    }
+}
+
+/// Why an agent deliberately has NO login store, in words a user can read.
+///
+/// The second half of the table above, and it has to exist separately: `None`
+/// from `login_store` would otherwise mean both "nobody has looked at this
+/// yet" and "we looked, and it cannot be isolated", which need opposite
+/// responses. An agent in neither table is the first case and fails a test.
+///
+/// The text is shown in Settings, so it says what is true of the AGENT rather
+/// than what termic did not do.
+pub fn login_unsupported_reason(base_id: &str) -> Option<&'static str> {
+    match base_id {
+        // Measured by research, not by this machine: the keyring service name
+        // is fixed, so the directory variable moves everything EXCEPT the
+        // credential.
+        "copilot" => Some(
+            "GitHub Copilot keeps its login in the OS keyring under one fixed name, so a second \
+             set would share the same credential. Use its own `/user switch` instead.",
+        ),
+        // The index moves; whether the keychain item behind it does is
+        // unresolved, and shipping the optimistic answer would silently share
+        // one login between two "accounts".
+        "muse" => Some(
+            "Muse stores its credential in the OS keychain and termic has not confirmed that a \
+             second set would get its own, so it does not offer one yet.",
+        ),
+        _ => None,
+    }
+}
+
+/// What an ACCOUNT's store shares with the agent's primary config dir
+/// (GH #278).
+///
+/// Relocating a config dir moves EVERYTHING, not just the credential. Measured
+/// on a real `~/.claude`: transcripts (`projects/`), `history.jsonl`,
+/// `settings.json` (permissions, hooks and termic's own status line),
+/// `CLAUDE.md`, plugins. A second account therefore started as a blank agent:
+/// no instructions, no permissions, no usage reporting, and `--resume` unable
+/// to find the conversation the user was in the middle of. That is the exact
+/// thing the switcher exists to protect.
+///
+/// So the store is a SYMLINK FARM. It owns the credential and nothing else;
+/// every entry here points back at the primary dir, so there is ONE copy and
+/// drift is impossible rather than merely unlikely. Claude's settings writer
+/// follows symlinks and writes through, so an in-session `/config` change made
+/// on either account lands in the same file.
+///
+/// Deliberately a LIST of what is shared rather than a list of what is not:
+/// an entry nobody has thought about stays the account's own, which is the
+/// safe direction. Getting it backwards would share a credential.
+/// The directory termic installs its hook scripts into, mirrored from
+/// `agent_hooks::SCRIPT_DIR`. Named here because a shared config that points
+/// at scripts the account cannot see is worse than no sharing at all.
+const SCRIPT_DIR_NAME: &str = "termic-hooks";
+
+pub fn shared_config_entries(base_id: &str) -> &'static [&'static str] {
+    match base_id {
+        // NOT shared, and this is the whole point: `.credentials.json` (the
+        // Linux credential) and `.claude.json` (account identity + per-project
+        // trust). On macOS the credential is in the Keychain under a service
+        // name hashed from THIS directory, which is what makes two live
+        // accounts possible at all.
+        "claude" => &[
+            "settings.json", "CLAUDE.md", "projects", "history.jsonl",
+            "plugins", "commands", "agents", "skills", "shell-snapshots",
+            // termic's OWN hook scripts, and they are not optional: the
+            // shared `settings.json` names them by ABSOLUTE path, so an
+            // account whose directory lacks them gets an agent that fails
+            // every hook on every turn:
+            //
+            //   /root/.claude/termic-hooks/working.sh: not found
+            //
+            // On the host that path resolves anyway (it points into the
+            // primary dir); inside a container it is a container path, so the
+            // directory has to be there. Sharing the settings without the
+            // scripts they name is the half-move that produced this.
+            SCRIPT_DIR_NAME,
+        ],
+        // Same shape for codex: `auth.json` is the credential and stays the
+        // account's own; config, instructions and transcripts are shared.
+        "codex" => &[
+            "config.toml", "AGENTS.md", "sessions", "history.jsonl", "prompts",
+            SCRIPT_DIR_NAME,
+        ],
+        _ => &[],
+    }
+}
+
+/// Does this agent tell termic how much of its plan is spent (GH #277)?
+///
+/// The automatic account switch needs a number to act on, so it is offered
+/// only where this is true. Everywhere else the switch is manual, which is the
+/// half that works for all eight built-ins.
+///
+/// TWO agents, by two different transports, and neither is a guess: claude
+/// pushes percentages through the status line it lets termic install, and
+/// codex answers `agent_usage.rs` over JSON-RPC. An agent gets a `true` here
+/// only once one of those two paths actually produces numbers for it, because
+/// the cost of being wrong is an "auto-switch" toggle that silently never
+/// fires. See `docs/ideas/usage-footer.md` for why the transports differ.
+///
+/// A clone resolves through `base_agent_id` first, exactly like the login
+/// table, so a second claude entry reports usage for the same reason the
+/// original does.
+pub fn reports_usage(base_id: &str) -> bool {
+    matches!(base_id, "claude" | "codex")
+}
+
+/// Extra variables an agent needs before its login REALLY follows the store.
+///
+/// Empty for almost everything. It exists for the case where relocating the
+/// directory makes an agent SAY it is signed out while the credential stays
+/// shared in an OS keyring, which is a false positive a probe cannot see.
+pub fn login_companion_env(base_id: &str) -> &'static [(&'static str, &'static str)] {
+    match base_id {
+        // gemini keeps its OAuth token in the OS keyring under a fixed service
+        // name, so `GEMINI_CLI_HOME` alone moves `settings.json` (the agent
+        // then complains about a missing auth method) while the TOKEN stays
+        // shared. This pins it to the file backend, which does live in the
+        // relocated directory.
+        //
+        // CAVEAT, and it is why `make login-probe` matters more for this agent
+        // than any other: the flag is in gemini's source but not its
+        // documentation, so it carries no stability promise. If it is ever
+        // removed, gemini silently returns to sharing one login.
+        "agy" | "antigravity" => &[("GEMINI_FORCE_FILE_STORAGE", "true")],
+        _ => &[],
     }
 }
 
@@ -301,7 +436,11 @@ pub fn config_relocation_env(base_id: &str) -> Option<&'static str> {
 pub fn login_env(base_id: &str, store: &std::path::Path) -> Vec<(String, String)> {
     let Some(shape) = login_store(base_id) else { return Vec::new() };
     let p = store.to_string_lossy().into_owned();
-    match shape {
+    let mut out: Vec<(String, String)> = login_companion_env(base_id)
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    out.extend(match shape {
         // The store IS the config dir, or the parent/root the agent hangs its
         // own directory off. In every directory shape the caller passes the
         // same store path and this decides what the agent is told.
@@ -312,25 +451,8 @@ pub fn login_env(base_id: &str, store: &std::path::Path) -> Vec<(String, String)
         LoginStore::HomeOnly { .. } => vec![("HOME".into(), p)],
         // No directory at all. The token is not known here: the caller reads
         // it from the account's own store, so this only names the variable.
-        LoginStore::TokenVar { env } => vec![(env.into(), String::new())],
-    }
-}
-
-/// Where the agent will actually put its config, given a store path.
-///
-/// Differs from the store for the shapes that append: gemini's variable is a
-/// parent, opencode's and muse's are generic roots. Callers that need to look
-/// AT the login (to report an identity, or to symlink shared settings back)
-/// need this, not the store path.
-pub fn login_config_dir(base_id: &str, store: &std::path::Path) -> Option<std::path::PathBuf> {
-    Some(match login_store(base_id)? {
-        LoginStore::ConfigDir { .. } => store.to_path_buf(),
-        LoginStore::SelfHostingDir { .. } => store.to_path_buf(),
-        LoginStore::ParentDir { child, .. } => store.join(child),
-        LoginStore::XdgRoot { child, .. } => store.join(child),
-        LoginStore::HomeOnly { child } => store.join(child),
-        LoginStore::TokenVar { .. } => return None,
-    })
+    });
+    out
 }
 
 pub fn state_dirs(agent_id: &str) -> &'static [&'static str] {
@@ -395,9 +517,23 @@ mod instance_dir_tests {
     // of them are expressible through this module, so these pin the gap rather
     // than the wish.
 
-    /// Every agent termic ships. Kept as one list so the guards below cannot
-    /// silently stop covering an agent someone added.
-    const BUILT_INS: &[&str] = &["claude", "codex", "copilot", "agy", "grok", "opencode", "pi", "muse"];
+    /// Every agent termic ships, DERIVED from the registry rather than typed.
+    ///
+    /// This was a hand-written list, and a hand-written list is exactly the
+    /// bug the guards below exist to prevent: adding a built-in that appears
+    /// in no other table failed ZERO tests, because it was not in this list
+    /// either. Measured, then fixed. Deriving it means a new agent is checked
+    /// the moment it exists.
+    ///
+    /// `kind == "agent"` skips custom TERMINAL entries, which are shell
+    /// commands and have no login of their own.
+    fn built_ins() -> Vec<String> {
+        crate::default_agents()
+            .into_iter()
+            .filter(|a| a.kind == "agent")
+            .map(|a| a.id)
+            .collect()
+    }
 
     #[test]
     fn every_builtin_agent_has_a_measured_login_store() {
@@ -405,15 +541,108 @@ mod instance_dir_tests {
         // login lives would give it an account switcher that silently shares
         // one login between "accounts", which is worse than not offering one.
         // This fails the moment a built-in appears without a row.
-        let missing: Vec<&str> = BUILT_INS.iter().copied()
-            .filter(|a| login_store(a).is_none())
+        let missing: Vec<String> = built_ins().into_iter()
+            .filter(|a| login_store(a).is_none() && login_unsupported_reason(a).is_none())
             .collect();
         assert!(
             missing.is_empty(),
-            "no measured login store for: {missing:?}. Point the agent's candidate variable at an \
-             empty dir and see whether it loses its login (docs/plans/agent-credentials.md), then \
-             add a row to `login_store`. Do NOT guess: an unmeasured agent must stay None.",
+            "no answer for: {missing:?}. Point the agent's candidate variable at an empty dir and \
+             see whether it loses its login (docs/adding-an-agent.md §1b), then EITHER add a row to \
+             `login_store` OR, if it cannot be isolated, a reason to `login_unsupported_reason`. \
+             Do not guess: silence here means a second account would share one credential.",
         );
+    }
+
+    #[test]
+    fn a_new_builtin_agent_is_registered_in_every_table_that_needs_it() {
+        // THE GUARD FOR EVERY PER-AGENT TABLE. Adding a built-in used to fail
+        // ZERO tests: it appeared in `default_agents()` and in none of the
+        // hand-maintained tables around it, and nothing said so. Measured by
+        // adding a fake agent and running the suite, which passed.
+        //
+        // Each table below is checked from the DERIVED agent list, so a new
+        // agent is covered the moment it exists rather than when someone
+        // remembers to add it here too. The message names the file to edit,
+        // because the person hitting this is usually meeting these tables for
+        // the first time. See docs/adding-an-agent.md.
+        let mut problems: Vec<String> = Vec::new();
+        for id in built_ins() {
+            if login_store(&id).is_none() && login_unsupported_reason(&id).is_none() {
+                problems.push(format!(
+                    "{id}: no `agent_dirs::login_store` row and no `login_unsupported_reason`. \
+                     Measure which env var moves its login (docs/adding-an-agent.md §1b), then \
+                     either add the shape or state why it cannot be isolated. Saying nothing \
+                     means a second account would silently share one credential.",
+                ));
+            }
+            if state_dirs(&id).is_empty() {
+                problems.push(format!(
+                    "{id}: no `agent_dirs::state_dirs` row. Without it Seatbelt will not allow \
+                     its config dir and Docker will not mount it, so the agent loses its login \
+                     on every run.",
+                ));
+            }
+            if !crate::docker::base_agent_id_is_known(&id) {
+                problems.push(format!(
+                    "{id}: missing from `docker::base_agent_id_str`'s BUILTINS. A CLONE of this \
+                     agent will not resolve its config shape, which is what made cloned agents \
+                     unusable in Docker before.",
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "per-agent tables are incomplete:\n  {}", problems.join("\n  "));
+    }
+
+    #[test]
+    fn a_shared_config_brings_the_hook_scripts_it_names_with_it() {
+        // `settings.json` is shared, and it names termic's hook scripts by
+        // ABSOLUTE path. Sharing the settings without the scripts gave a
+        // container an agent that failed every hook on every turn:
+        //
+        //   /root/.claude/termic-hooks/working.sh: not found
+        //
+        // Pinned by NAME because the failure is silent on the host (the path
+        // resolves into the primary dir anyway) and only shows up inside a
+        // container, which is the case least likely to be tried first.
+        for agent in ["claude", "codex"] {
+            let shared = shared_config_entries(agent);
+            assert!(
+                shared.contains(&SCRIPT_DIR_NAME),
+                "{agent} shares its config but not the hook scripts that config points at",
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_that_reports_usage_can_also_hold_a_second_account() {
+        // The automatic switch is the intersection of the two tables, so this
+        // pins that the intersection is never empty in the wrong direction: an
+        // agent whose usage we can read but whose login we cannot isolate
+        // would render an auto-switch toggle with nowhere to switch to.
+        //
+        // It is not symmetric on purpose. Six agents hold accounts and report
+        // no usage, which is exactly the manual-switch case the feature is
+        // built around.
+        for id in built_ins() {
+            if reports_usage(&id) {
+                assert!(
+                    login_store(&id).is_some(),
+                    "{id} reports usage but has no login store, so an automatic switch would \
+                     have nothing to switch to. Either give it a `login_store` shape or take \
+                     it out of `reports_usage`.",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_two_agents_with_a_measured_transport_report_usage() {
+        // A row here turns on a control that ACTS on the user's behalf, so it
+        // is pinned by name rather than by count: adding an agent to this
+        // table has to be a deliberate edit backed by a working transport,
+        // not something a refactor can do quietly.
+        let reporting: Vec<String> = built_ins().into_iter().filter(|id| reports_usage(id)).collect();
+        assert_eq!(reporting, vec!["claude".to_string(), "codex".to_string()]);
     }
 
     #[test]
@@ -426,7 +655,8 @@ mod instance_dir_tests {
         // This is the guard that replaced an earlier one asserting those
         // agents were absent from the table entirely. They are present now,
         // with shapes; what must stay true is which shapes reach Docker.
-        for a in BUILT_INS {
+        for a in built_ins() {
+            let a = a.as_str();
             let via_shape = matches!(login_store(a), Some(LoginStore::ConfigDir { .. }));
             assert_eq!(
                 config_relocation_env(a).is_some(), via_shape,
@@ -435,14 +665,15 @@ mod instance_dir_tests {
         }
         assert_eq!(config_relocation_env("claude"), Some("CLAUDE_CONFIG_DIR"));
         assert_eq!(config_relocation_env("codex"), Some("CODEX_HOME"));
-        assert_eq!(config_relocation_env("copilot"), Some("COPILOT_HOME"));
         // The three that would be WRONG as a plain variable name.
         assert_eq!(config_relocation_env("agy"), None, "GEMINI_CLI_HOME is a parent, not a config dir");
         assert_eq!(config_relocation_env("grok"), None,
             "GROK_HOME moves grok's login, but its binary lives in that tree: mounting over it in \
              Docker shadows the binary and the agent vanishes");
         assert_eq!(config_relocation_env("opencode"), None, "XDG_DATA_HOME is a generic root");
-        assert_eq!(config_relocation_env("muse"), None, "XDG_CONFIG_HOME is a generic root");
+        assert_eq!(config_relocation_env("muse"), None, "muse has no login store at all");
+        assert_eq!(config_relocation_env("copilot"), None,
+            "copilot's keyring service name is fixed, so COPILOT_HOME does not move the credential");
         assert_eq!(config_relocation_env("pi"), None, "pi has no dedicated variable at all");
     }
 
@@ -451,46 +682,36 @@ mod instance_dir_tests {
         let store = Path::new("/data/logins/claude/work");
         assert_eq!(login_env("claude", store), vec![("CLAUDE_CONFIG_DIR".to_string(), "/data/logins/claude/work".to_string())]);
         assert_eq!(login_env("codex", store), vec![("CODEX_HOME".to_string(), "/data/logins/claude/work".to_string())]);
-        assert_eq!(login_env("copilot", store), vec![("COPILOT_HOME".to_string(), "/data/logins/claude/work".to_string())]);
         // Relocatable for a LOGIN even though Docker cannot mount it.
         assert_eq!(login_env("grok", store), vec![("GROK_HOME".to_string(), "/data/logins/claude/work".to_string())]);
         // The parent shape still gets the STORE, not the config dir: the agent
         // is the one that appends. Passing `<store>/.gemini` here would nest.
-        assert_eq!(login_env("agy", store), vec![("GEMINI_CLI_HOME".to_string(), "/data/logins/claude/work".to_string())]);
+        // gemini needs a COMPANION: the variable alone moves settings.json
+        // while the token stays in a fixed keyring slot.
+        assert_eq!(login_env("agy", store), vec![
+            ("GEMINI_FORCE_FILE_STORAGE".to_string(), "true".to_string()),
+            ("GEMINI_CLI_HOME".to_string(), "/data/logins/claude/work".to_string()),
+        ]);
         assert_eq!(login_env("opencode", store), vec![("XDG_DATA_HOME".to_string(), "/data/logins/claude/work".to_string())]);
-        assert_eq!(login_env("muse", store), vec![("XDG_CONFIG_HOME".to_string(), "/data/logins/claude/work".to_string())]);
         assert_eq!(login_env("pi", store), vec![("HOME".to_string(), "/data/logins/claude/work".to_string())]);
         // An unmeasured agent gets NOTHING, which is the caller's signal that
         // it cannot hold a second account.
         assert!(login_env("some-unmapped-cli", store).is_empty());
     }
 
-    #[test]
-    fn the_config_dir_is_where_the_agent_puts_it_not_where_we_pointed_it() {
-        // The gemini trap, made explicit: reporting an identity or symlinking
-        // shared settings has to look at the dir the agent WRITES, which for
-        // three of the shapes is a level below the store.
-        let store = Path::new("/s");
-        assert_eq!(login_config_dir("claude", store).unwrap(), Path::new("/s"));
-        assert_eq!(login_config_dir("agy", store).unwrap(), Path::new("/s/.gemini"));
-        assert_eq!(login_config_dir("opencode", store).unwrap(), Path::new("/s/opencode"));
-        assert_eq!(login_config_dir("muse", store).unwrap(), Path::new("/s/muse"));
-        assert_eq!(login_config_dir("pi", store).unwrap(), Path::new("/s/.pi"));
-        assert_eq!(login_config_dir("some-unmapped-cli", store), None);
-    }
 
     #[test]
     fn the_agents_whose_variable_is_broader_than_themselves_are_known() {
         // XdgRoot redirects a variable other tools in the same environment
         // read, so the UI has to say so rather than present it as agent-local.
         // Listed here so adding one is a deliberate act with a UI consequence.
-        let broad: Vec<&str> = BUILT_INS.iter().copied()
+        let broad: Vec<String> = built_ins().into_iter()
             .filter(|a| matches!(login_store(a), Some(LoginStore::XdgRoot { .. })))
             .collect();
-        assert_eq!(broad, vec!["opencode", "muse"]);
+        assert_eq!(broad, vec!["opencode"]);
 
         // HomeOnly is broader still: the store has to be a home-shaped dir.
-        let home_only: Vec<&str> = BUILT_INS.iter().copied()
+        let home_only: Vec<String> = built_ins().into_iter()
             .filter(|a| matches!(login_store(a), Some(LoginStore::HomeOnly { .. })))
             .collect();
         assert_eq!(home_only, vec!["pi"]);
@@ -527,7 +748,7 @@ mod instance_dir_tests {
             "agy" | "antigravity" => "gemini",
             other => other,
         } }
-        let missing: Vec<&str> = BUILT_INS.iter().copied()
+        let missing: Vec<String> = built_ins().into_iter()
             .filter(|id| login_store(id).is_some())
             .filter(|id| !probe.contains(&format!("id: \"{}\"", binary_for(id))))
             .collect();
@@ -540,8 +761,8 @@ mod instance_dir_tests {
 
         // And the reverse: a probe row for an agent the table does not know is
         // checking something nothing uses.
-        for id in BUILT_INS.iter().filter(|i| login_store(i).is_some()) {
-            let bin = binary_for(id);
+        for id in built_ins().into_iter().filter(|i| login_store(i).is_some()) {
+            let bin = binary_for(&id);
             assert!(probe.contains(&format!("id: \"{bin}\"")), "{bin} vanished from the probe");
         }
     }

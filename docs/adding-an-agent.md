@@ -44,7 +44,8 @@ them: a maintainer on the cheapest plan has very few.
 - **`sandbox_allowed_paths`** — see §4. These grant **`file-write*`**.
 - **`signals`** — leave empty unless you have CAPTURED titles (§3).
 
-Also: `agent_dirs::state_dirs`, `docker::KNOWN_SAFE_AGENTS` and
+Also: `agent_dirs::login_store` (§1b, and a test FAILS until you add it),
+`agent_dirs::state_dirs`, `docker::KNOWN_SAFE_AGENTS` and
 `docker::base_agent_id_str`'s `BUILTINS`, the TS `BUILTIN_FALLBACK` in
 `lib/agents.ts` (the two tables MUST agree; the TS one runs before the registry
 loads), `CliIcon`'s `case`, `CLI_BRAND_COLOR`, `CLI_LABEL`, `index.css` brand
@@ -52,6 +53,126 @@ vars for both themes, and a line in `Dockerfile.default`.
 
 An existing install picks the new agent up through `load_settings_inner`'s
 merge, so no migration is needed. It also means every user gets the row.
+
+## 1b. Where its LOGIN lives, and how to find out (GH #278)
+
+`agent_dirs::login_store` is what lets an agent hold more than one credential
+set. **`every_builtin_agent_has_a_measured_login_store` fails until you add a
+row**, so this is not optional and cannot be deferred.
+
+**Measure it. Do not guess.** Point the candidate variable at an empty
+directory and run the agent's cheapest read-only auth command. If it reports
+itself signed out, the login follows that variable:
+
+```sh
+CANDIDATE_VAR=$(mktemp -d) <agent> <auth-status-command>
+```
+
+Then pick the shape that MATCHES WHAT YOU SAW, not the one that looks closest:
+
+| Shape | You saw | Example |
+|---|---|---|
+| `ConfigDir` | the var IS the config dir, and nothing else lives there | claude, codex |
+| `SelfHostingDir` | the login follows it, but the agent's own BINARY or bundled assets are in that tree too | grok |
+| `ParentDir` | the agent APPENDED a name to what you set (`$VAR/.gemini`) | agy / gemini |
+| `XdgRoot` | only a generic XDG variable moved it, and other tools read that variable too | opencode |
+| `HomeOnly` | no dedicated variable exists; only `HOME` moved it | pi |
+| `TokenVar` | a token variable outranks whatever is stored, so no directory is involved | no agent today; kept because it is the shape such an agent would take |
+
+`None` is a legitimate answer, and it has TWO meanings that the guard forces
+you to tell apart:
+
+- **`None` with no reason** is "nobody measured this". The agent gets no
+  override rather than a partial one, and the UI says "one login".
+- **`None` with a `login_unsupported_reason`** is "we measured, and the answer
+  is that it cannot be isolated". The UI shows that reason instead of an "add
+  account" control.
+
+**A config directory is not always where the credential is, and this is the
+trap.** Several CLIs keep the token in the OS keyring and only the settings in
+the config directory. Whether moving the directory isolates the login then
+depends on how the keyring item is keyed:
+
+| Keyring item keyed by | Moving the config dir | Agents |
+|---|---|---|
+| a hash of the store path | isolates | claude, codex |
+| a FIXED service name | does **not** isolate | copilot, gemini |
+
+A fixed service name is dangerous precisely because the measurement above
+LOOKS like it passed: the agent picks up the new empty directory, finds no
+settings, and says "please sign in". Sign in, and the token lands back in the
+one shared slot. So the measurement is necessary and not sufficient: if the
+agent uses a keyring at all, find out what names the item before believing a
+signed-out message. gemini is the middle case, isolating only with
+`GEMINI_FORCE_FILE_STORAGE=true`, which is why `login_companion_env` exists and
+why the probe tests it WITH that flag. A measurement taken under different
+conditions than the spawn is not a measurement of the spawn.
+
+The two shapes people get wrong:
+
+- **`ParentDir` typed as `ConfigDir`** puts the login one level too deep,
+  silently. If the agent created `<your tmpdir>/.something/`, it is a parent.
+- **`SelfHostingDir` typed as `ConfigDir`** hands Docker a directory it will
+  mount an empty volume over, shadowing the agent's own binary so it vanishes
+  inside the container. `docker_only_ever_sees_the_shape_it_can_actually_honour`
+  fails if you do this, and grok is the worked example.
+
+If the agent reports plan usage, see `reports_usage` in 1c: that is a separate
+table, and it is what decides whether the AUTOMATIC switch is offered.
+
+Finally, **add a row to `scripts/login-probe.mjs`** with the variable and a
+read-only command that reveals whether the agent is signed in.
+`the_probe_covers_every_agent_with_a_measured_login_store` fails until you do.
+That probe is the only thing that catches the agent CHANGING later: unit tests
+prove the table is self-consistent, never that it is still true.
+
+## 1c. Every per-agent table, and how each one tells you it is wrong
+
+Adding a built-in used to fail **zero** tests. Measured, not assumed: a fake
+agent was added to `default_agents()` and the whole suite passed, so an agent
+could ship registered in none of the tables below and nothing said so.
+
+`a_new_builtin_agent_is_registered_in_every_table_that_needs_it`
+(`agent_dirs.rs`) now derives the agent list from `default_agents()` and checks
+the three that fail SILENTLY. The others fail loudly on their own. This is the
+map, for whoever is debugging one:
+
+| Table | Where | If it is missing |
+|---|---|---|
+| `default_agents()` | `lib.rs` | the agent does not exist |
+| `login_store` | `agent_dirs.rs` | **guarded.** No account switching, and a wrong SHAPE relocates the login somewhere the agent does not read |
+| `state_dirs` | `agent_dirs.rs` | **guarded.** Seatbelt will not allow its config dir and Docker will not mount it, so it loses its login every run |
+| `BASE_BUILTINS` | `docker.rs` | **guarded.** A CLONE silently resolves to claude's config shape |
+| `KNOWN_SAFE_AGENTS` | `docker.rs` | no Docker config mount; the opt-in toggle is the fallback, so this is a degraded mode rather than a break |
+| `BUILTIN_FALLBACK` | `lib/agents.ts` | the agent cannot spawn before the registry loads. `agents.test.ts` pins it against the Rust table |
+| `hooks_for` / `state_dir` | `agent_hooks.rs` | no work-state signals; the agent looks permanently idle |
+| `CliIcon` / `CLI_BRAND_COLOR` / `CLI_LABEL` | `icons/cli.tsx` | a blank icon and an unstyled name, visible immediately |
+| `scripts/login-probe.mjs` | | **guarded.** The login table can rot with no way to notice |
+| `reports_usage` | `agent_dirs.rs` | no plan-usage chip and no automatic account switch. Default `false`, and leaving it there is the CORRECT answer for a new agent: turn it on only once a transport actually produces numbers |
+
+Three of those are guarded because they are the ones that go wrong QUIETLY: a
+missing icon is obvious the first time you look, a missing `state_dirs` row is
+not obvious until someone's login disappears a week later.
+
+`reports_usage` is the one table where the safe default is to say NOTHING. It
+gates a control that acts on the user's behalf (the automatic account switch),
+so it is pinned by NAME rather than by count
+(`only_the_two_agents_with_a_measured_transport_report_usage`): adding an agent
+to it has to be a deliberate edit backed by a working transport, not something
+a refactor can do quietly. A second guard pins that anything reporting usage
+can also hold a second account, since otherwise the switch would have nowhere
+to go.
+
+### Debugging "this agent behaves oddly"
+
+Work down, cheapest first:
+
+1. `cargo test --workspace --lib` — the guards above name the missing table.
+2. `make login-probe <agent>` — is the login table still TRUE of the installed
+   CLI, or did the agent change under us?
+3. `docs/sandbox.md`'s deny-debugging section — is it a cage problem rather
+   than a registry one?
+4. Only then read the agent's own output.
 
 ## 2. Resume: three shapes, and how to tell which one you have
 
@@ -184,7 +305,11 @@ the old scripts forever. There is a test that fails if you forget.
   `resume_id_args` broke `cli.e2e.ts`, which used codex as its example of an
   agent that cannot resume by id, and it was caught by CI on main rather than
   locally. Run the FULL `make e2e`, not the two specs you touched.
-- Docs: `docs/sandbox.md` (vendor hosts, the Docker agent list),
+- `make login-probe` must pass for your agent, and `make login-probe <agent>`
+  runs just yours. It is local-only: it needs the CLI installed and really
+  logged in, which no runner has.
+- Docs: `docs/agent-accounts.md` if the login shape was interesting,
+  `docs/sandbox.md` (vendor hosts, the Docker agent list),
   `docs/agent-hooks.md` if hooks were considered — including if they were
   REJECTED, with the measurement, so nobody repeats the investigation.
 - README's built-in list.

@@ -619,6 +619,13 @@ pub struct Task {
     /// appends at the bottom instead of jumping to the top.
     #[serde(default)]
     pub order: Option<u32>,
+    /// Per-agent account override for THIS task (GH #278), agent id -> account
+    /// name. Written when a running task is switched to another account, and
+    /// read at every spawn so the choice survives a relaunch. Absent means
+    /// "follow the agent's default", which is what every task has until
+    /// someone switches one.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accounts: HashMap<String, String>,
     /// Which profile this record was loaded from. IN-MEMORY ONLY
     /// (`serde(skip)`): nothing is written into the JSON on disk, so there is
     /// no schema bump and an existing install's files stay byte-identical.
@@ -902,6 +909,210 @@ fn profile_dir(id: &ProfileId) -> Result<PathBuf> {
     let p = profiles::profile_dir(&global_dir()?, id);
     fs::create_dir_all(&p)?;
     Ok(p)
+}
+
+// ─────────────── agent accounts: where a login lives (GH #278) ───────────────
+//
+// The switcher's whole storage rule. Two realms, because Docker never reads
+// the host's config dir (`docker-agents/` is termic-owned), so a login
+// performed on the host is invisible in a container and vice versa. A user
+// signs in once per realm, and each realm then shares that login across every
+// profile, because the store is keyed by the account's NAME.
+
+/// Which realm a spawn's login belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginRealm {
+    /// The machine's own agents, sandboxed or not.
+    Host,
+    /// Inside a container, where termic mounts a directory it owns.
+    Docker,
+}
+
+/// Filesystem-safe form of an account name.
+///
+/// The name IS the key, so it becomes a path segment; slugified for the same
+/// reason a profile slug is. Frozen once created, because for claude the store
+/// path is hashed into the Keychain service name and a rename would silently
+/// log that account out.
+pub(crate) fn account_slug(name: &str) -> String {
+    profiles::slugify(name, &std::collections::HashSet::new())
+}
+
+/// Where an account's login lives, or `None` for "the agent's ordinary login".
+///
+/// `None` is the migration-free path and the common one: with no account
+/// chosen, nothing is overridden and every agent reads exactly the directory
+/// it always did. Only a NAMED account adds a segment, so an install that
+/// never uses the feature keeps byte-identical paths, and an existing Docker
+/// login is not orphaned by shipping this.
+fn login_store_dir(agent_id: &str, account: Option<&str>, realm: LoginRealm) -> Option<PathBuf> {
+    let account = account?;
+    let slug = account_slug(account);
+    let base = match realm {
+        // Global on purpose: a login is a machine fact, so two profiles using
+        // the same account name resolve here and the second is already signed
+        // in. `docker-agents/` was already global for exactly this reason.
+        LoginRealm::Host => global_dir().ok()?.join("logins").join(agent_id),
+        LoginRealm::Docker => docker::agent_config_host_dir(agent_id),
+    };
+    Some(base.join(slug))
+}
+
+/// The account a spawn should use: the task's own override first, then the
+/// agent's default, then none.
+///
+/// Resolved in Rust rather than passed in, so every spawn path gets it: the
+/// UI, the CLI and MCP all reach `pty_spawn` and none of them should have to
+/// remember to thread an account through.
+fn account_for_spawn(task: Option<&Task>, agent_id: &str, agents: &[Agent]) -> Option<String> {
+    if let Some(t) = task {
+        if let Some(a) = t.accounts.get(agent_id) {
+            return Some(a.clone());
+        }
+    }
+    agents.iter().find(|a| a.id == agent_id)?.default_account.clone()
+}
+
+/// Where THIS task's agent keeps its login on the host, when it runs on a
+/// named account (GH #278).
+///
+/// `None` for the ordinary login, which needs no extra allowance because it is
+/// already where the agent's own `sandbox_allowed_paths` point. Derived from
+/// the task exactly as `pty_spawn` derives the env overlay, so the cage and the
+/// spawn can never disagree about which directory the agent is about to use.
+pub fn task_login_store(task: &Task, agent_id: &str) -> Option<PathBuf> {
+    let agents = load_settings_in(&task.profile).agents;
+    let account = account_for_spawn(Some(task), agent_id, &agents)?;
+    login_store_dir(agent_id, Some(&account), LoginRealm::Host)
+}
+
+/// Marker written once a store has been wired up, so the spawn path can skip
+/// the work without stat-ing every entry on every launch.
+const ACCOUNT_FARM_MARKER: &str = ".termic-shared-v1";
+
+/// Wire an account's store to share everything but the credential (GH #278).
+///
+/// See `agent_dirs::shared_config_entries` for WHY. This is the mechanical
+/// half: for each shared entry that exists in the primary dir and is absent
+/// from the store, drop a symlink.
+///
+/// Rules that matter:
+///
+/// - **Never replaces anything.** An entry the account already has is left
+///   exactly as it is, so a store somebody has already signed into or edited
+///   is never clobbered by a later repair pass.
+/// - **Skips what the primary does not have.** Linking a path that does not
+///   exist yet would create a dangling link that the agent then writes
+///   through to nowhere.
+/// - **Idempotent**, and marked, so the spawn path can call it on every launch
+///   to repair stores created before this existed.
+///
+/// Returns the number of links made, which is what the tests assert on.
+fn build_account_farm(primary: &Path, store: &Path, entries: &[&str]) -> std::io::Result<usize> {
+    fs::create_dir_all(store)?;
+    let mut made = 0;
+    for name in entries {
+        let src = primary.join(name);
+        let dst = store.join(name);
+        // `symlink_metadata`, not `exists`: a link we made on an earlier pass
+        // whose target has since gone would report false for `exists` and be
+        // linked again, which fails.
+        if dst.symlink_metadata().is_ok() {
+            continue;
+        }
+        if !src.exists() {
+            continue;
+        }
+        #[cfg(unix)]
+        if std::os::unix::fs::symlink(&src, &dst).is_ok() {
+            made += 1;
+        }
+    }
+    let _ = fs::write(store.join(ACCOUNT_FARM_MARKER), b"");
+    Ok(made)
+}
+
+/// Make sure this account's store shares the agent's config, creating it if
+/// needed. HOST realm only.
+///
+/// Docker is deliberately excluded: the container mounts the store at the
+/// agent's config path, and a symlink pointing at the HOST's `~/.claude` is
+/// dangling inside it. A Docker account genuinely is a separate config, which
+/// is also why its login is a separate sign-in.
+fn ensure_account_store(agent_id: &str, account: &str, realm: LoginRealm, agents: &[Agent]) {
+    if realm != LoginRealm::Host {
+        return;
+    }
+    let Some(store) = login_store_dir(agent_id, Some(account), realm) else { return };
+    if store.join(ACCOUNT_FARM_MARKER).exists() {
+        return;
+    }
+    let base = docker::base_agent_id(agents, agent_id);
+    let entries = agent_dirs::shared_config_entries(base);
+    if entries.is_empty() {
+        return;
+    }
+    let home = PathBuf::from(home_dir());
+    let Some(primary) = agent_dirs::instance_config_dir(agents, agent_id, &home) else { return };
+    // A store that IS the primary dir would link every entry to itself. That
+    // is the adopted account, which relocates nothing and never gets here,
+    // but the guard is cheap and the failure would be spectacular.
+    if primary == store {
+        return;
+    }
+    if let Err(e) = build_account_farm(&primary, &store, entries) {
+        dlog(&format!("[accounts] could not wire {agent_id}/{account}: {e}"));
+    }
+}
+
+/// The environment that points an agent at the chosen account's login.
+///
+/// Empty when no account is chosen, or when the agent has no measured
+/// boundary. The second case matters: an agent whose login cannot be
+/// relocated must run with NO override rather than a half-applied one, or two
+/// "accounts" would quietly share a credential.
+/// The account a spawn actually RELOCATES to, or `None` when it runs on the
+/// agent's ordinary login.
+///
+/// The difference from `account_for_spawn` is the ADOPTED account, which NAMES
+/// the login the agent already had and therefore moves nothing. Every realm
+/// has to agree on that, and they did not: the host checked it while building
+/// its env overlay, and the Docker branch appended the account's slug to the
+/// mount unconditionally. Naming your first account therefore pointed the
+/// container at a brand new directory and orphaned the login you were already
+/// using, which shows up as claude running its first-run wizard inside a task
+/// that was signed in a minute earlier.
+fn relocating_account(task: Option<&Task>, agent_id: &str, agents: &[Agent]) -> Option<String> {
+    let account = account_for_spawn(task, agent_id, agents)?;
+    let adopted = agents.iter().find(|a| a.id == agent_id)
+        .and_then(|a| a.adopted_account.as_deref());
+    if adopted == Some(account.as_str()) {
+        return None;
+    }
+    Some(account)
+}
+
+fn account_login_env(
+    task: Option<&Task>,
+    agent_id: &str,
+    agents: &[Agent],
+    realm: LoginRealm,
+) -> Vec<(String, String)> {
+    let Some(account) = relocating_account(task, agent_id, agents) else { return Vec::new() };
+    // Repair a store created before the sharing existed, or one whose primary
+    // dir has since grown an entry worth sharing. Marker-gated, so a wired
+    // store costs one `exists` call per spawn.
+    ensure_account_store(agent_id, &account, realm, agents);
+    let base = docker::base_agent_id(agents, agent_id);
+    let Some(dir) = login_store_dir(agent_id, Some(&account), realm) else { return Vec::new() };
+    let env = agent_dirs::login_env(base, &dir);
+    if env.is_empty() {
+        return Vec::new();
+    }
+    // The agent's own login command creates what it needs inside; termic only
+    // guarantees the directory exists so the first write does not fail.
+    let _ = fs::create_dir_all(&dir);
+    env
 }
 
 /// The profile whose window issued a command.
@@ -1362,6 +1573,21 @@ fn normalize_member(mut m: ProjectMember) -> Result<ProjectMember, String> {
         .collect();
     Ok(m)
 }
+/// Is this path already a project IN THIS PROFILE?
+///
+/// Scoped to the profile, and that is the whole point: profiles are separate
+/// Termics, so the same repo is expected to appear in several of them (work
+/// and personal both want `~/src/app`). A global check rejected the second
+/// window with "project already added", naming something the user could not
+/// see anywhere in it, which is the worst shape an error can take.
+///
+/// Within ONE profile it stays a duplicate, because two entries for one path
+/// in the same sidebar are indistinguishable to the user and every lookup that
+/// resolves a path to a project would then have to pick one arbitrarily.
+fn project_path_taken(list: &[Project], profile: &ProfileId, canon: &str) -> bool {
+    list.iter().any(|p| &p.profile == profile && p.root_path == canon)
+}
+
 fn save_projects_in(id: &ProfileId, list: &[Project]) -> Result<()> {
     let json = serde_json::to_string_pretty(list)?;
     write_atomic(&projects_file_in(id)?, json.as_bytes())?;
@@ -2838,6 +3064,16 @@ pub struct SandboxStatus {
 pub struct SpawnResult {
     id: String,
     sandbox: SandboxStatus,
+    /// Which account this process was ACTUALLY spawned with, `None` for the
+    /// agent's ordinary login (GH #278).
+    ///
+    /// Returned rather than re-derived in the frontend, and the difference is
+    /// not academic: a switch takes effect on the NEXT spawn, so between the
+    /// click and the restart the setting says one thing and the running
+    /// process is another. Attributing this process's usage to the setting
+    /// would file the old account's numbers under the new account's name,
+    /// which is the one mistake the whole feature exists to prevent.
+    account: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3181,6 +3417,11 @@ fn pty_spawn(
     let docker_task = spawn_task
         .clone()
         .filter(|t| t.docker_sandbox_enabled && docker_globally_enabled);
+    // The account this spawn resolved to, filled in by whichever realm ends up
+    // running it and handed back in `SpawnResult` (GH #278). Declared here
+    // because the two realms decide it in different places and neither can see
+    // the other's answer.
+    let mut spawn_account: Option<String> = None;
     // Carries the container's `--name` alongside its argv: the Activity
     // monitor cannot see inside the container via the host pid tree (the
     // `docker` CLI client it samples sits nearly idle while the real work
@@ -3220,7 +3461,13 @@ fn pty_spawn(
         // A cloned agent stores state under its OWN id (that is what gives it
         // a separate login) but has its BASE agent's config shape.
         let agent_base = docker::base_agent_id(&docker_settings.agents, &agent).to_string();
-        let spec = docker::build_spec(&task, &agent, &image, &args.cwd, task.docker_extra_args.clone(), &docker_env, &agent_extra_dirs, agent_persist_enabled, &docker_allowed_paths, &task.docker_extra_mounts, &id, &agent_base, &docker_settings.docker_shared_config_dirs);
+        let docker_account = relocating_account(Some(&task), &agent, &docker_settings.agents);
+        spawn_account = docker_account.clone();
+        let spec = docker::build_spec(&task, &agent, &image, &args.cwd, task.docker_extra_args.clone(), &docker_env, &agent_extra_dirs, agent_persist_enabled, &docker_allowed_paths, &task.docker_extra_mounts, &id, &agent_base, &docker_settings.docker_shared_config_dirs,
+            // The DOCKER realm's account: a container reads the dir termic
+            // mounts, never the host's config dir, so its login is a separate
+            // store and the host's would be a different account entirely.
+            docker_account.as_deref());
         let argv = docker::render_argv(&spec, &args.cmd, &args.args);
         dlog(&format!("[pty_spawn] docker task={} agent={} image={} argv={argv:?}", task.id, agent, image));
         Some((argv, spec.container_name))
@@ -3237,6 +3484,9 @@ fn pty_spawn(
     // Drop impl SIGKILLs the proxy when the PTY closes.
     // Docker mode short-circuits this: the container IS the cage, so the
     // program becomes `docker` with the rendered run-argv, no seatbelt bundle.
+    // Recorded before the move below, because the account overlay has to know
+    // which realm this spawn is in.
+    let is_docker_spawn = docker_argv.is_some();
     let (effective_cmd, effective_args, sandbox_bundle) = if let Some((argv, _)) = docker_argv {
         ("docker".to_string(), argv, None)
     } else { match args
@@ -3343,6 +3593,52 @@ fn pty_spawn(
     }
     for (k, v) in &args.env {
         cmd.env(k, expand_tilde_env(v));
+    }
+    // The chosen account's login (GH #278), AFTER the caller's overlay so a
+    // switch wins over whatever the agent entry carries. Applied here rather
+    // than in the frontend because every spawn path lands in `pty_spawn`: the
+    // UI, the CLI and MCP all get account switching without threading it
+    // through, and none of them can forget to.
+    //
+    // Docker spawns take the Docker realm: that container reads a directory
+    // termic mounts, never the host's config dir, so its login is a different
+    // store and reporting the host's would be a different account entirely.
+    // AGENT SPAWNS ONLY. An aux terminal in a task carries no `agent_id`, so
+    // falling back to `task.cli` would hand a plain shell the agent's account
+    // environment. Harmless-looking on macOS, genuinely wrong on Linux: two of
+    // the shapes relocate XDG_DATA_HOME / XDG_CONFIG_HOME, which every
+    // XDG-aware tool in that interactive shell reads, so the user's own
+    // commands would start writing into an account's login store.
+    let is_agent_spawn = args.role.as_ref().map(|r| r.kind == "agent").unwrap_or(false)
+        || args.agent_id.is_some();
+    if !is_docker_spawn && is_agent_spawn {
+        let agent_id = args.agent_id.clone()
+            .or_else(|| spawn_task.as_ref().map(|t| t.cli.clone()))
+            .unwrap_or_default();
+        let agents = load_settings_in(
+            &spawn_task.as_ref().map(|t| t.profile.clone()).unwrap_or_default(),
+        ).agents;
+        spawn_account = relocating_account(spawn_task.as_ref(), &agent_id, &agents);
+        let overlay = account_login_env(spawn_task.as_ref(), &agent_id, &agents, LoginRealm::Host);
+        // LINUX TRAP. Two of the shapes relocate an XDG root, and on Linux
+        // `dirs::data_local_dir()` IS `$XDG_DATA_HOME`. termic's own CLI
+        // resolves the app's socket through exactly that call, so an agent
+        // spawned with a relocated XDG_DATA_HOME would have its bundled
+        // `termic` look for the socket inside the account's login store and
+        // silently fail to reach the app. macOS never sees this: its data dir
+        // is `~/Library/Application Support` and ignores XDG.
+        //
+        // Pin the socket explicitly for those spawns. `TERMIC_SOCKET` already
+        // exists for this shape of problem and, unlike TERMIC_DATA_DIR, is
+        // honoured in release builds.
+        if overlay.iter().any(|(k, _)| k.starts_with("XDG_")) {
+            if let Ok(dir) = global_dir() {
+                cmd.env("TERMIC_SOCKET", dir.join(termic_proto::SOCKET_FILE));
+            }
+        }
+        for (k, v) in overlay {
+            cmd.env(k, v);
+        }
     }
     // INVARIANT: everything `cmd.env`'d from here down is applied AFTER
     // the caller's overlay above, so it silently overrides any extra
@@ -3691,7 +3987,7 @@ fn pty_spawn(
     // event; keep the parameter binding alive for tauri's handler
     // signature but mark it unused.
     let _ = app;
-    Ok(SpawnResult { id, sandbox: status })
+    Ok(SpawnResult { id, sandbox: status, account: spawn_account })
 }
 
 #[tauri::command]
@@ -3793,6 +4089,277 @@ fn slug_of_window(reg: &profiles::Registry, window: &tauri::Window) -> Option<St
         ProfileId::Root => reg.root_slug.clone(),
         ProfileId::Slug(s) => reg.get(&s).map(|p| p.slug.clone()),
     }
+}
+
+// ─────────────── the account switcher's verbs (GH #278) ───────────────
+//
+// All of them are LOGIN verbs. There is deliberately no verb that takes a
+// path: where a login lives is derived from the account's name, never stored,
+// so nothing here can point at a stale directory.
+//
+// termic never handles a secret. `account_add` creates an EMPTY store; the
+// agent's own login command writes its credential there, wherever it likes,
+// file or keychain. That is what keeps this small, and it is why there is no
+// import, export or backup verb.
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountView {
+    pub name: String,
+    /// True once the agent has actually written something into this account's
+    /// store. "Named but never signed in" is a legitimate state: it is what a
+    /// second machine looks like, and what the Docker realm looks like before
+    /// its first login there.
+    pub signed_in: bool,
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAccountsView {
+    pub agent_id: String,
+    pub accounts: Vec<AccountView>,
+    /// `false` when this agent cannot hold a second login, in which case the
+    /// UI must not offer one rather than offering one that silently shares a
+    /// credential.
+    pub supported: bool,
+    /// WHY, when `supported` is false and somebody has actually looked into
+    /// it. Shown to the user, so it says what is true of the AGENT rather than
+    /// what termic did not get round to.
+    pub unsupported_reason: Option<String>,
+    /// The variable that gets set. Surfaced because for opencode and muse it
+    /// is a GENERIC root other tools read, which the user deserves to know.
+    pub env_var: Option<String>,
+    pub env_is_shared_root: bool,
+    /// Is this agent one that can report how much of its plan is spent? The
+    /// automatic switch is offered only where the answer is yes, and the UI
+    /// says so rather than showing a control that could never fire.
+    pub reports_usage: bool,
+    /// Whether the automatic switch is on for this agent.
+    pub auto_switch: bool,
+    /// Which account NAMES the agent's pre-existing login. It relocates
+    /// nothing, so a process running on the ordinary login is running on THIS
+    /// account, and the footer needs to know in order to say so.
+    pub adopted_account: Option<String>,
+}
+
+/// Has this account's store been written to?
+///
+/// A directory termic created but the agent never wrote into is "named, not
+/// signed in". Checked by looking for ANY entry, because where an agent puts
+/// its credential differs per agent and two of them put it in the keychain
+/// with only an index on disk.
+fn account_signed_in(agent_id: &str, account: &str, realm: LoginRealm, agents: &[Agent]) -> bool {
+    // The adopted account is the agent's ORDINARY login, so the question is
+    // whether the agent itself is signed in, not whether a store exists.
+    if agents.iter().find(|a| a.id == agent_id)
+        .and_then(|a| a.adopted_account.as_deref()) == Some(account)
+    {
+        let home = PathBuf::from(home_dir());
+        return agent_dirs::instance_config_dir(agents, agent_id, &home)
+            .map(|d| d.exists())
+            .unwrap_or(false);
+    }
+    let Some(dir) = login_store_dir(agent_id, Some(account), realm) else { return false };
+    std::fs::read_dir(&dir)
+        .map(|mut d| d.any(|e| e.is_ok()))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn agent_accounts(window: tauri::Window, agent_id: String, docker: bool) -> AgentAccountsView {
+    let realm = if docker { LoginRealm::Docker } else { LoginRealm::Host };
+    let agents = load_settings_in(&window_profile(&window)).agents;
+    accounts_view_for(&agent_id, &agents, realm)
+}
+
+/// One agent's view, from an already-loaded registry.
+fn accounts_view_for(agent_id: &str, agents: &[Agent], realm: LoginRealm) -> AgentAccountsView {
+    let base = docker::base_agent_id(agents, agent_id);
+    let entry = agents.iter().find(|a| a.id == agent_id);
+    let store = agent_dirs::login_store(base);
+    AgentAccountsView {
+        accounts: entry.map(|e| e.accounts.iter().map(|n| AccountView {
+            name: n.clone(),
+            signed_in: account_signed_in(agent_id, n, realm, agents),
+            is_default: e.default_account.as_deref() == Some(n.as_str()),
+        }).collect()).unwrap_or_default(),
+        supported: store.is_some(),
+        unsupported_reason: agent_dirs::login_unsupported_reason(base).map(str::to_string),
+        env_var: agent_dirs::login_env(base, Path::new("/x")).first().map(|(k, _)| k.clone()),
+        env_is_shared_root: matches!(
+            store,
+            Some(agent_dirs::LoginStore::XdgRoot { .. }) | Some(agent_dirs::LoginStore::HomeOnly { .. })
+        ),
+        adopted_account: entry.and_then(|e| e.adopted_account.clone()),
+        reports_usage: agent_dirs::reports_usage(base),
+        // Reported as OFF for an agent that cannot act on it, whatever the
+        // stored flag says. A flag can outlive the reason it was set (the
+        // agent's feed is removed, or the entry is re-pointed at a different
+        // base), and the honest answer then is that nothing will switch.
+        auto_switch: agent_dirs::reports_usage(base)
+            && entry.map(|e| e.auto_switch_account).unwrap_or(false),
+        agent_id: agent_id.to_string(),
+    }
+}
+
+/// Tell every window an agent's account list or default changed (GH #278).
+///
+/// BROADCAST, not scoped to the calling window, and that is deliberate. The
+/// list and the default are profile-scoped, but the login STORES are global
+/// and keyed by name, so adding or removing a set changes what "signed in"
+/// means for every profile that offers the same name. A window that shows a
+/// stale answer to that is worse than one that re-reads a file it owns.
+///
+/// The footer's account pill is the reason this exists at all: it fetched on
+/// mount and on its own actions, so a set added from Settings did not appear
+/// there until something else happened to remount it.
+fn emit_accounts_changed(app: &AppHandle) {
+    let _ = app.emit("termic://agent-accounts-changed", ());
+}
+
+#[tauri::command]
+fn account_add(window: tauri::Window, agent_id: String, name: String) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("account name is required".into());
+    }
+    let profile = window_profile(&window);
+    let mut settings = load_settings_in(&profile);
+    let base = docker::base_agent_id(&settings.agents, &agent_id).to_string();
+    if agent_dirs::login_store(&base).is_none() {
+        return Err(format!(
+            "termic has not measured where {base} keeps its login, so it cannot hold a second account yet",
+        ));
+    }
+    let Some(entry) = settings.agents.iter_mut().find(|a| a.id == agent_id) else {
+        return Err(format!("no such agent: {agent_id}"));
+    };
+    if entry.accounts.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
+        return Err(format!("this agent already has an account called {name:?}"));
+    }
+    // Two accounts whose names slugify to the same thing would share one
+    // directory, which is the one way the name-as-key rule can bite.
+    let slug = account_slug(&name);
+    if entry.accounts.iter().any(|a| account_slug(a) == slug) {
+        return Err(format!("{name:?} is too close to an account you already have"));
+    }
+    entry.accounts.push(name.clone());
+    // Whether this one gets a store of its own. The FIRST account is the
+    // ADOPTED one: it names the login the agent already has and relocates
+    // nothing, so there is nothing to wire and linking the primary dir into
+    // itself would be a loop.
+    let needs_store = entry.accounts.len() > 1;
+    // The FIRST account NAMES the login the agent already has rather than
+    // creating one, so someone whose agent works fine is never told they are
+    // "not signed in". Same rule as the first profile being the install that
+    // already exists.
+    if entry.accounts.len() == 1 {
+        entry.adopted_account = Some(name.clone());
+        entry.default_account = Some(name.clone());
+    }
+    save_settings_in(&profile, &settings)?;
+    // Wire the store as part of CREATING the account, not lazily later: the
+    // whole point of a named account is that it is a working agent with a
+    // different credential, and a bare directory is a BLANK agent (no
+    // instructions, no permissions, no transcripts, no usage feed).
+    if needs_store {
+        ensure_account_store(&agent_id, &name, LoginRealm::Host, &settings.agents);
+    }
+    { use tauri::Manager; emit_accounts_changed(window.app_handle()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn account_remove(window: tauri::Window, agent_id: String, name: String) -> Result<(), String> {
+    let profile = window_profile(&window);
+    let mut settings = load_settings_in(&profile);
+    let Some(entry) = settings.agents.iter_mut().find(|a| a.id == agent_id) else {
+        return Err(format!("no such agent: {agent_id}"));
+    };
+    entry.accounts.retain(|a| a != &name);
+    if entry.default_account.as_deref() == Some(name.as_str()) {
+        entry.default_account = entry.accounts.first().cloned();
+    }
+    if entry.adopted_account.as_deref() == Some(name.as_str()) {
+        // The name for the pre-existing login is gone. Do NOT promote another
+        // account into it: those have their own stores, and calling one of
+        // them "the login you already had" would be a lie. The agent's
+        // ordinary login simply goes back to being unnamed.
+        entry.adopted_account = None;
+    }
+    save_settings_in(&profile, &settings)?;
+    // The STORE is left alone, deliberately. It is global and keyed by name,
+    // so another profile may still be using it, and dropping it here would log
+    // that profile out of an account it never touched. Removing the login
+    // itself is the agent's own `logout`.
+    { use tauri::Manager; emit_accounts_changed(window.app_handle()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn account_set_default(window: tauri::Window, agent_id: String, name: Option<String>) -> Result<(), String> {
+    let profile = window_profile(&window);
+    let mut settings = load_settings_in(&profile);
+    let Some(entry) = settings.agents.iter_mut().find(|a| a.id == agent_id) else {
+        return Err(format!("no such agent: {agent_id}"));
+    };
+    if let Some(n) = name.as_deref() {
+        if !entry.accounts.iter().any(|a| a == n) {
+            return Err(format!("{n:?} is not one of this agent's accounts"));
+        }
+    }
+    entry.default_account = name;
+    save_settings_in(&profile, &settings)?;
+    { use tauri::Manager; emit_accounts_changed(window.app_handle()); }
+    Ok(())
+}
+
+/// Turn the automatic switch on or off for one agent (GH #278).
+///
+/// Refused for an agent with no usage feed rather than stored and ignored. A
+/// flag that can never fire is worse than an absent one: the user believes
+/// they are covered, and finds out they were not at the moment they hit a
+/// limit.
+#[tauri::command]
+fn account_set_auto_switch(window: tauri::Window, agent_id: String, on: bool) -> Result<(), String> {
+    let profile = window_profile(&window);
+    let mut settings = load_settings_in(&profile);
+    let base = docker::base_agent_id(&settings.agents, &agent_id).to_string();
+    if on && !agent_dirs::reports_usage(&base) {
+        return Err(format!("{agent_id} does not report plan usage, so it cannot switch on its own"));
+    }
+    let Some(entry) = settings.agents.iter_mut().find(|a| a.id == agent_id) else {
+        return Err(format!("no such agent: {agent_id}"));
+    };
+    entry.auto_switch_account = on;
+    save_settings_in(&profile, &settings)?;
+    { use tauri::Manager; emit_accounts_changed(window.app_handle()); }
+    Ok(())
+}
+
+/// Point one TASK at a different account for one agent.
+///
+/// This is the switch. It writes the override and nothing else: the running
+/// PTY keeps its old login, because a process cannot have its environment
+/// changed underneath it. The next spawn for that agent picks the new account
+/// up, which is what makes "switch and resume" work.
+#[tauri::command]
+fn task_set_account(id: String, agent_id: String, name: Option<String>) -> Result<(), String> {
+    let mut t = load_tasks_all().into_iter().find(|t| t.id == id).ok_or("no task")?;
+    match name {
+        Some(n) => { t.accounts.insert(agent_id, n); }
+        None => { t.accounts.remove(&agent_id); }
+    }
+    save_task(&t).map_err(|e| e.to_string())
+}
+
+/// Which account a task's agent is actually running as, for the footer pill.
+#[tauri::command]
+fn task_account(window: tauri::Window, id: String, agent_id: String) -> Option<String> {
+    let task = load_tasks_all().into_iter().find(|t| t.id == id);
+    let agents = load_settings_in(&window_profile(&window)).agents;
+    account_for_spawn(task.as_ref(), &agent_id, &agents)
 }
 
 #[tauri::command]
@@ -3902,22 +4469,29 @@ fn profile_seeded_tasks_path(name: String) -> (String, String) {
 
 #[tauri::command]
 fn profile_create(app: AppHandle, args: CreateProfileArgs) -> Result<ProfileView, String> {
-    let g = global_dir().map_err(|e| e.to_string())?;
-    let mut reg = profiles::load_registry(&g);
-    let slug = registry_add_profile(
-        &mut reg,
-        &args.name,
-        &args.accent,
-        args.existing_name.as_deref(),
-        args.existing_accent.as_deref(),
-    )?;
-    profiles::save_registry(&g, &reg).map_err(|e| e.to_string())?;
+    // Under the lock: creating the FIRST profile also adopts the existing
+    // install, and both entries have to land in one write or the registry is
+    // briefly a registry that names one of two profiles.
+    // Returns what the caller needs from the registry, read under the same
+    // lock that wrote it: re-reading afterwards would be a second load another
+    // window could have changed in between.
+    let (slug, id, order) = with_registry(|_g, reg| {
+        let slug = registry_add_profile(
+            reg,
+            &args.name,
+            &args.accent,
+            args.existing_name.as_deref(),
+            args.existing_accent.as_deref(),
+        )?;
+        let id = reg.id_for(&slug);
+        let order = reg.get(&slug).map(|p| p.order).unwrap_or(0);
+        Ok((slug, id, order))
+    })?;
 
     // Seed the new profile's settings. NOT blank: agent DETECTION is a machine
     // fact, so the registry is inherited from the profile that already ran it
     // rather than making the user re-detect every CLI. See
     // docs/plans/profiles.md, "Profile creation seeds, it never blanks".
-    let id = reg.id_for(&slug);
     let mut seeded = load_settings_in(&ProfileId::Root);
     seeded.default_tasks_path = if args.tasks_path.trim().is_empty() {
         builtin_profile_tasks_path(&slug)
@@ -3929,7 +4503,6 @@ fn profile_create(app: AppHandle, args: CreateProfileArgs) -> Result<ProfileView
     save_settings_in(&id, &seeded)?;
     save_projects_in(&id, &[]).map_err(|e| e.to_string())?;
 
-    let order = reg.get(&slug).map(|p| p.order).unwrap_or(0);
     let view = ProfileView {
         slug: slug.clone(),
         name: args.name.trim().to_string(),
@@ -3947,23 +4520,22 @@ fn profile_create(app: AppHandle, args: CreateProfileArgs) -> Result<ProfileView
 
 #[tauri::command]
 fn profile_update(app: AppHandle, slug: String, name: Option<String>, accent: Option<String>) -> Result<(), String> {
-    let g = global_dir().map_err(|e| e.to_string())?;
-    let mut reg = profiles::load_registry(&g);
-    let Some(p) = reg.profiles.iter_mut().find(|p| p.slug == slug) else {
-        return Err(format!("no such profile: {slug}"));
-    };
-    // The SLUG is deliberately not touched. It keys both trees, and CWD-resume
-    // agents key sessions to the working directory, so a rename that relocated
-    // worktrees would silently orphan every conversation under them.
-    if let Some(n) = name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        p.name = n.to_string();
-    }
-    if let Some(a) = accent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        p.accent = a.to_string();
-    }
-    let title = format!("Termic - {}", p.name);
-    let id = reg.id_for(&slug);
-    profiles::save_registry(&g, &reg).map_err(|e| e.to_string())?;
+    let (title, id) = with_registry(|_g, reg| {
+        let p = reg.profiles.iter_mut().find(|p| p.slug == slug)
+            .ok_or_else(|| format!("no such profile: {slug}"))?;
+        // The SLUG is deliberately not touched. It keys both trees, and
+        // CWD-resume agents key sessions to the working directory, so a rename
+        // that relocated worktrees would silently orphan every conversation
+        // under them.
+        if let Some(n) = name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            p.name = n.to_string();
+        }
+        if let Some(a) = accent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            p.accent = a.to_string();
+        }
+        let title = format!("Termic - {}", p.name);
+        Ok((title, reg.id_for(&slug)))
+    })?;
     {
         use tauri::Manager;
         if let Some(win) = app.get_webview_window(&id.window_label()) {
@@ -3985,20 +4557,33 @@ fn profile_update(app: AppHandle, slug: String, name: Option<String>, accent: Op
 #[tauri::command]
 fn profile_open(app: AppHandle, slug: String) -> Result<(), String> {
     use tauri::Manager;
-    let g = global_dir().map_err(|e| e.to_string())?;
-    let mut reg = profiles::load_registry(&g);
-    if reg.get(&slug).is_none() {
-        return Err(format!("no such profile: {slug}"));
-    }
-    let id = reg.id_for(&slug);
-
     // Chrome's tie-break for a project that lives in several profiles is
     // "most recently focused window", so focusing has to be recorded.
-    if let Some(p) = reg.profiles.iter_mut().find(|p| p.slug == slug) {
-        p.last_focused_at = Some(chrono::Utc::now().to_rfc3339());
-    }
-    let _ = profiles::save_registry(&g, &reg);
+    //
+    // Under the lock and NOTHING ELSE under it: `build_profile_window` below
+    // writes the registry too, and holding this across it would deadlock.
+    let id = with_registry(|_g, reg| {
+        if reg.get(&slug).is_none() {
+            return Err(format!("no such profile: {slug}"));
+        }
+        if let Some(p) = reg.profiles.iter_mut().find(|p| p.slug == slug) {
+            p.last_focused_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        Ok(reg.id_for(&slug))
+    })?;
 
+    // BEFORE the target is focused, never after. `leave_windowless` restores
+    // every profile window and then focuses ONE, preferring the root, which is
+    // right when the app is coming back from windowless and has no other
+    // instruction. Called afterwards it silently undoes this function's whole
+    // job: clicking "Work" focused the Work window and was then pulled
+    // straight back to the root window, so switching profiles appeared to
+    // open the wrong one.
+    //
+    // Whoever focuses LAST wins, so the target goes last.
+    //
+    // A profile window is a window: an app that was windowless has one again.
+    leave_windowless(&app);
     let win = match app.get_webview_window(&id.window_label()) {
         Some(w) => w,
         None => build_profile_window(&app, &id).map_err(|e| e.to_string())?,
@@ -4006,8 +4591,6 @@ fn profile_open(app: AppHandle, slug: String) -> Result<(), String> {
     let _ = win.unminimize();
     let _ = win.show();
     focus_window_unless_e2e(&win);
-    // A profile window is a window: an app that was windowless has one again.
-    leave_windowless(&app);
     // The menu marks the open profiles, so opening one changes it.
     rebuild_tray_menu(&app);
     Ok(())
@@ -4060,6 +4643,32 @@ fn profiles_disable(app: AppHandle) -> Result<(), String> {
 /// Refuses to close the CALLING window: that is the red button's job, and
 /// closing the window you are driving from would leave the dialog you clicked
 /// in mid-air.
+/// Close THIS window, but only when it is not the last one open (GH #280).
+///
+/// The keyboard half of the red button: ⌘W closes the innermost thing there is
+/// to close, and a window with no task open is itself that thing.
+///
+/// The last-window check lives HERE rather than in the caller because it is
+/// the difference between closing a window and quitting the app. The frontend
+/// knows how many windows are open only through a store that a just-closed
+/// sibling can leave stale for a moment, and being wrong in that direction
+/// means the close-action setting fires and takes someone's running agents
+/// with it. Rust counts the real windows.
+///
+/// Returns whether it closed, so the caller can tell "nothing to do" from a
+/// failure.
+#[tauri::command]
+fn window_close_if_not_last(app: AppHandle, window: tauri::Window) -> Result<bool, String> {
+    if profile_windows(&app).len() <= 1 {
+        return Ok(false);
+    }
+    // Through the ordinary close path, not `destroy`: `CloseRequested` is what
+    // hides the root, destroys a profile, clears `open_at_quit` so launch
+    // restore does not resurrect it, and rebuilds the tray.
+    window.close().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 #[tauri::command]
 fn profile_close(app: AppHandle, window: tauri::Window, slug: String) -> Result<(), String> {
     use tauri::Manager;
@@ -4163,6 +4772,18 @@ async fn profile_delete(app: AppHandle, slug: String, delete_worktrees: bool) ->
     Ok(())
 }
 
+/// Is `label` the window this request came from?
+///
+/// `profile_delete` runs on a blocking thread and does not carry the calling
+/// `Window`, so the focused window stands in for it: the user just clicked a
+/// button in that dialog, so it is focused by construction.
+fn is_calling_window(app: &AppHandle, label: &str) -> bool {
+    use tauri::Manager;
+    app.webview_windows()
+        .iter()
+        .any(|(l, w)| l == label && w.is_focused().unwrap_or(false))
+}
+
 fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool) -> Result<(), String> {
     use tauri::Manager;
     let g = global_dir().map_err(|e| e.to_string())?;
@@ -4172,11 +4793,26 @@ fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool) -> R
     }
     let id = reg.id_for(slug);
 
-    // PRECONDITION, not a race to handle: one window per profile makes this a
-    // rule the user can act on. Live agents in that window are their decision,
-    // made before the dialog appears.
-    if app.get_webview_window(&id.window_label()).is_some() {
-        return Err("close the profile's window before deleting it".into());
+    // CLOSE IT OURSELVES rather than making the user do it first.
+    //
+    // This used to be a precondition: "close the window, then come back". That
+    // is a chore we invented. The user has just confirmed a dialog that says
+    // what will be deleted, and finding a window that may be on another Space
+    // or another monitor is not part of that decision. The dialog warns that
+    // the window closes and that anything running in it stops; this carries it
+    // out.
+    //
+    // Still refused for the window making the REQUEST, which is not a chore
+    // but an impossibility: deleting the profile you are driving from would
+    // pull the data dir out from under the dialog you clicked in. That is the
+    // same rule `profile_close` already enforces.
+    let label = id.window_label();
+    if let Some(win) = app.get_webview_window(&label) {
+        if win.label() == label && is_calling_window(app, &label) {
+            return Err("switch to another profile before deleting this one".into());
+        }
+        // Its PTYs die with the window, which is what the dialog warned about.
+        let _ = win.destroy();
     }
 
     delete_profile_data(&g, &mut reg, &id, slug, delete_worktrees)
@@ -4313,7 +4949,7 @@ fn project_add(window: tauri::Window, root_path: String, non_git: Option<bool>) 
     }
     let mut list = load_projects_all();
     let canon = fs::canonicalize(&pb).map_err(|e| e.to_string())?;
-    if list.iter().any(|p| p.root_path == canon.to_string_lossy()) {
+    if project_path_taken(&list, &window_profile(&window), &canon.to_string_lossy()) {
         // NOTE: the "project already added" substring is load-bearing for
         // cli_server::handle_project_add's idempotent re-add.
         return Err("project already added".into());
@@ -4515,7 +5151,7 @@ fn project_add_multi(window: tauri::Window, root_path: String, name: String, mem
 
     let mut list = load_projects_all();
     let canon = fs::canonicalize(&pb).map_err(|e| e.to_string())?;
-    if list.iter().any(|p| p.root_path == canon.to_string_lossy()) {
+    if project_path_taken(&list, &window_profile(&window), &canon.to_string_lossy()) {
         return Err("a project at this path is already added".into());
     }
 
@@ -4933,6 +5569,9 @@ fn task_open_repo(
     let task = Task {
         id: Uuid::new_v4().to_string(),
         project_id: proj.id.clone(),
+        // No account override at create: a new task follows the agent's
+        // default until someone switches it.
+        accounts: HashMap::new(),
         // A task's profile is ALWAYS its project's: a task belongs to a
         // project and a project belongs to a profile, so creation never
         // needs to be told which one.
@@ -5192,6 +5831,9 @@ fn task_import_worktree(
     let task = Task {
         id: Uuid::new_v4().to_string(),
         project_id: proj.id.clone(),
+        // No account override at create: a new task follows the agent's
+        // default until someone switches it.
+        accounts: HashMap::new(),
         // A task's profile is ALWAYS its project's: a task belongs to a
         // project and a project belongs to a profile, so creation never
         // needs to be told which one.
@@ -5555,6 +6197,9 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
     let task = Task {
         id: task_id.clone(),
         project_id: proj.id.clone(),
+        // No account override at create: a new task follows the agent's
+        // default until someone switches it.
+        accounts: HashMap::new(),
         // A task's profile is ALWAYS its project's: a task belongs to a
         // project and a project belongs to a profile, so creation never
         // needs to be told which one.
@@ -6045,6 +6690,9 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     let task = Task {
         id: task_id.clone(),
         project_id: host.id.clone(),
+        // No account override at create: a new task follows the agent's
+        // default until someone switches it.
+        accounts: HashMap::new(),
         // A task's profile is ALWAYS its project's: a task belongs to a
         // project and a project belongs to a profile, so creation never
         // needs to be told which one.
@@ -7582,6 +8230,21 @@ fn build_profile_window(app: &AppHandle, id: &ProfileId) -> tauri::Result<tauri:
         });
     }
 
+    // Linux and Windows keep Tauri's native close (a closed window is closed,
+    // which is the convention there), but launch restore still has to learn
+    // about it or it would reopen a window the user deliberately shut. The
+    // macOS handler above does this as part of its own close decision; this is
+    // the same bookkeeping for the platforms that do not have one.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let close_id = id.clone();
+        win.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                set_open_at_quit(&close_id, false);
+            }
+        });
+    }
+
     #[cfg(target_os = "macos")]
     round_window_corners_for_tahoe(&win);
     set_open_at_quit(id, true);
@@ -7594,22 +8257,82 @@ fn build_profile_window(app: &AppHandle, id: &ProfileId) -> tauri::Result<tauri:
 /// write, and creating one here would make the feature exist for someone who
 /// never asked for it.
 fn set_open_at_quit(id: &ProfileId, open: bool) {
-    let Ok(g) = global_dir() else { return };
+    let _ = with_registry(|_g, reg| {
+        if reg.profiles.is_empty() {
+            return Err("dormant".into());
+        }
+        let slug = match id {
+            ProfileId::Root => reg.root_slug.clone(),
+            ProfileId::Slug(s) => Some(s.clone()),
+        };
+        let slug = slug.ok_or("no slug")?;
+        let p = reg.profiles.iter_mut().find(|p| p.slug == slug).ok_or("gone")?;
+        if p.open_at_quit == open {
+            // `Err` to skip the save: nothing changed, and a no-op write is
+            // still a write another thread could be racing.
+            return Err("unchanged".into());
+        }
+        p.open_at_quit = open;
+        Ok(())
+    });
+}
+
+/// Serializes every read-modify-write of `profiles.json`.
+///
+/// The registry is `load -> mutate -> save`, and several call sites do it from
+/// different windows' event handlers: a window opening stamps
+/// `last_focused_at`, a window closing clears `open_at_quit`, a build sets it.
+/// Unserialized, two of those interleave and the later save writes back a copy
+/// loaded BEFORE the other's change, silently undoing it. The visible symptom
+/// is a setting that "did not take" and then works on the next attempt, which
+/// is the hardest kind of bug to believe a report of.
+///
+/// NOT re-entrant (`std::sync::Mutex` never is), so every holder below keeps it
+/// for the load-mutate-save and nothing else. In particular it must not be
+/// held across `build_profile_window`, which writes the registry itself.
+static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` with exclusive access to the registry, then persist it.
+///
+/// The closure gets the data dir too, because some callers need it for paths
+/// alongside the mutation. Returning `Err` skips the save.
+fn with_registry<T>(
+    f: impl FnOnce(&Path, &mut profiles::Registry) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let g = global_dir().map_err(|e| e.to_string())?;
     let mut reg = profiles::load_registry(&g);
-    if reg.profiles.is_empty() {
-        return;
+    let out = f(&g, &mut reg)?;
+    profiles::save_registry(&g, &reg).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// Was the root window closed at quit, with another profile left open?
+///
+/// `setup` builds the root window unconditionally and `restore_open_profiles`
+/// skips it for that reason, so nothing else in the app reads root's
+/// `open_at_quit`. Without this the root came back on every launch no matter
+/// how the user left things, which is only visible once a SECOND profile
+/// exists: with one profile the root is the only window there is.
+///
+/// Deliberately conservative: it answers false unless another profile is
+/// actually flagged to come back, so a registry in any unexpected state still
+/// launches to a window rather than to nothing.
+fn root_window_stays_closed() -> bool {
+    let reg = profiles_registry();
+    if reg.is_dormant() {
+        return false;
     }
-    let slug = match id {
-        ProfileId::Root => reg.root_slug.clone(),
-        ProfileId::Slug(s) => Some(s.clone()),
-    };
-    let Some(slug) = slug else { return };
-    let Some(p) = reg.profiles.iter_mut().find(|p| p.slug == slug) else { return };
-    if p.open_at_quit == open {
-        return;
+    let root_slug = reg.root_slug.clone();
+    let root_open = root_slug
+        .as_deref()
+        .and_then(|s| reg.get(s))
+        .map(|p| p.open_at_quit)
+        .unwrap_or(true);
+    if root_open {
+        return false;
     }
-    p.open_at_quit = open;
-    let _ = profiles::save_registry(&g, &reg);
+    reg.profiles.iter().any(|p| p.open_at_quit && Some(p.slug.as_str()) != root_slug.as_deref())
 }
 
 /// Reopen every profile that had a window when the app last quit.
@@ -17125,6 +17848,47 @@ pub struct Agent {
     /// output, unusual title patterns, never-quiet PTYs).
     #[serde(default = "default_true")]
     pub work_done: bool,
+    /// Named credential sets for this agent (GH #278), in the order the user
+    /// added them. Names only: where a login LIVES is derived from the name by
+    /// `login_store_dir`, never stored, so nothing here can point at a stale
+    /// path. Empty is the overwhelmingly common case and means "one login,
+    /// exactly as before".
+    ///
+    /// Lives on the agent entry, so it is profile-scoped for free
+    /// (`settings.agents` already is) without a second mechanism. The STORES
+    /// are global and keyed by name, so two profiles naming an account "Work"
+    /// share the login rather than each signing in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<String>,
+    /// Which of `accounts` new tasks use. `None` means the agent's ordinary
+    /// login, the one it had before any account existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_account: Option<String>,
+    /// Move a task to another account on its own when this one is spent
+    /// (GH #278). Opt-in, per agent, and therefore profile-scoped like every
+    /// other field here: a work profile can rotate work accounts while a
+    /// personal one never does.
+    ///
+    /// Only ever true for an agent that reports usage, because "spent" is a
+    /// number somebody has to tell us (`agent_dirs::reports_usage`). It is
+    /// stored per agent rather than globally so turning it on for claude says
+    /// nothing about codex, which is a different subscription with a different
+    /// billing consequence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_switch_account: bool,
+    /// The account that IS the agent's pre-existing login (GH #278).
+    ///
+    /// Naming your first credential set does not create one: you already had a
+    /// login, and this is the name you gave it. It therefore relocates
+    /// NOTHING, exactly as the first profile is the install that already
+    /// exists rather than a new directory. Without this the UI would tell
+    /// someone whose agent works fine that they are "not signed in", and
+    /// switching to that account would hand them an empty store.
+    ///
+    /// Recorded by name rather than by position, so removing another account
+    /// cannot silently move which one is adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_account: Option<String>,
     /// ID of the agent this one was cloned from. NOT merely informational:
     /// Docker mode resolves a clone's config SHAPE through it (see
     /// `docker::base_agent_id`), because a clone of claude runs the claude
@@ -17287,6 +18051,10 @@ fn default_agents() -> Vec<Agent> {
             ],
             sandbox_allowed_hosts: vec![],
             work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
             extends: None,
             kind: "agent".into(),
             post_launch_capture: None,
@@ -17345,6 +18113,10 @@ fn default_agents() -> Vec<Agent> {
             ],
             sandbox_allowed_hosts: vec![],
             work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
             extends: None,
             kind: "agent".into(),
             post_launch_capture: None,
@@ -17402,6 +18174,10 @@ fn default_agents() -> Vec<Agent> {
             ],
             sandbox_allowed_hosts: vec![],
             work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
             extends: None,
             kind: "agent".into(),
             post_launch_capture: None,
@@ -17446,6 +18222,10 @@ fn default_agents() -> Vec<Agent> {
             ],
             sandbox_allowed_hosts: vec![],
             work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
             extends: None,
             kind: "agent".into(),
             post_launch_capture: None,
@@ -17496,6 +18276,10 @@ fn default_agents() -> Vec<Agent> {
             ],
             sandbox_allowed_hosts: vec![],
             work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
             extends: None,
             kind: "agent".into(),
             post_launch_capture: None,
@@ -17540,6 +18324,10 @@ fn default_agents() -> Vec<Agent> {
             sandbox_allowed_paths: vec!["$HOME/.pi".into()],
             sandbox_allowed_hosts: vec![],
             work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
             extends: None,
             kind: "agent".into(),
             post_launch_capture: None,
@@ -17583,6 +18371,10 @@ fn default_agents() -> Vec<Agent> {
             ],
             sandbox_allowed_hosts: vec![],
             work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
             extends: None,
             kind: "agent".into(),
             post_launch_capture: Some(PostLaunchCapture {
@@ -17690,6 +18482,10 @@ fn default_agents() -> Vec<Agent> {
             ],
             sandbox_allowed_hosts: vec![],
             work_done: true,
+            accounts: Vec::new(),
+            default_account: None,
+            adopted_account: None,
+            auto_switch_account: false,
             extends: None,
             kind: "agent".into(),
             // It IS opencode's shape after all: muse cannot be TOLD an id, but
@@ -18229,7 +19025,7 @@ fn docker_command_preview_sync(task_id: Option<String>, agent_id: Option<String>
         .unwrap_or_else(|| agent.clone());
     let preview_env = docker_env_for(&settings.agents, &agent_id, &agent.env);
     let agent_base = docker::base_agent_id(&settings.agents, &agent_id).to_string();
-    let spec = docker::build_spec(&task, &agent_id, &image, &task.path, task.docker_extra_args.clone(), &preview_env, &agent_extra_dirs, agent_persist_enabled, &docker_allowed_paths, &task.docker_extra_mounts, PREVIEW_PTY_ID, &agent_base, &settings.docker_shared_config_dirs);
+    let spec = docker::build_spec(&task, &agent_id, &image, &task.path, task.docker_extra_args.clone(), &preview_env, &agent_extra_dirs, agent_persist_enabled, &docker_allowed_paths, &task.docker_extra_mounts, PREVIEW_PTY_ID, &agent_base, &settings.docker_shared_config_dirs, None);
     let argv = docker::render_argv(&spec, &agent.command, &agent.args);
     Ok(DockerCommandPreview { spec, argv })
 }
@@ -19141,6 +19937,72 @@ fn merge_tray_rows(
     out
 }
 
+/// One rendered line of the tray's attention section.
+///
+/// Planned separately from building it because a `Menu` needs an `AppHandle`
+/// and cannot be constructed in a test, and this is where the grouping lives:
+/// which heading appears, when a separator goes in, what gets truncated.
+/// `merge_tray_rows` was split out for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrayRow {
+    /// Between profile sections, never leading or trailing.
+    Separator,
+    /// A profile name. Only ever emitted when more than one profile has rows.
+    ProfileHeading(String),
+    ProjectHeading(String),
+    Task { task_id: String, name: String, state: String },
+    More(usize),
+}
+
+/// Group the attention rows into the lines the menu draws.
+///
+/// PROFILES ARE SECTIONS. Each one gets a heading and is separated from the
+/// next, rather than every row carrying a `"Work - seat-be"` prefix: with four
+/// projects across two profiles that prefix was repeated on every heading and
+/// the eye had to parse it each time to answer a question ("which window?")
+/// that a section answers once.
+///
+/// The project heading keeps its own line inside the section, so the hierarchy
+/// reads profile > project > task down the menu.
+fn plan_tray_rows(items: &[TrayAttentionItem], cap: usize) -> Vec<TrayRow> {
+    let mut out = Vec::new();
+    if items.is_empty() {
+        return out;
+    }
+    let shown = &items[..items.len().min(cap)];
+    let mut last_profile: Option<Option<String>> = None;
+    let mut last_project: Option<String> = None;
+    for it in shown {
+        if last_profile.as_ref() != Some(&it.profile_name) {
+            // Between sections only. A separator above the first would put a
+            // rule at the very top of the menu.
+            if last_profile.is_some() {
+                out.push(TrayRow::Separator);
+            }
+            if let Some(p) = &it.profile_name {
+                out.push(TrayRow::ProfileHeading(p.clone()));
+            }
+            last_profile = Some(it.profile_name.clone());
+            // A project heading always follows a new section, even when the
+            // same project also ended the previous one.
+            last_project = None;
+        }
+        if last_project.as_deref() != Some(it.project_name.as_str()) {
+            out.push(TrayRow::ProjectHeading(it.project_name.clone()));
+            last_project = Some(it.project_name.clone());
+        }
+        out.push(TrayRow::Task {
+            task_id: it.task_id.clone(),
+            name: it.task_name.clone(),
+            state: it.state.clone(),
+        });
+    }
+    if items.len() > shown.len() {
+        out.push(TrayRow::More(items.len() - shown.len()));
+    }
+    out
+}
+
 fn build_tray_menu(
     app: &AppHandle,
     items: &[TrayAttentionItem],
@@ -19148,54 +20010,47 @@ fn build_tray_menu(
     use tauri::menu::{IconMenuItem, Menu, MenuItem, PredefinedMenuItem};
 
     let mut entries: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = Vec::new();
-    if !items.is_empty() {
-        let shown = &items[..items.len().min(TRAY_ATTENTION_CAP)];
-        let mut last_group: Option<(Option<String>, String)> = None;
-        for it in shown {
-            let group = (it.profile_name.clone(), it.project_name.clone());
-            if last_group.as_ref() != Some(&group) {
-                // With several profiles up, the header reads
-                // "Work - termic" so the row answers "which window is this
-                // in" before you click it. One profile: project name alone,
-                // exactly as before.
-                let label = match &it.profile_name {
-                    Some(p) => format!("{p} - {}", it.project_name),
-                    None => it.project_name.clone(),
-                };
-                let header = MenuItem::with_id(
-                    app,
-                    format!("tray_header_{label}"),
-                    &label,
-                    false,
-                    None::<&str>,
-                )?;
-                entries.push(Box::new(header));
-                last_group = Some(group);
+    let plan = plan_tray_rows(items, TRAY_ATTENTION_CAP);
+    if !plan.is_empty() {
+        for (i, row) in plan.iter().enumerate() {
+            match row {
+                TrayRow::Separator => {
+                    entries.push(Box::new(PredefinedMenuItem::separator(app)?));
+                }
+                TrayRow::ProfileHeading(name) => {
+                    entries.push(Box::new(MenuItem::with_id(
+                        app, format!("tray_profile_head_{i}"), name, false, None::<&str>,
+                    )?));
+                }
+                TrayRow::ProjectHeading(name) => {
+                    // Indented, so the hierarchy reads down the menu without a
+                    // second font: a native menu item cannot be styled, and
+                    // leading space is what the platform's own menus use.
+                    entries.push(Box::new(MenuItem::with_id(
+                        app, format!("tray_header_{i}"), format!("  {name}"), false, None::<&str>,
+                    )?));
+                }
+                // Icon carries the state (amber dot / blue dot, tray_row_icon)
+                // — no text prefix/suffix needed. (Emoji was tried in between:
+                // crisp, but rendered far larger than the menu text — Apple
+                // Color Emoji doesn't shrink to match a surrounding font the
+                // way a raster icon can be sized.)
+                TrayRow::Task { task_id, name, state } => {
+                    entries.push(Box::new(IconMenuItem::with_id(
+                        app,
+                        format!("tray_task_{task_id}"),
+                        name,
+                        true,
+                        Some(tray_row_icon(state)),
+                        None::<&str>,
+                    )?));
+                }
+                TrayRow::More(n) => {
+                    entries.push(Box::new(MenuItem::with_id(
+                        app, "tray_more", format!("+{n} more"), false, None::<&str>,
+                    )?));
+                }
             }
-            // Icon carries the state (amber dot / blue dot, tray_row_icon)
-            // — no text prefix/suffix needed. (Emoji was tried in between:
-            // crisp, but rendered far larger than the menu text — Apple
-            // Color Emoji doesn't shrink to match a surrounding font the
-            // way a raster icon can be sized.)
-            let task = IconMenuItem::with_id(
-                app,
-                format!("tray_task_{}", it.task_id),
-                &it.task_name,
-                true,
-                Some(tray_row_icon(&it.state)),
-                None::<&str>,
-            )?;
-            entries.push(Box::new(task));
-        }
-        if items.len() > shown.len() {
-            let more = MenuItem::with_id(
-                app,
-                "tray_more",
-                format!("+{} more", items.len() - shown.len()),
-                false,
-                None::<&str>,
-            )?;
-            entries.push(Box::new(more));
         }
         entries.push(Box::new(PredefinedMenuItem::separator(app)?));
     }
@@ -20083,6 +20938,12 @@ pub fn run() {
             // signal — y=21 on Tahoe, y=16 on the older chrome older OSes get.
             // Overridable at runtime via TERMIC_TRAFFIC_Y so the exact value can
             // be swept without a recompile (set it, relaunch the process, eyeball).
+            // BEFORE the window is built, because building it STAMPS
+            // `open_at_quit = true`. Read afterwards, this always answered
+            // "the root was open" and main came back on every launch no matter
+            // how the user left things, which is the whole bug it exists to
+            // fix, reintroduced by reading one line too late.
+            let root_closed_at_quit = root_window_stays_closed();
             let win = build_profile_window(app.handle(), &ProfileId::Root)?;
             // The menu-bar item exists from boot but stays hidden until we
             // windowless, so a normal windowed session gains nothing visible.
@@ -20105,8 +20966,25 @@ pub fn run() {
                 // whatever the user is actually working in.
                 #[cfg(all(target_os = "macos", feature = "e2e"))]
                 let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-                let _ = win.show();
-                SHOWN_ONCE.store(true, Ordering::SeqCst);
+                // ...unless the user had CLOSED the root window and left only
+                // another profile up (GH #280).
+                //
+                // The root window is built by `setup` unconditionally and
+                // `restore_open_profiles` skips it for exactly that reason, so
+                // its `open_at_quit` was written and then never read: closing
+                // main, working on in a second profile and quitting brought
+                // main back every time. The flag is honoured here, which is
+                // the only place that can honour it.
+                //
+                // Only when another profile IS coming back. If nothing else is
+                // flagged, showing main is the right answer whatever the flag
+                // says: the alternative is launching to no window at all.
+                if root_closed_at_quit {
+                    dlog("[profiles] root was closed at quit; leaving it hidden");
+                } else {
+                    let _ = win.show();
+                    SHOWN_ONCE.store(true, Ordering::SeqCst);
+                }
             }
 
             // Close (red button) sends us windowless instead of
@@ -20183,6 +21061,9 @@ pub fn run() {
             agent_usage::agent_usage_codex,
             perf_boot_elapsed_ms,
             deep_link_take_pending,
+            agent_accounts, account_add, account_remove, account_set_default, account_set_auto_switch,
+            task_set_account, task_account,
+            window_close_if_not_last,
             profiles_list, profiles_disable, profile_create, profile_close, profile_seeded_tasks_path, profile_update, profile_open, profile_delete_preview, profile_delete,
             projects_list, project_add, project_add_multi, project_set_members, project_update, project_remove, project_reorder, project_set_group,
             tasks_list, task_create, task_create_multi, task_open_repo, task_importable_worktrees, task_import_worktree, task_archive, task_set_cli, task_set_custom_command, task_set_resume_override, task_set_sandbox, task_set_docker, task_set_yolo,
@@ -20975,6 +21856,46 @@ mod tests {
     }
 
     #[test]
+    fn the_root_window_stays_closed_when_another_profile_is_coming_back() {
+        // The root window is built by `setup` unconditionally and skipped by
+        // the restore, so nothing read its `open_at_quit`: closing main,
+        // carrying on in a second profile and quitting brought main back every
+        // launch. Invisible with one profile, because then the root is the
+        // only window there is.
+        with_scratch_data_dir(|data| {
+            let mk = |slug: &str, open: bool| crate::profiles::Profile {
+                slug: slug.into(), name: slug.into(), accent: "blue".into(),
+                order: 0, last_focused_at: None, open_at_quit: open,
+            };
+
+            // Root closed, Work still up: main must NOT come back.
+            let mut reg = crate::profiles::Registry {
+                root_slug: Some("personal".into()),
+                profiles: vec![mk("personal", false), mk("work", true)],
+                ..Default::default()
+            };
+            crate::profiles::save_registry(data, &reg).unwrap();
+            assert!(crate::root_window_stays_closed());
+
+            // Root still up: it comes back, as it always did.
+            reg.profiles[0].open_at_quit = true;
+            crate::profiles::save_registry(data, &reg).unwrap();
+            assert!(!crate::root_window_stays_closed());
+
+            // NOTHING flagged. Conservative on purpose: launching to no window
+            // at all is worse than showing the one the user closed.
+            reg.profiles[0].open_at_quit = false;
+            reg.profiles[1].open_at_quit = false;
+            crate::profiles::save_registry(data, &reg).unwrap();
+            assert!(!crate::root_window_stays_closed());
+
+            // A DORMANT install has no profiles and no opinion.
+            crate::profiles::save_registry(data, &crate::profiles::Registry::default()).unwrap();
+            assert!(!crate::root_window_stays_closed());
+        });
+    }
+
+    #[test]
     fn a_dormant_install_never_grows_a_registry_from_window_bookkeeping() {
         // set_open_at_quit runs on every window build. If it created a
         // registry, the feature would switch itself on for someone who never
@@ -21308,6 +22229,92 @@ mod tests {
         }
     }
 
+    fn profiled(task: &str, project: &str, profile: Option<&str>) -> crate::TrayAttentionItem {
+        let mut it = tray_item(task, project);
+        it.profile_name = profile.map(str::to_string);
+        it
+    }
+
+    fn headings(rows: &[crate::TrayRow]) -> Vec<String> {
+        rows.iter().map(|r| match r {
+            crate::TrayRow::Separator => "---".into(),
+            crate::TrayRow::ProfileHeading(p) => format!("[{p}]"),
+            crate::TrayRow::ProjectHeading(p) => format!("<{p}>"),
+            crate::TrayRow::Task { name, .. } => name.clone(),
+            crate::TrayRow::More(n) => format!("+{n}"),
+        }).collect()
+    }
+
+    #[test]
+    fn the_tray_groups_by_profile_into_separated_sections() {
+        // Each profile is a SECTION with its own heading, rather than every
+        // project heading carrying a "Work - " prefix. With four projects
+        // across two profiles that prefix was repeated on every heading, and
+        // the eye had to re-read it to answer a question a section answers
+        // once.
+        let rows = crate::plan_tray_rows(&[
+            profiled("acc1", "rotating-proxy", Some("Personal")),
+            profiled("acc2", "seat-be", Some("Work")),
+            profiled("claude-1", "seat-ui", Some("Work")),
+        ], 20);
+        assert_eq!(headings(&rows), vec![
+            "[Personal]", "<rotating-proxy>", "acc1",
+            "---",
+            "[Work]", "<seat-be>", "acc2", "<seat-ui>", "claude-1",
+        ]);
+    }
+
+    #[test]
+    fn the_tray_never_opens_with_a_separator() {
+        // A rule at the very top of a menu reads as a rendering fault.
+        let rows = crate::plan_tray_rows(&[profiled("t", "p", Some("Personal"))], 20);
+        assert_eq!(rows.first(), Some(&crate::TrayRow::ProfileHeading("Personal".into())));
+    }
+
+    #[test]
+    fn a_single_profile_install_gets_no_profile_headings_at_all() {
+        // `merge_tray_rows` leaves `profile_name` None below two profiles, and
+        // the menu must then look exactly as it did before profiles existed:
+        // project heading, tasks, nothing else.
+        let rows = crate::plan_tray_rows(&[
+            tray_item("t1", "alpha"),
+            tray_item("t2", "alpha"),
+            tray_item("t3", "beta"),
+        ], 20);
+        assert_eq!(headings(&rows), vec!["<alpha>", "t1", "t2", "<beta>", "t3"]);
+    }
+
+    #[test]
+    fn a_project_in_two_profiles_gets_a_heading_in_each() {
+        // Same project name, two sections. Carrying the last heading across a
+        // section boundary would leave the second section's first task with
+        // no project line at all.
+        let rows = crate::plan_tray_rows(&[
+            profiled("t1", "termic", Some("Personal")),
+            profiled("t2", "termic", Some("Work")),
+        ], 20);
+        assert_eq!(headings(&rows), vec![
+            "[Personal]", "<termic>", "t1", "---", "[Work]", "<termic>", "t2",
+        ]);
+    }
+
+    #[test]
+    fn the_cap_counts_tasks_and_the_remainder_is_reported() {
+        // Headings must not eat the budget: the cap is about how many TASKS
+        // fit in a menu bar, and "+1 more" has to name what was left out.
+        let rows = crate::plan_tray_rows(&[
+            profiled("t1", "a", Some("P")),
+            profiled("t2", "b", Some("P")),
+            profiled("t3", "c", Some("P")),
+        ], 2);
+        assert_eq!(headings(&rows), vec!["[P]", "<a>", "t1", "<b>", "t2", "+1"]);
+    }
+
+    #[test]
+    fn no_rows_means_no_menu_section_at_all() {
+        assert!(crate::plan_tray_rows(&[], 20).is_empty());
+    }
+
     #[test]
     fn the_tray_merges_every_window_rather_than_taking_the_last_writer() {
         // The bug this replaced: each window pushes its OWN profile's set, so
@@ -21398,6 +22405,517 @@ mod tests {
             // Script topics append `:<member>:<kind>` after the id.
             assert_eq!(crate::emit_target("script-done://t2::setup").as_deref(), Some("profile-home"));
         });
+    }
+
+    // ───────── the account switcher (GH #278) ─────────
+
+    use crate::LoginRealm;
+
+    fn agent_with(id: &str, accounts: &[&str], default: Option<&str>) -> crate::Agent {
+        let mut a = crate::default_agents().into_iter().find(|a| a.id == "claude").unwrap();
+        a.id = id.into();
+        a.accounts = accounts.iter().map(|s| s.to_string()).collect();
+        a.default_account = default.map(|s| s.to_string());
+        a
+    }
+
+    #[test]
+    fn the_view_reports_auto_switch_off_for_an_agent_that_cannot_act_on_it() {
+        // A stored flag can outlive the reason it was set: the agent's feed is
+        // dropped, or a clone is re-pointed at a base that has none. Reporting
+        // the raw flag would then leave a checked box on screen for something
+        // that can never fire, which is worse than an unchecked one because
+        // the user believes they are covered until the moment they are not.
+        with_scratch_data_dir(|_| {
+            let mut grok = agent_with("grok", &["Work", "Personal"], Some("Work"));
+            grok.auto_switch_account = true; // set while it still meant something
+            let agents = vec![grok];
+            let v = crate::accounts_view_for("grok", &agents, LoginRealm::Host);
+            assert!(!v.reports_usage, "grok has no usage feed");
+            assert!(!v.auto_switch, "a flag that cannot fire must not read as on");
+
+            let mut claude = agent_with("claude", &["Work", "Personal"], Some("Work"));
+            claude.auto_switch_account = true;
+            let v = crate::accounts_view_for("claude", &vec![claude], LoginRealm::Host);
+            assert!(v.reports_usage && v.auto_switch);
+        });
+    }
+
+    #[test]
+    fn a_clone_inherits_its_bases_usage_feed() {
+        // The same base resolution the login table uses. A second claude entry
+        // reports usage for exactly the reason the first one does, so the
+        // automatic switch is offered on both or neither.
+        with_scratch_data_dir(|_| {
+            let mut clone = agent_with("next-claude", &["Work", "Personal"], Some("Work"));
+            clone.extends = Some("claude".into());
+            clone.builtin = false;
+            let agents = vec![agent_with("claude", &[], None), clone];
+            let v = crate::accounts_view_for("next-claude", &agents, LoginRealm::Host);
+            assert!(v.reports_usage, "a claude clone reports usage like claude");
+        });
+    }
+
+    #[test]
+    fn the_same_repo_can_be_added_to_two_different_profiles() {
+        // GH #280. Profiles are separate Termics, so the same checkout is
+        // EXPECTED in several of them: work and personal both want
+        // `~/src/app`. The duplicate check scanned every profile's projects,
+        // so the second window was told "project already added" about a
+        // project it could not see anywhere in it.
+        //
+        // Not academic: `deep_link_project_label` already resolves a name that
+        // hits several profiles by most-recently-focused, so the resolver was
+        // built for a state that `project_add` refused to create.
+        let mk = |profile: ProfileId, path: &str| {
+            let mut p = Project::default();
+            p.profile = profile;
+            p.id = Uuid::new_v4().to_string();
+            p.root_path = path.into();
+            p
+        };
+        let list = vec![mk(ProfileId::Root, "/Users/u/src/app")];
+
+        // The same path, in the profile that already has it: still a duplicate.
+        // Two entries for one path in one sidebar are indistinguishable, and
+        // every path-to-project lookup would have to pick one arbitrarily.
+        assert!(project_path_taken(&list, &ProfileId::Root, "/Users/u/src/app"));
+        // ...and in a DIFFERENT profile: allowed, which is the fix.
+        assert!(!project_path_taken(
+            &list, &ProfileId::Slug("work".into()), "/Users/u/src/app"));
+        // A path nobody has is free everywhere.
+        assert!(!project_path_taken(&list, &ProfileId::Root, "/Users/u/src/other"));
+
+        // And with the SAME path in two profiles, each still blocks its own.
+        let both = vec![
+            mk(ProfileId::Root, "/Users/u/src/app"),
+            mk(ProfileId::Slug("work".into()), "/Users/u/src/app"),
+        ];
+        assert!(project_path_taken(&both, &ProfileId::Root, "/Users/u/src/app"));
+        assert!(project_path_taken(&both, &ProfileId::Slug("work".into()), "/Users/u/src/app"));
+        assert!(!project_path_taken(&both, &ProfileId::Slug("personal".into()), "/Users/u/src/app"));
+    }
+
+    #[test]
+    fn the_whole_chain_holds_from_saved_settings_to_the_docker_mounts() {
+        // Every account bug that reached the maintainer was in a SEAM, and
+        // each link of this chain was individually tested while the chain
+        // itself was not. This walks it once, through the real functions, in
+        // the real order:
+        //
+        //   settings on disk -> account_for_spawn -> relocating_account
+        //     -> login_store_dir -> docker::build_spec's mounts
+        //
+        // A break anywhere along it fails here, which is the property the
+        // per-link tests do not have.
+        with_scratch_data_dir(|_| {
+            let mut agent = agent_with("claude", &["Personal", "Work"], Some("Personal"));
+            agent.adopted_account = Some("Personal".into());
+            let profile = ProfileId::Root;
+            let mut settings = load_settings_in(&profile);
+            settings.agents = vec![agent];
+            save_settings_in(&profile, &settings).unwrap();
+
+            // Re-READ, so this proves what a spawn would actually see rather
+            // than what the test happens to be holding.
+            let agents = load_settings_in(&profile).agents;
+
+            let mut task = crate::Task::default();
+            task.cli = "claude".into();
+            task.path = "/tmp".into();
+
+            // 1. The default is the ADOPTED account: nothing relocates, so the
+            //    container keeps the login it already had. Getting this wrong
+            //    orphaned a real Docker login.
+            assert_eq!(relocating_account(Some(&task), "claude", &agents), None);
+
+            // 2. Switched to a real second account: it relocates, and the
+            //    mount follows the SAME name the env overlay would use.
+            task.accounts.insert("claude".into(), "Work".into());
+            let account = relocating_account(Some(&task), "claude", &agents)
+                .expect("a named account relocates");
+            assert_eq!(account, "Work");
+
+            let env = account_login_env(Some(&task), "claude", &agents, LoginRealm::Host);
+            let store = login_store_dir("claude", Some(&account), LoginRealm::Host).unwrap();
+            assert!(
+                env.iter().any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v == &store.to_string_lossy()),
+                "the host env and the store must agree: {env:?} vs {store:?}",
+            );
+
+            // 3. ...and Docker mounts THAT account's directory, not the
+            //    agent's plain one.
+            let spec = docker::build_spec(
+                &task, "claude", "img", &task.path, vec![], &Default::default(),
+                &[], false, &[], &[], "aaaaaaaa-1111-2222-3333-444444444444", "claude", &[],
+                Some(&account),
+            );
+            assert!(
+                spec.mounts.iter().any(|m| m.host.ends_with("/claude/work") && m.container == "/root/.claude"),
+                "the container must get the ACCOUNT's config dir: {:?}", spec.mounts,
+            );
+        });
+    }
+
+    #[test]
+    fn the_adopted_account_relocates_nothing_in_either_realm() {
+        // It NAMES the login the agent already had, so no realm may move it.
+        //
+        // The host obeyed this while building its env overlay; Docker did not,
+        // and appended the account's slug to the mount unconditionally. Naming
+        // your first account therefore pointed the container at a brand new
+        // directory and orphaned the login you were already using, which shows
+        // up as claude running its first-run wizard in a task that was signed
+        // in a minute earlier. One rule now, asked by every realm.
+        with_scratch_data_dir(|_| {
+            let mut a = agent_with("claude", &["Personal", "Work"], Some("Personal"));
+            a.adopted_account = Some("Personal".into());
+            let agents = vec![a];
+
+            let mut t = crate::Task::default();
+            t.cli = "claude".into();
+
+            // Default is the adopted one: nothing relocates, in any realm.
+            assert_eq!(crate::relocating_account(Some(&t), "claude", &agents), None);
+            assert!(crate::account_login_env(Some(&t), "claude", &agents, LoginRealm::Host).is_empty());
+
+            // Switch to a real second account: now it relocates.
+            t.accounts.insert("claude".into(), "Work".into());
+            assert_eq!(crate::relocating_account(Some(&t), "claude", &agents).as_deref(), Some("Work"));
+            assert!(!crate::account_login_env(Some(&t), "claude", &agents, LoginRealm::Host).is_empty());
+        });
+    }
+
+    #[test]
+    fn an_account_store_shares_everything_but_the_credential() {
+        // The store used to be a bare directory, which made a second account a
+        // BLANK agent: no CLAUDE.md, no permissions, no transcripts (so
+        // `--resume` could not find the conversation), and no status line, so
+        // that account reported no usage at all. Measured on a real
+        // `~/.claude`, which holds all of it.
+        let tmp = std::env::temp_dir().join(format!("termic-farm-{}", Uuid::new_v4()));
+        let primary = tmp.join("primary");
+        let store = tmp.join("store");
+        fs::create_dir_all(primary.join("projects")).unwrap();
+        fs::write(primary.join("settings.json"), b"{}").unwrap();
+        fs::write(primary.join("CLAUDE.md"), b"# hi").unwrap();
+        fs::write(primary.join(".credentials.json"), b"SECRET").unwrap();
+
+        let entries = crate::agent_dirs::shared_config_entries("claude");
+        let made = crate::build_account_farm(&primary, &store, entries).unwrap();
+        assert!(made >= 3, "expected settings/CLAUDE.md/projects to be linked, made {made}");
+
+        // Shared: the link resolves to the primary copy, so there is ONE file
+        // and an edit on either account is the same edit.
+        assert_eq!(fs::read_to_string(store.join("CLAUDE.md")).unwrap(), "# hi");
+        assert!(store.join("projects").symlink_metadata().unwrap().file_type().is_symlink());
+
+        // NOT shared, and this is the entire point of the feature.
+        assert!(
+            store.join(".credentials.json").symlink_metadata().is_err(),
+            "the credential must never be shared: two accounts would be one account",
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wiring_a_store_never_replaces_what_is_already_there() {
+        // A repair pass runs on every spawn. It must not touch a store the
+        // user has already signed into or edited, so an entry that exists is
+        // left exactly as found, link or real file.
+        let tmp = std::env::temp_dir().join(format!("termic-farm-{}", Uuid::new_v4()));
+        let primary = tmp.join("primary");
+        let store = tmp.join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::create_dir_all(&primary).unwrap();
+        fs::write(primary.join("settings.json"), b"{\"from\":\"primary\"}").unwrap();
+        fs::write(store.join("settings.json"), b"{\"from\":\"account\"}").unwrap();
+
+        crate::build_account_farm(&primary, &store, &["settings.json"]).unwrap();
+        assert_eq!(
+            fs::read_to_string(store.join("settings.json")).unwrap(),
+            "{\"from\":\"account\"}",
+            "an entry the account already owns is never replaced",
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wiring_a_store_never_makes_a_dangling_link() {
+        // Linking a path the primary does not have yet would leave a link to
+        // nowhere, which the agent then writes THROUGH to nowhere.
+        let tmp = std::env::temp_dir().join(format!("termic-farm-{}", Uuid::new_v4()));
+        let primary = tmp.join("primary");
+        let store = tmp.join("store");
+        fs::create_dir_all(&primary).unwrap();
+        let made = crate::build_account_farm(&primary, &store, &["settings.json", "projects"]).unwrap();
+        assert_eq!(made, 0, "nothing exists to share yet");
+        assert!(store.join("settings.json").symlink_metadata().is_err());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wiring_a_store_twice_is_a_no_op() {
+        let tmp = std::env::temp_dir().join(format!("termic-farm-{}", Uuid::new_v4()));
+        let primary = tmp.join("primary");
+        let store = tmp.join("store");
+        fs::create_dir_all(&primary).unwrap();
+        fs::write(primary.join("CLAUDE.md"), b"x").unwrap();
+        assert_eq!(crate::build_account_farm(&primary, &store, &["CLAUDE.md"]).unwrap(), 1);
+        assert_eq!(crate::build_account_farm(&primary, &store, &["CLAUDE.md"]).unwrap(), 0);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_shared_list_never_names_a_credential() {
+        // The list is what is SHARED, so an entry added here by mistake is two
+        // accounts quietly becoming one. Named files, checked by name.
+        for (agent, forbidden) in [
+            ("claude", vec![".credentials.json", ".claude.json"]),
+            ("codex", vec!["auth.json"]),
+        ] {
+            let shared = crate::agent_dirs::shared_config_entries(agent);
+            for f in forbidden {
+                assert!(!shared.contains(&f), "{agent} must never share {f}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_account_means_the_paths_are_exactly_what_they_always_were() {
+        // The migration-free rule, and the reason shipping this does not
+        // orphan anyone's existing Docker login: only a NAMED account adds a
+        // segment. An install that never uses the feature is untouched.
+        with_scratch_data_dir(|_| {
+            assert_eq!(crate::login_store_dir("claude", None, LoginRealm::Host), None);
+            assert_eq!(crate::login_store_dir("claude", None, LoginRealm::Docker), None);
+            assert!(crate::account_login_env(None, "claude", &[], LoginRealm::Host).is_empty());
+        });
+    }
+
+    #[test]
+    fn the_two_realms_are_different_stores_for_the_same_account() {
+        // A container never reads the host's config dir, so one sign-in does
+        // not cover both. Presenting them as one login that mysteriously does
+        // not work in Docker would be the dishonest version.
+        with_scratch_data_dir(|data| {
+            let host = crate::login_store_dir("claude", Some("Work"), LoginRealm::Host).unwrap();
+            let docker = crate::login_store_dir("claude", Some("Work"), LoginRealm::Docker).unwrap();
+            assert_ne!(host, docker);
+            assert!(host.starts_with(data.join("logins/claude")), "{}", host.display());
+            assert!(docker.starts_with(data.join("docker-agents/claude")), "{}", docker.display());
+        });
+    }
+
+    #[test]
+    fn the_store_is_keyed_by_name_so_two_profiles_share_one_login() {
+        // The whole sharing rule. Nothing selects or copies a credential: two
+        // profiles using "Work" simply address the same directory, so the
+        // second is already signed in.
+        with_scratch_data_dir(|_| {
+            let a = crate::login_store_dir("claude", Some("Work"), LoginRealm::Host).unwrap();
+            let b = crate::login_store_dir("claude", Some("Work"), LoginRealm::Host).unwrap();
+            assert_eq!(a, b);
+            // ...and a different name is a different login.
+            let c = crate::login_store_dir("claude", Some("Personal"), LoginRealm::Host).unwrap();
+            assert_ne!(a, c);
+            // Slugified, because the name becomes a path segment.
+            assert!(a.ends_with("work"), "{}", a.display());
+        });
+    }
+
+    #[test]
+    fn a_task_override_outranks_the_agent_default() {
+        // The switch: a running task points at another account without
+        // changing what every other task uses.
+        let agents = vec![agent_with("claude", &["Work", "Personal"], Some("Work"))];
+        let mut t = a_task("t1", ProfileId::Root);
+        assert_eq!(crate::account_for_spawn(Some(&t), "claude", &agents).as_deref(), Some("Work"));
+        t.accounts.insert("claude".into(), "Personal".into());
+        assert_eq!(crate::account_for_spawn(Some(&t), "claude", &agents).as_deref(), Some("Personal"));
+        // Other agents in the same task are unaffected.
+        assert_eq!(crate::account_for_spawn(Some(&t), "codex", &agents), None);
+    }
+
+    #[test]
+    fn an_agent_with_no_measured_boundary_gets_no_override_at_all() {
+        // A half-applied override is worse than none: it would run the agent
+        // on its ordinary login while the UI claimed an account. Empty env is
+        // the caller's signal that this agent cannot hold a second account.
+        with_scratch_data_dir(|_| {
+            let agents = vec![agent_with("mystery-cli", &["Work"], Some("Work"))];
+            let env = crate::account_login_env(None, "mystery-cli", &agents, LoginRealm::Host);
+            assert!(env.is_empty(), "an unmeasured agent must not be given a partial override");
+        });
+    }
+
+    #[test]
+    fn the_chosen_account_reaches_the_agent_as_its_own_variable() {
+        with_scratch_data_dir(|_| {
+            let agents = vec![agent_with("claude", &["Work"], Some("Work"))];
+            let env = crate::account_login_env(None, "claude", &agents, LoginRealm::Host);
+            assert_eq!(env.len(), 1);
+            assert_eq!(env[0].0, "CLAUDE_CONFIG_DIR");
+            assert!(env[0].1.ends_with("logins/claude/work"), "{}", env[0].1);
+            // And the directory is created, so the agent's first write cannot
+            // fail on a missing parent.
+            assert!(Path::new(&env[0].1).is_dir());
+        });
+    }
+
+    #[test]
+    fn a_gemini_account_is_given_the_parent_not_the_config_dir() {
+        // The shape trap, end to end: pointing GEMINI_CLI_HOME at the config
+        // dir would nest the login one level too deep, silently.
+        with_scratch_data_dir(|_| {
+            let agents = vec![agent_with("agy", &["Work"], Some("Work"))];
+            let env = crate::account_login_env(None, "agy", &agents, LoginRealm::Host);
+            let home = env.iter().find(|(k, _)| k == "GEMINI_CLI_HOME").expect("no GEMINI_CLI_HOME");
+            assert!(home.1.ends_with("logins/agy/work"), "{}", home.1);
+            // ...and the SHAPE says the agent writes one level down, which is
+            // the whole reason the variable gets the parent.
+            assert!(matches!(
+                crate::agent_dirs::login_store("agy"),
+                Some(crate::agent_dirs::LoginStore::ParentDir { child: ".gemini", .. }),
+            ));
+            // The COMPANION rides along, and without it the variable moves
+            // settings.json while the OAuth token stays in a fixed keyring
+            // slot, i.e. two "accounts" quietly sharing one login.
+            assert_eq!(
+                env.iter().find(|(k, _)| k == "GEMINI_FORCE_FILE_STORAGE").map(|(_, v)| v.as_str()),
+                Some("true"),
+            );
+        });
+    }
+
+    #[test]
+    fn a_clone_uses_its_base_agents_variable_but_its_own_store() {
+        // A clone of claude runs the claude binary, so it takes claude's
+        // relocation variable; its login is still its own directory.
+        with_scratch_data_dir(|_| {
+            let mut clone = agent_with("next-claude", &["Work"], Some("Work"));
+            clone.extends = Some("claude".into());
+            let agents = vec![agent_with("claude", &[], None), clone];
+            let env = crate::account_login_env(None, "next-claude", &agents, LoginRealm::Host);
+            assert_eq!(env[0].0, "CLAUDE_CONFIG_DIR", "a clone must use its base's variable");
+            assert!(env[0].1.contains("logins/next-claude/work"), "{}", env[0].1);
+        });
+    }
+
+    #[test]
+    fn an_account_is_signed_in_only_once_the_agent_has_written_something() {
+        // "Named but never signed in" is legitimate: it is what a second
+        // machine looks like, and what Docker looks like before its first
+        // login there. The UI has to offer the sign-in rather than fail.
+        with_scratch_data_dir(|_| {
+            assert!(!crate::account_signed_in("claude", "Work", LoginRealm::Host, &[]));
+            let dir = crate::login_store_dir("claude", Some("Work"), LoginRealm::Host).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(!crate::account_signed_in("claude", "Work", LoginRealm::Host, &[]),
+                "an empty directory is not a login");
+            std::fs::write(dir.join(".credentials.json"), "x").unwrap();
+            assert!(crate::account_signed_in("claude", "Work", LoginRealm::Host, &[]));
+        });
+    }
+
+    #[test]
+    fn the_first_account_names_the_login_you_already_have_and_relocates_nothing() {
+        // The screenshot caught this: naming your first credential set used to
+        // create an EMPTY store, so the UI told someone whose agent works fine
+        // that they were "not signed in", and switching to that account would
+        // have handed them a logged-out agent. The first account is the login
+        // that already exists, exactly as the first profile is the install
+        // that already exists.
+        with_scratch_data_dir(|_| {
+            let mut a = agent_with("claude", &["Personal"], Some("Personal"));
+            a.adopted_account = Some("Personal".into());
+            let agents = vec![a];
+            assert!(
+                crate::account_login_env(None, "claude", &agents, LoginRealm::Host).is_empty(),
+                "the adopted account must relocate nothing",
+            );
+        });
+    }
+
+    #[test]
+    fn a_second_account_does_get_its_own_store() {
+        with_scratch_data_dir(|_| {
+            let mut a = agent_with("claude", &["Personal", "Work"], Some("Work"));
+            a.adopted_account = Some("Personal".into());
+            let agents = vec![a];
+            let env = crate::account_login_env(None, "claude", &agents, LoginRealm::Host);
+            assert_eq!(env.len(), 1);
+            assert!(env[0].1.ends_with("logins/claude/work"), "{}", env[0].1);
+        });
+    }
+
+    #[test]
+    fn removing_the_adopted_name_never_promotes_another_account_into_it() {
+        // Those have their own stores. Calling one of them "the login you
+        // already had" would be a lie, and would silently stop relocating it.
+        with_scratch_data_dir(|_| {
+            let mut a = agent_with("claude", &["Personal", "Work"], Some("Work"));
+            a.adopted_account = Some("Personal".into());
+            // Simulate the removal `account_remove` performs.
+            a.accounts.retain(|n| n != "Personal");
+            if a.adopted_account.as_deref() == Some("Personal") { a.adopted_account = None; }
+            let agents = vec![a];
+            assert_eq!(agents[0].adopted_account, None);
+            // Work still relocates, as it always did.
+            let env = crate::account_login_env(None, "claude", &agents, LoginRealm::Host);
+            assert!(env[0].1.ends_with("logins/claude/work"), "{}", env[0].1);
+        });
+    }
+
+    #[test]
+    fn only_the_xdg_shapes_need_the_socket_pinned_and_they_are_known() {
+        // The Linux trap, pinned as the RULE that decides it. On Linux
+        // `dirs::data_local_dir()` IS `$XDG_DATA_HOME`, and termic's own CLI
+        // resolves the app's socket through that call, so relocating an XDG
+        // root for an agent would send its bundled `termic` looking for the
+        // socket inside the account's login store. macOS never sees it: its
+        // data dir is ~/Library/Application Support and ignores XDG.
+        with_scratch_data_dir(|_| {
+            let needs_pin = |agent: &str| {
+                let agents = vec![agent_with(agent, &["Work"], Some("Work"))];
+                crate::account_login_env(None, agent, &agents, LoginRealm::Host)
+                    .iter()
+                    .any(|(k, _)| k.starts_with("XDG_"))
+            };
+            assert!(needs_pin("opencode"), "opencode relocates XDG_DATA_HOME");
+            // Everything else sets an agent-specific variable that nothing
+            // else reads, so no pin is needed and adding one would be noise.
+            // muse and copilot have no store at all (see login_unsupported_reason).
+            for a in ["claude", "codex", "agy", "grok", "pi", "muse", "copilot"] {
+                assert!(!needs_pin(a), "{a} does not touch an XDG root");
+            }
+        });
+    }
+
+    #[test]
+    fn an_aux_shell_never_inherits_the_agents_account_environment() {
+        // A plain terminal opened inside a task carries no `agent_id`, and
+        // falling back to the task's `cli` would give that SHELL the agent's
+        // login overlay. On macOS that mostly looks harmless; on Linux two of
+        // the shapes relocate XDG_DATA_HOME / XDG_CONFIG_HOME, which every
+        // XDG-aware tool in an interactive shell reads, so the user's own
+        // commands would write into an account's login store.
+        //
+        // Pinned as the RULE rather than the call site: what must hold is
+        // that only an agent spawn is given login environment.
+        let role_agent = crate::PtyRole {
+            task_id: "t1".into(), kind: "agent".into(), is_default: true, tab_id: None,
+        };
+        let role_aux = crate::PtyRole {
+            task_id: "t1".into(), kind: "aux".into(), is_default: false, tab_id: None,
+        };
+        let is_agent = |role: &crate::PtyRole, agent_id: Option<&str>| {
+            role.kind == "agent" || agent_id.is_some()
+        };
+        assert!(is_agent(&role_agent, None), "an agent tab must get its account");
+        assert!(!is_agent(&role_aux, None), "an aux shell must NOT get an account overlay");
+        // An explicit agent id still wins: that is a spawn that named an agent.
+        assert!(is_agent(&role_aux, Some("claude")));
     }
 
     #[test]

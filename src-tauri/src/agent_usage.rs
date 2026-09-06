@@ -160,8 +160,8 @@ fn app_server_command(bin: &str, home: &Path) -> Command {
 /// hazard: the app-server is a long-lived JSON-RPC peer, termic wants one
 /// answer, and a child that never answers would otherwise hang a caller with
 /// the pipe still open.
-pub fn fetch_codex(agent_id: &str, docker: bool) -> Result<AgentUsage, String> {
-    let home = codex_home(agent_id, docker)?;
+pub fn fetch_codex(agent_id: &str, docker: bool, account: Option<&str>) -> Result<AgentUsage, String> {
+    let home = codex_home(agent_id, docker, account)?;
     let bin = codex_binary(agent_id);
 
     let mut child = app_server_command(&bin, &home)
@@ -226,7 +226,25 @@ pub fn fetch_codex(agent_id: &str, docker: bool) -> Result<AgentUsage, String> {
 /// clone points codex at a second account, and `instance_config_dir` already
 /// resolves that from the agent ENTRY, so a clone is asked about its own login
 /// rather than the base's.
-fn codex_home(agent_id: &str, docker: bool) -> Result<PathBuf, String> {
+fn codex_home(agent_id: &str, docker: bool, account: Option<&str>) -> Result<PathBuf, String> {
+    // A NAMED account has its own CODEX_HOME, and asking the primary dir
+    // instead reports the primary account's quota under every account's name:
+    // two different logins showed the same percentage, which is the exact
+    // misattribution the account-keyed usage store exists to prevent.
+    //
+    // The ADOPTED account is excluded because it NAMES the login the agent
+    // already had and relocates nothing, so its home IS the primary dir.
+    if let Some(a) = account {
+        let agents = crate::load_settings_inner().agents;
+        let adopted = agents.iter().find(|x| x.id == agent_id)
+            .and_then(|x| x.adopted_account.as_deref());
+        if adopted != Some(a) {
+            let realm = if docker { crate::LoginRealm::Docker } else { crate::LoginRealm::Host };
+            if let Some(dir) = crate::login_store_dir(agent_id, Some(a), realm) {
+                return Ok(dir);
+            }
+        }
+    }
     // A DOCKER task's codex logs in inside the container, whose CODEX_HOME is
     // the termic-owned directory bind-mounted at that path. Asking the host's
     // `~/.codex` instead would report a DIFFERENT ACCOUNT's quota under the
@@ -258,8 +276,12 @@ fn codex_binary(agent_id: &str) -> String {
 /// 10s for it: a synchronous Tauri command doing that blocks the WKWebView
 /// event loop and freezes the whole window (see CLAUDE.md).
 #[tauri::command]
-pub async fn agent_usage_codex(agent_id: String, docker: bool) -> Result<AgentUsage, String> {
-    tauri::async_runtime::spawn_blocking(move || fetch_codex(&agent_id, docker))
+pub async fn agent_usage_codex(
+    agent_id: String,
+    docker: bool,
+    account: Option<String>,
+) -> Result<AgentUsage, String> {
+    tauri::async_runtime::spawn_blocking(move || fetch_codex(&agent_id, docker, account.as_deref()))
         .await
         .map_err(|e| format!("usage task failed: {e}"))?
 }
@@ -300,7 +322,7 @@ mod tests {
     #[test]
     #[ignore = "needs a real, logged-in codex binary on PATH"]
     fn codex_rate_limits_live() {
-        let usage = fetch_codex("codex", false).expect("codex should answer account/rateLimits/read");
+        let usage = fetch_codex("codex", false, None).expect("codex should answer account/rateLimits/read");
         println!("{}", serde_json::to_string_pretty(&usage).unwrap());
         assert!(
             usage.session.is_some() || usage.weekly.is_some(),
@@ -343,14 +365,33 @@ mod tests {
     /// different account's quota under this task's name, which is worse than
     /// reporting none: it looks authoritative and belongs to someone else.
     #[test]
+    fn each_account_is_asked_at_its_own_codex_home() {
+        // Two accounts reported the SAME percentage because `codex_home`
+        // ignored the account and always pointed at the primary dir: it was
+        // one login answering twice, under two names. That is the exact
+        // misattribution the account-keyed usage store exists to prevent, and
+        // it is invisible unless the two accounts happen to differ.
+        crate::test_support::with_scratch_data_dir(|_| {
+            let work = codex_home("codex", false, Some("Work")).expect("a named account resolves");
+            let other = codex_home("codex", false, Some("Personal")).expect("...and so does another");
+            assert_ne!(work, other, "two accounts must not share one CODEX_HOME");
+            assert!(work.to_string_lossy().contains("/logins/"), "{work:?}");
+
+            // No account named: the agent's ordinary login, unchanged.
+            let plain = codex_home("codex", false, None).expect("the plain path still resolves");
+            assert_ne!(plain, work);
+        });
+    }
+
+    #[test]
     fn a_docker_task_is_asked_about_the_mounted_config_dir() {
-        let docker = codex_home("codex", true).expect("docker dir always resolves");
+        let docker = codex_home("codex", true, None).expect("docker dir always resolves");
         assert!(
             docker.ends_with("docker-agents/codex"),
             "expected the termic-owned mounted dir, got {}",
             docker.display()
         );
-        if let Ok(host) = codex_home("codex", false) {
+        if let Ok(host) = codex_home("codex", false, None) {
             assert_ne!(host, docker);
         }
     }

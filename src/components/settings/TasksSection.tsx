@@ -59,6 +59,8 @@ export function TasksSection() {
   const confirmBeforeCloseAgentTab = usePrefs(s => s.confirmBeforeCloseAgentTab);
   const setConfirmBeforeCloseAgentTab = usePrefs(s => s.setConfirmBeforeCloseAgentTab);
   const confirmBeforeArchiveTask = usePrefs(s => s.confirmBeforeArchiveTask);
+  const confirmBeforeAccountRestart = usePrefs(s => s.confirmBeforeAccountRestart);
+  const setConfirmBeforeAccountRestart = usePrefs(s => s.setConfirmBeforeAccountRestart);
   const setConfirmBeforeArchiveTask = usePrefs(s => s.setConfirmBeforeArchiveTask);
   const archiveDeleteBranch = usePrefs(s => s.archiveDeleteBranch);
   const setArchiveDeleteBranch = usePrefs(s => s.setArchiveDeleteBranch);
@@ -362,6 +364,18 @@ export function TasksSection() {
           while confirmation was on meant a user who deletes branches every
           time had to re-tick the box on every single archive, with no way to
           change the default. */}
+      {/* Same shape as the archive toggle above, and here for the same
+          reason: its dialog can turn itself off, and a dialog you dismissed
+          once is otherwise unreachable. */}
+      <Block>
+        <Toggle
+          label="Confirm before restarting an agent to switch account"
+          hint={"Switching a task to another credential set needs the agent to restart, which resumes the conversation. With this off the restart happens straight away."}
+          value={confirmBeforeAccountRestart}
+          onChange={setConfirmBeforeAccountRestart}
+        />
+      </Block>
+
       <Block>
         <Toggle
           label="Delete the branch when archiving"

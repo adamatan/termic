@@ -20,6 +20,7 @@ import { Input } from "@/components/ui/Input";
 import { AppDialog } from "@/components/ui/Dialog";
 import { Tip } from "@/components/ui/Tooltip";
 import { Trash2, Plus, Check, AlertTriangle, RotateCcw, Copy } from "lucide-react";
+import { AgentAccountsRow, AgentAccountsAction } from "@/components/settings/AgentAccountsRow";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
 import { SignalInspector } from "./SignalInspector";
 import { cn, slugify } from "@/lib/utils";
@@ -43,6 +44,28 @@ export function AgentsSection() {
   // id of an agent that just got created — its card uses this to scroll into
   // view and focus its name input on mount. Cleared after one use.
   const [autoFocusId, setAutoFocusId] = useState<string | null>(null);
+  // Deep link: `openSettings("agents", undefined, "<agent id>")` selects that
+  // agent's card. The footer's usage popover uses it, because "add a second
+  // account" landing on Settings with SOME OTHER agent selected sends the user
+  // hunting for the one they were just looking at.
+  const settingsHighlight = useApp(s => s.view.settingsHighlight);
+  const clearSettingsHighlight = useApp(s => s.clearSettingsHighlight);
+  useEffect(() => {
+    if (!settingsHighlight) return;
+    const [agentId, intent] = settingsHighlight.split(":");
+    if (!agents.some(a => a.id === agentId)) return; // wait for the list
+    if (intent) {
+      // `"<id>:accounts"` only SELECTS here. `autoFocusId` is the
+      // freshly-created-agent signal and focuses the name input, which is how
+      // this deep link ended up highlighting the agent's name instead of the
+      // thing the user asked for. The card consumes the intent itself and
+      // opens the add form.
+      setActiveId(agentId);
+    } else {
+      setAutoFocusId(agentId);
+      clearSettingsHighlight();
+    }
+  }, [settingsHighlight, clearSettingsHighlight, agents]);
   // Pending-delete confirmation. null = closed.
   const [pendingDelete, setPendingDelete] = useState<Agent | null>(null);
   // Projects that name the pending-delete agent as their default CLI. They
@@ -68,42 +91,70 @@ export function AgentsSection() {
     useApp.getState().refreshClis();
   }, []);
 
+  /** The fields a reset must CARRY OVER, and that must not count as a
+   *  modification.
+   *
+   *  None of them describe how the agent runs, which is what "defaults" and
+   *  "modified" are about:
+   *
+   *  - `env` is a personal setup detail (`CLAUDE_CODE_NO_FLICKER=1`).
+   *  - the ACCOUNT fields are user DATA (GH #278). They name real login
+   *    stores on disk, so wiping them on a reset orphans directories the user
+   *    signed into and silently drops the agent back to one login. Naming a
+   *    credential set is also not a change to the agent's command shape, so
+   *    it must not light up the "modified" badge or arm a Reset button that
+   *    would then destroy it.
+   */
+  function carriedOver(a: Agent): Partial<Agent> {
+    return {
+      env: a.env ?? {},
+      accounts: a.accounts,
+      default_account: a.default_account,
+      adopted_account: a.adopted_account,
+      auto_switch_account: a.auto_switch_account,
+    };
+  }
+
   /** True if any field on the agent differs from its ship-time default.
    *  Used to gate the "Reset to defaults" button per agent so it's only
-   *  shown when there's actually something to reset. Env is excluded
-   *  from the comparison: user-set env is a personal augmentation, not
-   *  a "modification" of the agent's command shape, and we never
-   *  clobber it on reset. */
+   *  shown when there's actually something to reset. `carriedOver` fields are
+   *  excluded from the comparison, for the reasons documented there. */
   function isModified(a: Agent): boolean {
     const d = defaults.find(d => d.id === a.id);
     if (!d) return false; // custom agents have no "defaults" to revert to
-    const stripEnv = (x: Agent) => { const { env: _e, disabled: _d, ...rest } = x; void _e; void _d; return rest; };
-    return JSON.stringify(stripEnv(d)) !== JSON.stringify(stripEnv(a));
+    const strip = (x: Agent) => {
+      const {
+        env: _e, disabled: _d,
+        accounts: _acc, default_account: _da, adopted_account: _aa,
+        auto_switch_account: _as, ...rest
+      } = x;
+      void _e; void _d; void _acc; void _da; void _aa; void _as;
+      return rest;
+    };
+    return JSON.stringify(strip(d)) !== JSON.stringify(strip(a));
   }
 
   /** Reset one agent to its ship-time defaults (preserves display_name +
-   *  ordering AND the user's per-agent env block — env is a personal
-   *  setup detail, not part of the agent's command shape, so a reset
-   *  shouldn't wipe `CLAUDE_CODE_NO_FLICKER=1` etc.). Custom agents
-   *  (no matching default id) are no-op. */
+   *  ordering AND everything `carriedOver` names). Custom agents (no matching
+   *  default id) are no-op. */
   function resetAgent(id: string) {
     const d = defaults.find(d => d.id === id);
     if (!d) return;
-    mutate(agents.map(a => a.id === id ? { ...d, env: a.env ?? {} } : a));
+    mutate(agents.map(a => a.id === id ? { ...d, ...carriedOver(a) } : a));
   }
 
   /** Reset every built-in to ship defaults; preserves custom agents the
-   *  user added AND each agent's env block. */
+   *  user added AND everything `carriedOver` names. */
   async function resetAllBuiltins() {
     const ok = await useUI.getState().askConfirm({
       title: "Reset built-in agents to defaults?",
-      message: "Resets the built-in agents (claude, codex, Antigravity, gemini) to their ship-default commands. Custom agents and per-agent env blocks are kept.",
+      message: "Resets the built-in agents (claude, codex, Antigravity, gemini) to their ship-default commands. Custom agents, per-agent env blocks and your credential sets are kept.",
       confirmLabel: "Reset built-ins",
     });
     if (!ok) return;
     const next = agents.map(a => {
       const d = defaults.find(d => d.id === a.id);
-      return d ? { ...d, env: a.env ?? {} } : a;
+      return d ? { ...d, ...carriedOver(a) } : a;
     });
     mutate(next);
   }
@@ -275,6 +326,11 @@ export function AgentsSection() {
       kind: src.kind,
       work_done: true,
       command: "", args: [], icon_id: "", color: "",
+      // Same rule as `resetAgent`: this rebuilds the entry from scratch, and
+      // the account fields are user DATA naming real login stores. Dropping
+      // them here would orphan a clone's credential sets exactly as the
+      // built-in reset used to.
+      ...carriedOver(src),
     } as Agent;
     mutate(agents.map(a => (a.id === id ? bare : a)));
   }
@@ -475,7 +531,13 @@ function AgentsTabs({
     }
   }, [agents, activeId]);
   // Auto-jump to a freshly added agent so the user lands on its editor.
-  useEffect(() => { if (autoFocusId) setActiveId(autoFocusId); }, [autoFocusId]);
+  // Waits for the agent to EXIST. A deep link is applied before the async
+  // agent load finishes, and the effect above then resets the selection to
+  // `agents[0]` the moment the list arrives, landing the user on the wrong
+  // card. Depending on `agents` re-applies it once the target is really there.
+  useEffect(() => {
+    if (autoFocusId && agents.some(a => a.id === autoFocusId)) setActiveId(autoFocusId);
+  }, [autoFocusId, agents]);
 
   // Drag-to-reorder — same pointer-based pattern as TabBar (no HTML5 DnD;
   // WKWebView's native drag is unreliable and Tauri intercepts it).
@@ -705,6 +767,25 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
    *  (custom agents have no defaults to revert to). */
   onReset?: () => void;
 }) {
+  // Bumped when the header names the FIRST credential set, so the row below
+  // (which fetches on mount) appears instead of staying empty until the card
+  // is reopened.
+  const [accountsNonce, setAccountsNonce] = useState(0);
+  // The header button opens the add form, which renders in the BODY row. Held
+  // here because the two are siblings: an input in the header pushed the
+  // badges onto a second line and made the strip look broken.
+  const [addingAccount, setAddingAccount] = useState(false);
+  // Arrived from the footer's "Add another account..." row, which deep-links
+  // `"<agent id>:accounts"`. Open the FORM rather than focusing the button:
+  // the user already pressed a button that said this, and making them press a
+  // second one that says the same thing is a step for nothing.
+  const accountHighlight = useApp(s => s.view.settingsHighlight);
+  const clearHighlight = useApp(s => s.clearSettingsHighlight);
+  useEffect(() => {
+    if (accountHighlight !== `${agent.id}:accounts`) return;
+    setAddingAccount(true);
+    clearHighlight();
+  }, [accountHighlight, agent.id, clearHighlight]);
   // The args fields are string[] edited as space-separated text. ArgsInput
   // owns the local draft so spaces survive (#19); it splits + bubbles up the
   // parsed array on each change.
@@ -732,8 +813,12 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
     // data-agent-card: every card renders the same control labels, so e2e (and
     // anything else reaching in) needs a way to scope to one agent.
     <div data-agent-card={agent.id} className="rounded-lg border border-[var(--color-border-soft)] bg-[var(--color-bg-1)] p-4">
-      <header className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
+      {/* `flex-wrap` + `gap-y`: with several badges and a narrow window the
+          strip WRAPS AS A WHOLE rather than letting each badge break its own
+          text onto two lines, which is what doubled the header height and put
+          "BUILT-IN" over two rows. */}
+      <header className="mb-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           <span className={cn(CLI_BRAND_COLOR[agent.icon_id || inherited?.icon_id || agent.id] || "text-[var(--color-fg-dim)]")}>
             <CliIcon cli={agent.icon_id || inherited?.icon_id || agent.id} className="h-4 w-4" />
           </span>
@@ -753,19 +838,19 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
             spellCheck={false}
             className="bg-transparent text-[14px] font-semibold outline-none border-b border-transparent focus:border-[var(--color-accent)]"
           />
-          <span className="rounded bg-[var(--color-bg-3)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-dim)] font-mono">{agent.id}</span>
+          <span className="shrink-0 whitespace-nowrap rounded bg-[var(--color-bg-3)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-dim)] font-mono">{agent.id}</span>
           {agent.builtin && (
-            <span className="rounded bg-[var(--color-bg-3)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-faint)] uppercase tracking-wider">built-in</span>
+            <span className="shrink-0 whitespace-nowrap rounded bg-[var(--color-bg-3)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-faint)] uppercase tracking-wider">built-in</span>
           )}
           {isTerminal && (
             <span
-              className="rounded bg-[var(--color-bg-3)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-faint)] uppercase tracking-wider"
+              className="shrink-0 whitespace-nowrap rounded bg-[var(--color-bg-3)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-faint)] uppercase tracking-wider"
               title="Custom terminal: offered under New terminal in the + tab menu. Runs through your login shell; no agent features (resume, work-done, message queue)."
             >terminal</span>
           )}
           {extendsName && (
             <span
-              className="rounded bg-[var(--color-bg-3)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-dim)] font-mono"
+              className="shrink-0 whitespace-nowrap rounded bg-[var(--color-bg-3)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-dim)] font-mono"
               title={overrideCount
                 ? `Inherits from ${extendsName}. ${overrideCount} field${overrideCount === 1 ? "" : "s"} overridden; everything else follows ${extendsName} as it changes.`
                 : `Inherits everything from ${extendsName}, live. Editing a field here overrides just that one.`}
@@ -780,13 +865,13 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
               type="button"
               data-testid="reset-overrides"
               onClick={() => resetOverrides(agent.id)}
-              className="rounded bg-[var(--color-accent)]/15 px-1.5 py-0.5 text-[11px] text-[var(--color-accent)] hover:bg-[var(--color-accent)]/25"
+              className="shrink-0 whitespace-nowrap rounded bg-[var(--color-accent)]/15 px-1.5 py-0.5 text-[11px] text-[var(--color-accent)] hover:bg-[var(--color-accent)]/25"
               title={`Clear all ${overrideCount} override${overrideCount === 1 ? "" : "s"} and inherit everything from ${extendsName} again.`}
             >{overrideCount} override{overrideCount === 1 ? "" : "s"} · reset</button>
           )}
           {modified && (
             <span
-              className="rounded bg-[var(--color-accent)]/15 px-1.5 py-0.5 text-[11px] text-[var(--color-accent)] uppercase tracking-wider"
+              className="shrink-0 whitespace-nowrap rounded bg-[var(--color-accent)]/15 px-1.5 py-0.5 text-[11px] text-[var(--color-accent)] uppercase tracking-wider"
               title="Some fields differ from this agent's ship defaults. Use Reset to revert."
             >modified</span>
           )}
@@ -796,7 +881,7 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
           {!isTerminal && detected && (
             <span
               className={cn(
-                "rounded px-1.5 py-0.5 text-[11px] uppercase tracking-wider",
+                "shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[11px] uppercase tracking-wider",
                 detected.found
                   ? "bg-[var(--color-ok)]/15 text-[var(--color-ok)]"
                   : "bg-[var(--color-err)]/15 text-[var(--color-err)]",
@@ -807,7 +892,16 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
             >{detected.found ? "installed" : "not found"}</span>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
+          {/* Credentials (GH #278). In the HEADER while dormant rather than in
+              a row of its own: almost every install has one login for ever,
+              and a full row for that costs space above the fields people came
+              to edit. Once a set is named the row below takes over. */}
+          <AgentAccountsAction
+            agentId={agent.id}
+            nonce={accountsNonce}
+            onStartAdd={() => setAddingAccount(true)}
+          />
           {/* Force hide/show — disabled agents drop out of every CLI
               picker (worktree popover, New Task, Review, + menu)
               but stay editable here and keep working for existing
@@ -870,6 +964,17 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
           )}
         </div>
       </header>
+
+      {/* Credentials first (GH #278): "who is this signed in as" reads before
+          "how does it run", and this is the only place a user with one login
+          discovers a second is possible. */}
+      <AgentAccountsRow
+        agentId={agent.id}
+        nonce={accountsNonce}
+        adding={addingAccount}
+        onDoneAdding={() => { setAddingAccount(false); setAccountsNonce(n => n + 1); }}
+        onEmptied={() => setAccountsNonce(n => n + 1)}
+      />
 
       {/* Said ONCE, at the top, before the reader meets a column of empty
           boxes. Without it a clone reads as unconfigured rather than

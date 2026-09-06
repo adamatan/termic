@@ -16,6 +16,12 @@
 // KEEP IN SYNC with `agent_hooks::USAGE_BODY_PREFIX` and
 // `agent_hooks::statusline_body()`. Both sides pin the literal in their own
 // test, because a string cannot be shared across the language boundary.
+//
+// The body also carries SESSION COST in USD, as a fifth field. Only claude
+// sends it: codex answers plan limits over JSON-RPC and its own spend data is
+// a token count, which would need a per-model price table to become dollars.
+// Changing the script means bumping `agent_hooks::SCHEMA_VERSION`, or existing
+// installs keep the old one forever.
 
 /** Prefix of the body that reports subscription usage. */
 export const USAGE_BODY_PREFIX = "usage ";
@@ -31,11 +37,35 @@ export interface UsageWindow {
  *  plan reports a single 30-day window and no second one at all, so a UI that
  *  assumes two columns renders an empty one. */
 export interface AgentUsage {
+  /** What this claude SESSION has cost so far, in USD, straight from the
+   *  status line's `cost.total_cost_usd` (GH #277 follow-up).
+   *
+   *  `null` when the agent did not report one. Only claude does: codex answers
+   *  plan limits over JSON-RPC and its own spend data is a token count, not
+   *  dollars, and converting that would mean shipping a per-model price table
+   *  that goes silently wrong the day prices move.
+   *
+   *  CUMULATIVE FOR ONE SESSION, not a delta. It resets to zero when the agent
+   *  restarts, which is why the store banks it rather than summing readings
+   *  (see `store/agentUsage.ts`). */
+  sessionCostUsd: number | null;
   /** The short window. 5 hours for claude; whatever codex reports as the
    *  shorter of its two. */
   session: UsageWindow | null;
   /** The long window. 7 days for claude. */
   weekly: UsageWindow | null;
+}
+
+/** A money field: any non-negative number, unclamped.
+ *
+ *  Separate from `field` because that one is written for PERCENTAGES and its
+ *  caller clamps to 100. Dollars have no ceiling, and clamping spend at 100
+ *  would silently cap the number the moment it mattered most. */
+function money(raw: string | undefined): number | null {
+  if (!raw || raw === "-") return null;
+  if (!/^\d+(\.\d+)?$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
 }
 
 /** One space-separated field: a number, or `-` for "the agent did not say".
@@ -55,22 +85,31 @@ function field(raw: string | undefined): number | null {
  *
  * Wire format, four space-separated fields after the prefix:
  *
- *     usage <5h percent> <7d percent> <5h resets_at> <7d resets_at>
+ *     usage <5h percent> <7d percent> <5h resets_at> <7d resets_at> <cost usd>
  *
  * with `-` standing in for any field the payload did not carry. A percentage
  * that fails to parse drops its whole window rather than defaulting, so an
  * unreadable payload shows nothing instead of showing a wrong number.
+ *
+ * Cost is the FIFTH field and was appended, never inserted: a running app with
+ * an older status line installed sends four fields, and reading a missing
+ * fifth as absent is exactly right. The reverse also holds, which is what lets
+ * the script be upgraded independently of the app.
  */
 export function parseUsageBody(body: string): AgentUsage | null {
   if (!body.startsWith(USAGE_BODY_PREFIX)) return null;
   const parts = body.slice(USAGE_BODY_PREFIX.length).trim().split(/\s+/);
-  const [fh, sd, fhr, sdr] = parts;
+  const [fh, sd, fhr, sdr, cost] = parts;
   const fhPct = field(fh);
   const sdPct = field(sd);
-  if (fhPct === null && sdPct === null) return null;
+  const usd = money(cost);
+  // Cost ALONE is a valid reading: an API-key account has no plan windows at
+  // all, and it is the account this field exists for.
+  if (fhPct === null && sdPct === null && usd === null) return null;
   return {
     session: fhPct === null ? null : { usedPercent: clamp(fhPct), resetsAt: field(fhr) },
     weekly: sdPct === null ? null : { usedPercent: clamp(sdPct), resetsAt: field(sdr) },
+    sessionCostUsd: usd,
   };
 }
 
@@ -85,12 +124,40 @@ function clamp(n: number): number {
  *  every single turn (docs/performance.md bear trap 8). */
 export function sameUsage(a: AgentUsage | undefined, b: AgentUsage | undefined): boolean {
   if (!a || !b) return a === b;
-  return sameWindow(a.session, b.session) && sameWindow(a.weekly, b.weekly);
+  return sameWindow(a.session, b.session)
+    && sameWindow(a.weekly, b.weekly)
+    // Cost moves on turns where neither percentage does (it changes by cents
+    // while a window stays on the same whole number), so leaving it out of the
+    // comparison would bail on exactly the writes worth making.
+    && a.sessionCostUsd === b.sessionCostUsd;
 }
 
 function sameWindow(a: UsageWindow | null, b: UsageWindow | null): boolean {
   if (!a || !b) return a === b;
   return a.usedPercent === b.usedPercent && a.resetsAt === b.resetsAt;
+}
+
+/**
+ * Money, the way the user asked to read it: `$3.42` under ten dollars, `$42`
+ * at or above it.
+ *
+ * Two decimals matter while the number is small, because that is where the
+ * interesting movement is: watching a session tick from $0.40 to $0.85 is the
+ * whole point, and `$0` for both would be useless. Past ten dollars the cents
+ * are noise in a footer, and dropping them stops the chip reflowing every few
+ * seconds as a digit appears and disappears.
+ *
+ * Never abbreviated. `$1.2k` in a spend readout is the one place a rounded
+ * number is actively unwelcome.
+ */
+export function formatUsd(usd: number | null | undefined): string {
+  if (usd == null || !Number.isFinite(usd)) return "";
+  return usd < 10
+    ? `$${usd.toFixed(2)}`
+    // `Math.round`, not `toFixed(0)`: both round, but going through the
+    // locale-free path keeps this free of a thousands separator we did not
+    // ask for.
+    : `$${Math.round(usd)}`;
 }
 
 /** `58%`, or `—` when the window is absent. Rounded, because the footer is a

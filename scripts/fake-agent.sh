@@ -38,6 +38,27 @@ done
 # On exit, drop back to the idle glyph and say goodbye (like a clean quit).
 trap 'set_title "✳ ${name}"; printf "\nFAKE-AGENT exiting\n"; exit 0' INT TERM
 
+# Record the LOGIN environment this spawn actually received (GH #278).
+#
+# Terminal output is a WebGL canvas, never the DOM, so a spec cannot read what
+# the agent printed. Writing it to a file in the isolated e2e profile is the
+# same trick `e2e_record_open` uses, and it is the only way to prove the whole
+# chain end to end: account chosen -> login_env computed -> pty_spawn applied
+# -> the PROCESS actually got it. Asserting the store instead would only prove
+# termic's own bookkeeping.
+#
+# Guarded on TERMIC_DATA_DIR, which only the e2e/automation seam sets, so a
+# real run writes nothing.
+if [ -n "${TERMIC_DATA_DIR:-}" ]; then
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "${TERMIC_TASK_ID:-}" \
+    "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-}" \
+    "CODEX_HOME=${CODEX_HOME:-}" \
+    "GEMINI_CLI_HOME=${GEMINI_CLI_HOME:-}" \
+    "XDG_DATA_HOME=${XDG_DATA_HOME:-}" \
+    >> "${TERMIC_DATA_DIR}/e2e-agent-login.log" 2>/dev/null || true
+fi
+
 # Cold start: banner + idle title (awaiting input == work done).
 echo "FAKE-AGENT ready (args: $*)"
 echo "  claude-like fixture: ✳ = idle, spinner = working. Type a prompt."

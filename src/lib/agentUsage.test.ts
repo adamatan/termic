@@ -1,11 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
-  USAGE_BODY_PREFIX, parseUsageBody, sameUsage, formatPercent, formatReset,
+  USAGE_BODY_PREFIX, parseUsageBody, sameUsage, formatPercent, formatReset, formatUsd,
   usageLevel, drivingWindow, USAGE_WARN_PERCENT, USAGE_CRITICAL_PERCENT,
   blocksUsageFeed, statusLineAgentPrompt, type StatusLineOwner,
 } from "./agentUsage";
 import { HOOK_OSC_BODY, HOOK_OSC_READY_BODY, parseNotifyBody, hookOscHandlerData } from "./agentHooks";
-import { useAgentUsage } from "@/store/agentUsage";
+import { useAgentUsage, usageKey, foldCost, costTotal, costChipVisible, type UsageEntry } from "@/store/agentUsage";
 
 describe("the usage body", () => {
   // The Rust half of this pair is
@@ -31,6 +31,7 @@ describe("parseUsageBody", () => {
     expect(parseUsageBody("usage 16 14.000000000000002 1788530400 1788937200")).toEqual({
       session: { usedPercent: 16, resetsAt: 1788530400 },
       weekly: { usedPercent: 14.000000000000002, resetsAt: 1788937200 },
+      sessionCostUsd: null,
     });
   });
 
@@ -40,6 +41,7 @@ describe("parseUsageBody", () => {
     expect(parseUsageBody("usage - 49 - 1790491695")).toEqual({
       session: null,
       weekly: { usedPercent: 49, resetsAt: 1790491695 },
+      sessionCostUsd: null,
     });
   });
 
@@ -47,6 +49,7 @@ describe("parseUsageBody", () => {
     expect(parseUsageBody("usage 7 3 - 9")).toEqual({
       session: { usedPercent: 7, resetsAt: null },
       weekly: { usedPercent: 3, resetsAt: 9 },
+      sessionCostUsd: null,
     });
   });
 
@@ -65,6 +68,7 @@ describe("parseUsageBody", () => {
     expect(parseUsageBody("usage <script> 5 - -")).toEqual({
       session: null,
       weekly: { usedPercent: 5, resetsAt: null },
+      sessionCostUsd: null,
     });
     expect(parseUsageBody("usage -5 - - -")).toBeNull();
   });
@@ -103,8 +107,17 @@ describe("formatting", () => {
 
   it("treats the reset as epoch SECONDS, not milliseconds", () => {
     // Getting this backwards is a silent 1970 in the tooltip.
-    const inAnHour = Math.floor(Date.now() / 1000) + 3600;
-    expect(formatReset({ usedPercent: 1, resetsAt: inAnHour })).toMatch(/^resets \d/);
+    //
+    // Anchored to NOON TODAY rather than `now + 1h`: within the last hour of
+    // any day "in an hour" is tomorrow, which renders the weekday form
+    // ("resets Mon 00:01") and failed this assertion for anyone running the
+    // suite late in the evening. A time-of-day flake in a test about epochs.
+    const noon = new Date();
+    noon.setHours(12, 0, 0, 0);
+    const secs = Math.floor(noon.getTime() / 1000);
+    expect(formatReset({ usedPercent: 1, resetsAt: secs })).toMatch(/^resets \d/);
+    // ...and the same number read as MILLISECONDS is the bug this guards.
+    expect(new Date(secs).getFullYear()).toBe(1970);
   });
 });
 
@@ -126,27 +139,193 @@ describe("the warning thresholds", () => {
     // The case this exists for: a comfortable session window in front of a
     // nearly-spent week. Reading the session window alone reports good news
     // right up until the turn that fails.
-    const d = drivingWindow({ session: w(30), weekly: w(95) })!;
+    const d = drivingWindow({ session: w(30), weekly: w(95) , sessionCostUsd: null})!;
     expect(d.label).toBe("wk");
     expect(usageLevel(d.window.usedPercent)).toBe("critical");
   });
 
   it("prefers the session window when it is the one in trouble", () => {
-    const d = drivingWindow({ session: w(95), weekly: w(30) })!;
+    const d = drivingWindow({ session: w(95), weekly: w(30) , sessionCostUsd: null})!;
     expect(d.label).toBe("5h");
   });
 
   it("takes whichever single window exists", () => {
     // codex on a free plan reports only the long one.
-    expect(drivingWindow({ session: null, weekly: w(49) })!.label).toBe("wk");
-    expect(drivingWindow({ session: w(49), weekly: null })!.label).toBe("5h");
-    expect(drivingWindow({ session: null, weekly: null })).toBeNull();
+    expect(drivingWindow({ session: null, weekly: w(49) , sessionCostUsd: null})!.label).toBe("wk");
+    expect(drivingWindow({ session: w(49), weekly: null , sessionCostUsd: null})!.label).toBe("5h");
+    expect(drivingWindow({ session: null, weekly: null , sessionCostUsd: null})).toBeNull();
   });
 
   it("breaks an exact tie towards the session window", () => {
     // Arbitrary but must be STABLE: a tie that flipped between renders would
     // move the colour from one number to the other while nothing changed.
-    expect(drivingWindow({ session: w(80), weekly: w(80) })!.label).toBe("5h");
+    expect(drivingWindow({ session: w(80), weekly: w(80) , sessionCostUsd: null})!.label).toBe("5h");
+  });
+});
+
+describe("formatUsd", () => {
+  it("shows cents below ten dollars, where the movement is", () => {
+    // Watching a session tick from $0.40 to $0.85 is the point. Rounding both
+    // to "$0" would make the readout useless exactly when it is interesting.
+    expect(formatUsd(0)).toBe("$0.00");
+    expect(formatUsd(0.4)).toBe("$0.40");
+    expect(formatUsd(3.427)).toBe("$3.43");
+    expect(formatUsd(9.994)).toBe("$9.99");
+  });
+
+  it("drops the cents from ten dollars up", () => {
+    // Cents are noise at that size, and a footer that reflows every few
+    // seconds as a digit appears and disappears is worse than a rounded one.
+    expect(formatUsd(10)).toBe("$10");
+    expect(formatUsd(12.5)).toBe("$13");
+    expect(formatUsd(1234.56)).toBe("$1235");
+  });
+
+  it("never abbreviates", () => {
+    // A spend readout is the one place a rounded-away magnitude is actively
+    // unwelcome: "$1.2k" hides whether you spent 1200 or 1249.
+    expect(formatUsd(1200)).toBe("$1200");
+    expect(formatUsd(1200)).not.toContain("k");
+  });
+
+  it("says nothing when there is nothing to say", () => {
+    expect(formatUsd(null)).toBe("");
+    expect(formatUsd(undefined)).toBe("");
+    expect(formatUsd(NaN)).toBe("");
+  });
+});
+
+describe("cost on the wire", () => {
+  it("reads the fifth field", () => {
+    const u = parseUsageBody("usage 58 41 100 200 3.25")!;
+    expect(u.sessionCostUsd).toBe(3.25);
+    expect(u.session?.usedPercent).toBe(58);
+  });
+
+  it("treats a four-field body as cost-free, not as broken", () => {
+    // A running app can have an OLDER status line installed, which sends
+    // four. Appending the field rather than inserting it is what makes that
+    // a missing value instead of a misparse.
+    const u = parseUsageBody("usage 58 41 100 200")!;
+    expect(u.sessionCostUsd).toBeNull();
+    expect(u.session?.usedPercent).toBe(58);
+    expect(u.weekly?.usedPercent).toBe(41);
+  });
+
+  it("accepts cost with no plan windows at all, which is the API-key account", () => {
+    // The whole reason cost is read. Before this, the body was rejected
+    // outright and that account's footer was empty.
+    const u = parseUsageBody("usage - - - - 0.1")!;
+    expect(u.sessionCostUsd).toBe(0.1);
+    expect(u.session).toBeNull();
+    expect(u.weekly).toBeNull();
+  });
+
+  it("still rejects a body with nothing readable in it", () => {
+    expect(parseUsageBody("usage - - - - -")).toBeNull();
+  });
+
+  it("does not clamp spend the way it clamps a percentage", () => {
+    // Percentages are clamped to 100 so a provider reporting 101 cannot
+    // overflow the bar. Dollars have no ceiling, and clamping them would cap
+    // the number at the moment it started to matter.
+    expect(parseUsageBody("usage - - - - 250.75")!.sessionCostUsd).toBe(250.75);
+  });
+
+  it("drops a cost that is not a bare number", () => {
+    expect(parseUsageBody("usage 58 - - - 1e9")!.sessionCostUsd).toBeNull();
+    expect(parseUsageBody("usage 58 - - - -3")!.sessionCostUsd).toBeNull();
+  });
+});
+
+describe("when money is allowed in the chip", () => {
+  const entry = (over: Partial<UsageEntry>): UsageEntry => ({
+    session: null, weekly: null, sessionCostUsd: 0.1,
+    source: "statusline", updatedAt: 0, account: null,
+    sawPlan: false, windowless: 0, ...over,
+  });
+
+  it("stays hidden on the FIRST window-less reading, which every session has", () => {
+    // THE BUG. claude sends `cost` on every payload but `rate_limits` only
+    // once a turn has reached the API, so a subscription's first reading is
+    // indistinguishable from a token-billed account. Showing money there made
+    // the footer flip from a dollar figure to a percentage bar mid-turn.
+    expect(costChipVisible(entry({ windowless: 1 }), 0.1)).toBe(false);
+  });
+
+  it("shows once a second window-less reading confirms there is no plan", () => {
+    // A subscription reports its windows on the very next payload, so a
+    // second one in a row is evidence rather than a race.
+    expect(costChipVisible(entry({ windowless: 2 }), 0.1)).toBe(true);
+  });
+
+  it("never shows again once a plan has been seen, even on a later gap", () => {
+    // `sawPlan` is sticky: a turn that never reached the API reports no
+    // windows, and that must not turn a subscription's chip back into money.
+    expect(costChipVisible(entry({ sawPlan: true, windowless: 9 }), 5)).toBe(false);
+  });
+
+  it("shows nothing when nothing has been spent", () => {
+    expect(costChipVisible(entry({ windowless: 5 }), 0)).toBe(false);
+    expect(costChipVisible(undefined, 1)).toBe(false);
+  });
+});
+
+describe("spend since launch", () => {
+  it("sums the live sessions", () => {
+    let e = foldCost(undefined, "t1", 0.5);
+    e = foldCost(e, "t2", 1.25);
+    expect(costTotal(e)).toBeCloseTo(1.75);
+  });
+
+  it("replaces a session's total rather than adding to it", () => {
+    // claude reports a RUNNING TOTAL, not a delta. Adding readings would
+    // multiply the bill by the number of turns.
+    let e = foldCost(undefined, "t1", 0.5);
+    e = foldCost(e, "t1", 0.9);
+    expect(costTotal(e)).toBeCloseTo(0.9);
+  });
+
+  it("banks the old total when a session restarts", () => {
+    // THE case this exists for. Restarting the agent in a tab starts claude's
+    // counter again at zero, and taking the latest reading would erase
+    // everything spent before the restart.
+    let e = foldCost(undefined, "t1", 2.0);
+    e = foldCost(e, "t1", 0.1);   // restarted: counter went backwards
+    expect(costTotal(e)).toBeCloseTo(2.1);
+    e = foldCost(e, "t1", 0.4);
+    expect(costTotal(e)).toBeCloseTo(2.4);
+  });
+
+  it("survives several restarts in one tab", () => {
+    let e = foldCost(undefined, "t1", 1);
+    e = foldCost(e, "t1", 0.5);   // 1 banked
+    e = foldCost(e, "t1", 0.2);   // 0.5 banked
+    expect(costTotal(e)).toBeCloseTo(1.7);
+  });
+
+  it("does not double-count a session resumed somewhere else", () => {
+    // THE BUG the session key exists for. claude's cost is a per-session
+    // RUNNING TOTAL, so a session resumed in another tab (reopen a task, a
+    // second tab on the same conversation, or the account switcher's own
+    // restart) reports the same cumulative figure again. Keyed by tab, that
+    // arrived as a second session and was added on top: the spend doubled for
+    // work nobody did.
+    let e = foldCost(undefined, "session-abc", 2.0);
+    e = foldCost(e, "session-abc", 2.05);   // same session, new tab, same id
+    expect(costTotal(e)).toBeCloseTo(2.05);
+  });
+
+  it("still counts a genuinely NEW session on top", () => {
+    // The other half: a different conversation is more spend, not a
+    // correction. Deduping too eagerly would report only the largest session.
+    let e = foldCost(undefined, "session-abc", 2.0);
+    e = foldCost(e, "session-def", 0.5);
+    expect(costTotal(e)).toBeCloseTo(2.5);
+  });
+
+  it("is zero for an account nobody has spent on", () => {
+    expect(costTotal(undefined)).toBe(0);
   });
 });
 
@@ -156,11 +335,71 @@ describe("the store", () => {
   it("keys on the agent entry, so two clones never share a number", () => {
     reset();
     const s = useAgentUsage.getState();
-    s.report("claude", { session: { usedPercent: 10, resetsAt: null }, weekly: null }, "statusline");
-    s.report("next-claude", { session: { usedPercent: 90, resetsAt: null }, weekly: null }, "statusline");
+    s.report("claude", null, { session: { usedPercent: 10, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    s.report("next-claude", null, { session: { usedPercent: 90, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
     const { byAgent } = useAgentUsage.getState();
-    expect(byAgent["claude"].session?.usedPercent).toBe(10);
-    expect(byAgent["next-claude"].session?.usedPercent).toBe(90);
+    expect(byAgent[usageKey("claude", null)].session?.usedPercent).toBe(10);
+    expect(byAgent[usageKey("next-claude", null)].session?.usedPercent).toBe(90);
+  });
+
+  it("keys on the ACCOUNT too, so two logins of one agent never share a number", () => {
+    // The defect this key exists to prevent (GH #278). One agent entry can
+    // hold several accounts, so before the account was part of the key two
+    // tasks on different logins wrote into one slot and whichever spoke last
+    // painted its percentage under the other's name. Nothing failed and
+    // nothing looked wrong; the number was simply somebody else's.
+    reset();
+    const s = useAgentUsage.getState();
+    s.report("claude", "Work", { session: { usedPercent: 12, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    s.report("claude", "Personal", { session: { usedPercent: 88, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    const { byAgent } = useAgentUsage.getState();
+    expect(byAgent[usageKey("claude", "Work")].session?.usedPercent).toBe(12);
+    expect(byAgent[usageKey("claude", "Personal")].session?.usedPercent).toBe(88);
+  });
+
+  it("gives the unnamed login a key of its own", () => {
+    reset();
+    useAgentUsage.getState().report("claude", null, { session: { usedPercent: 30, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    expect(useAgentUsage.getState().byAgent[usageKey("claude", null)].session?.usedPercent).toBe(30);
+    // "no account" is not the same as an account with an empty name.
+    expect(usageKey("claude", null)).not.toBe(usageKey("claude", ""));
+  });
+
+  it("cannot be made to collide, whatever the two halves contain", () => {
+    // Both halves are typed by the user in Settings. The first version of
+    // this key joined them with a NUL and this test broke it, which is why
+    // the key is an encoded tuple: unlikely is not impossible, and the whole
+    // point of the key is that one account's spending never lands under
+    // another's name.
+    const pairs: Array<[string, string | null]> = [
+      ["claude", "x"], ["claude\u0000x", null], ["a", "b\u0000c"], ["a\u0000b", "c"],
+      ["a", '"]'], ['a"]', null], ["a", null], ["a", ""],
+    ];
+    expect(new Set(pairs.map(([a, n]) => usageKey(a, n))).size).toBe(pairs.length);
+  });
+
+  it("clears one account without touching the agent's others", () => {
+    reset();
+    const s = useAgentUsage.getState();
+    s.report("claude", "Work", { session: { usedPercent: 12, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    s.report("claude", "Personal", { session: { usedPercent: 88, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    s.clear("claude", "Work");
+    const { byAgent } = useAgentUsage.getState();
+    expect(byAgent[usageKey("claude", "Work")]).toBeUndefined();
+    expect(byAgent[usageKey("claude", "Personal")]).toBeDefined();
+  });
+
+  it("clears every account when no account is named", () => {
+    // What a removed agent needs. An orphaned key would otherwise be
+    // inherited by a later agent that happens to reuse the id.
+    reset();
+    const s = useAgentUsage.getState();
+    s.report("claude", null, { session: { usedPercent: 1, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    s.report("claude", "Work", { session: { usedPercent: 2, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    s.report("codex", "Work", { session: { usedPercent: 3, resetsAt: null }, weekly: null , sessionCostUsd: null}, "rpc");
+    s.clear("claude");
+    const keys = Object.keys(useAgentUsage.getState().byAgent);
+    expect(keys).toEqual([usageKey("codex", "Work")]);
   });
 
   // docs/performance.md bear trap 8. The status line fires on EVERY turn and
@@ -168,32 +407,32 @@ describe("the store", () => {
   // the whole store and re-run every selector on the hottest path there is.
   it("bails on an unchanged reading, object identity included", () => {
     reset();
-    const usage = { session: { usedPercent: 10, resetsAt: 5 }, weekly: null };
-    useAgentUsage.getState().report("claude", usage, "statusline");
+    const usage = { session: { usedPercent: 10, resetsAt: 5 }, weekly: null, sessionCostUsd: null };
+    useAgentUsage.getState().report("claude", null, usage, "statusline");
     const first = useAgentUsage.getState().byAgent;
     // A fresh object with the same VALUES must still be recognised as equal.
-    useAgentUsage.getState().report("claude", { session: { usedPercent: 10, resetsAt: 5 }, weekly: null }, "statusline");
+    useAgentUsage.getState().report("claude", null, { session: { usedPercent: 10, resetsAt: 5 }, weekly: null , sessionCostUsd: null}, "statusline");
     expect(useAgentUsage.getState().byAgent).toBe(first);
   });
 
   it("writes when the number actually moves", () => {
     reset();
     const s = useAgentUsage.getState();
-    s.report("claude", { session: { usedPercent: 10, resetsAt: null }, weekly: null }, "statusline");
+    s.report("claude", null, { session: { usedPercent: 10, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
     const first = useAgentUsage.getState().byAgent;
-    s.report("claude", { session: { usedPercent: 11, resetsAt: null }, weekly: null }, "statusline");
+    s.report("claude", null, { session: { usedPercent: 11, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
     expect(useAgentUsage.getState().byAgent).not.toBe(first);
-    expect(useAgentUsage.getState().byAgent["claude"].session?.usedPercent).toBe(11);
+    expect(useAgentUsage.getState().byAgent[usageKey("claude", null)].session?.usedPercent).toBe(11);
   });
 
   it("writes when the same number arrives from the other transport", () => {
     // Which side reported it is shown in the tooltip, so a switch from the
     // codex RPC to a status line push has to land even at an equal percentage.
     reset();
-    const u = { session: { usedPercent: 10, resetsAt: null }, weekly: null };
-    useAgentUsage.getState().report("codex", u, "rpc");
+    const u = { session: { usedPercent: 10, resetsAt: null }, weekly: null, sessionCostUsd: null };
+    useAgentUsage.getState().report("codex", null, u, "rpc");
     const first = useAgentUsage.getState().byAgent;
-    useAgentUsage.getState().report("codex", u, "statusline");
+    useAgentUsage.getState().report("codex", null, u, "statusline");
     expect(useAgentUsage.getState().byAgent).not.toBe(first);
   });
 
@@ -203,13 +442,14 @@ describe("the store", () => {
   it("keeps a window the newest reading happens to omit", () => {
     reset();
     const s = useAgentUsage.getState();
-    s.report("claude", {
+    s.report("claude", null, {
       session: { usedPercent: 3, resetsAt: 10 },
       weekly: { usedPercent: 18, resetsAt: 20 },
+      sessionCostUsd: null,
     }, "statusline");
     // The next turn reports only the weekly one.
-    s.report("claude", { session: null, weekly: { usedPercent: 19, resetsAt: 20 } }, "statusline");
-    const e = useAgentUsage.getState().byAgent["claude"];
+    s.report("claude", null, { session: null, weekly: { usedPercent: 19, resetsAt: 20 }, sessionCostUsd: null }, "statusline");
+    const e = useAgentUsage.getState().byAgent[usageKey("claude", null)];
     expect(e.session?.usedPercent).toBe(3);
     expect(e.weekly?.usedPercent).toBe(19);
   });
@@ -218,8 +458,8 @@ describe("the store", () => {
     // codex on a free plan has no session window at all, and carrying one
     // forward from nothing would be inventing a limit that does not exist.
     reset();
-    useAgentUsage.getState().report("codex", { session: null, weekly: { usedPercent: 49, resetsAt: 1 } }, "rpc");
-    expect(useAgentUsage.getState().byAgent["codex"].session).toBeNull();
+    useAgentUsage.getState().report("codex", null, { session: null, weekly: { usedPercent: 49, resetsAt: 1 } , sessionCostUsd: null}, "rpc");
+    expect(useAgentUsage.getState().byAgent[usageKey("codex", null)].session).toBeNull();
   });
 
   it("never carries a window ACROSS sources", () => {
@@ -228,9 +468,9 @@ describe("the store", () => {
     // account does not have.
     reset();
     const s = useAgentUsage.getState();
-    s.report("x", { session: { usedPercent: 5, resetsAt: 1 }, weekly: null }, "statusline");
-    s.report("x", { session: null, weekly: { usedPercent: 7, resetsAt: 2 } }, "rpc");
-    expect(useAgentUsage.getState().byAgent["x"].session).toBeNull();
+    s.report("x", null, { session: { usedPercent: 5, resetsAt: 1 }, weekly: null , sessionCostUsd: null}, "statusline");
+    s.report("x", null, { session: null, weekly: { usedPercent: 7, resetsAt: 2 } , sessionCostUsd: null}, "rpc");
+    expect(useAgentUsage.getState().byAgent[usageKey("x", null)].session).toBeNull();
   });
 
   it("clears without churning the store when there is nothing to clear", () => {
@@ -243,10 +483,10 @@ describe("the store", () => {
 
 describe("sameUsage", () => {
   it("compares by value, and treats a missing window as different from a present one", () => {
-    const a = { session: { usedPercent: 1, resetsAt: 2 }, weekly: null };
-    expect(sameUsage(a, { session: { usedPercent: 1, resetsAt: 2 }, weekly: null })).toBe(true);
-    expect(sameUsage(a, { session: { usedPercent: 1, resetsAt: 3 }, weekly: null })).toBe(false);
-    expect(sameUsage(a, { session: null, weekly: null })).toBe(false);
+    const a = { session: { usedPercent: 1, resetsAt: 2 }, weekly: null, sessionCostUsd: null };
+    expect(sameUsage(a, { session: { usedPercent: 1, resetsAt: 2 }, weekly: null, sessionCostUsd: null })).toBe(true);
+    expect(sameUsage(a, { session: { usedPercent: 1, resetsAt: 3 }, weekly: null, sessionCostUsd: null })).toBe(false);
+    expect(sameUsage(a, { session: null, weekly: null, sessionCostUsd: null })).toBe(false);
     expect(sameUsage(undefined, undefined)).toBe(true);
     expect(sameUsage(a, undefined)).toBe(false);
   });

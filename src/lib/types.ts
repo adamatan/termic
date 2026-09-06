@@ -512,6 +512,26 @@ export interface Agent {
    *  lists it so it can be re-enabled; existing tasks bound to it
    *  keep working. Missing = false. */
   disabled?: boolean;
+  /** Named credential sets for this agent (GH #278), in the order they were
+   *  added. The first one is `adopted_account`: it NAMES the login the agent
+   *  already had and relocates nothing.
+   *
+   *  User DATA, not configuration. Each name is a real login store on disk,
+   *  so anything that rebuilds an Agent from its ship default has to carry
+   *  these across or it orphans directories the user signed into. They are
+   *  also excluded from the "modified" comparison: naming a credential set is
+   *  not a change to how the agent runs.
+   *
+   *  Declared here because they were NOT, which is exactly how "Reset to
+   *  defaults" came to delete them: the reset spreads the default entry, and
+   *  a field TypeScript did not know about was not carried over. */
+  accounts?: string[];
+  /** Which of `accounts` new tasks use. */
+  default_account?: string | null;
+  /** The account that IS the agent's pre-existing login. Relocates nothing. */
+  adopted_account?: string | null;
+  /** Move a task to another account on its own when this one is spent. */
+  auto_switch_account?: boolean;
   /** Optional capabilities the app consumes when present. Missing = "not
    *  supported by this CLI" → the corresponding UI gracefully omits the
    *  feature rather than failing. */
@@ -1172,6 +1192,15 @@ export interface BaseTab {
 
 export interface TerminalTab extends BaseTab {
   type: "terminal";
+  /** The account this tab's PROCESS was spawned with (GH #278), straight from
+   *  `pty_spawn`. `null`/absent is the agent's ordinary login.
+   *
+   *  Runtime state, like `ptyId` and `liveTitle`, and it exists because the
+   *  configured account and the running one are legitimately different: a
+   *  switch applies on the next spawn. Usage readings are filed under THIS,
+   *  never under the setting, or the old account's spending lands under the
+   *  new account's name. */
+  liveAccount?: string | null;
   /** Agent id (claude / gemini / codex / agy) the tab runs, OR the
    *  sentinel `"shell"` for a plain login-shell tab, OR `"custom"` for a
    *  task launched with a user-supplied command (see `command`). */
@@ -1582,4 +1611,42 @@ export interface ProfileDeletePreview {
   mainCheckouts: number;
   worktreesHint: string;
   windowOpen: boolean;
+}
+
+// ─────────────────── agent accounts (GH #278) ───────────────────
+
+export interface AccountView {
+  name: string;
+  /** True once the agent has actually written into this account's store.
+   *  "Named but never signed in" is legitimate: it is what a second machine
+   *  looks like, and what Docker looks like before its first login there. */
+  signedIn: boolean;
+  isDefault: boolean;
+}
+
+export interface AgentAccountsView {
+  agentId: string;
+  accounts: AccountView[];
+  /** False when this agent cannot hold a second login. The UI must not offer
+   *  one then, rather than offer one that silently shares a credential. */
+  supported: boolean;
+  /** Why, when somebody has actually looked into it. Says what is true of the
+   *  AGENT, not what termic did not get round to. */
+  unsupportedReason: string | null;
+  /** The variable that gets set, surfaced because for opencode and muse it is
+   *  a GENERIC root other tools read. */
+  envVar: string | null;
+  envIsSharedRoot: boolean;
+  /** Can this agent report how much of its plan is spent? The automatic
+   *  switch is offered only where it can, because "nearly out" is a number
+   *  somebody has to tell us. */
+  reportsUsage: boolean;
+  /** Is the automatic switch on for this agent? Always false when
+   *  `reportsUsage` is false, whatever is stored. */
+  autoSwitch: boolean;
+  /** Which account NAMES the agent's pre-existing login. It relocates
+   *  nothing, so a process running on the ordinary login IS running on this
+   *  account, and the footer needs it to say so instead of falling back to
+   *  whatever is merely configured. */
+  adoptedAccount: string | null;
 }

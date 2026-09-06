@@ -37,7 +37,7 @@ vi.mock("@/lib/tabFocus", () => ({
 }));
 
 import { useApp, selectTaskTabs, selectActiveTabId, EMPTY_TABS } from "@/store/app";
-import { useAgentUsage } from "@/store/agentUsage";
+import { useAgentUsage, usageKey } from "@/store/agentUsage";
 import type { AppState } from "@/store/app";
 import type { Tab } from "@/lib/types";
 
@@ -169,7 +169,7 @@ describe("selector fan-out budget (bear trap 5)", () => {
 
     const r = measureFanout(subs, WRITES, i =>
       useAgentUsage.getState().report(
-        "claude", { session: { usedPercent: i % 100, resetsAt: null }, weekly: null }, "statusline"));
+        "claude", null, { session: { usedPercent: i % 100, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline"));
 
     expect(r.invalidations).toBe(0);
     expect(r.selectorRuns).toBe(0);
@@ -183,17 +183,17 @@ describe("selector fan-out budget (bear trap 5)", () => {
       i % 2 === 0 ? "claude" : "next-claude");
 
     let runs = 0, invalidations = 0;
-    const snap = agents.map(a => useAgentUsage.getState().byAgent[a]);
+    const snap = agents.map(a => useAgentUsage.getState().byAgent[usageKey(a, null)]);
     const unsub = useAgentUsage.subscribe(() => {
       for (let i = 0; i < agents.length; i++) {
         runs++;
-        const next = useAgentUsage.getState().byAgent[agents[i]];
+        const next = useAgentUsage.getState().byAgent[usageKey(agents[i], null)];
         if (!Object.is(next, snap[i])) { invalidations++; snap[i] = next; }
       }
     });
 
     useAgentUsage.getState().report(
-      "claude", { session: { usedPercent: 1, resetsAt: null }, weekly: null }, "statusline");
+      "claude", null, { session: { usedPercent: 1, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
     expect(invalidations).toBe(SUBSCRIBERS / 2);
 
     // The same reading again. Most turns move a percentage by nothing, so this
@@ -201,9 +201,56 @@ describe("selector fan-out budget (bear trap 5)", () => {
     // `report` means no subscriber is even woken.
     const runsAfterFirst = runs;
     useAgentUsage.getState().report(
-      "claude", { session: { usedPercent: 1, resetsAt: null }, weekly: null }, "statusline");
+      "claude", null, { session: { usedPercent: 1, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
     expect(runs).toBe(runsAfterFirst);
     expect(invalidations).toBe(SUBSCRIBERS / 2);
+
+    unsub();
+  });
+
+  it("an account pill only re-renders for its OWN agent's accounts", () => {
+    // The pill BUILDS an object (one entry per account of its agent), so it is
+    // the one usage subscriber that cannot be Object.is-stable by construction
+    // and needs `useShallow`. Without it every pill in the window re-renders on
+    // every status-line report from any agent, once per turn per task, which
+    // is bear trap 8 on the hottest path there is.
+    useAgentUsage.setState({ byAgent: {} });
+    const agents = Array.from({ length: SUBSCRIBERS }, (_, i) =>
+      i % 2 === 0 ? "claude" : "next-claude");
+    const ACCOUNTS = ["Work", "Personal"];
+
+    // What the pill's selector produces, compared the way useShallow compares.
+    const build = (agent: string) =>
+      Object.fromEntries(ACCOUNTS.map(n =>
+        [n, useAgentUsage.getState().byAgent[usageKey(agent, n)]]));
+    const shallowEq = (a: Record<string, unknown>, b: Record<string, unknown>) =>
+      Object.keys(a).length === Object.keys(b).length
+      && Object.keys(a).every(k => Object.is(a[k], b[k]));
+
+    let invalidations = 0;
+    const snap = agents.map(build);
+    const unsub = useAgentUsage.subscribe(() => {
+      for (let i = 0; i < agents.length; i++) {
+        const next = build(agents[i]);
+        if (!shallowEq(next, snap[i])) { invalidations++; snap[i] = next; }
+      }
+    });
+
+    useAgentUsage.getState().report(
+      "claude", "Work", { session: { usedPercent: 1, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    // Only the claude pills, and only because one of THEIR accounts moved.
+    expect(invalidations).toBe(SUBSCRIBERS / 2);
+
+    // An account of the OTHER agent: the claude pills must not move again.
+    useAgentUsage.getState().report(
+      "next-claude", "Work", { session: { usedPercent: 5, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    expect(invalidations).toBe(SUBSCRIBERS);
+
+    // An account NOBODY's pill lists: no pill re-renders at all.
+    const before = invalidations;
+    useAgentUsage.getState().report(
+      "claude", "Client", { session: { usedPercent: 9, resetsAt: null }, weekly: null , sessionCostUsd: null}, "statusline");
+    expect(invalidations).toBe(before);
 
     unsub();
   });

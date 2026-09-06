@@ -35,7 +35,8 @@ import { IS_MAC, bindingMatches, type ShortcutId } from "@/lib/shortcuts";
 import { registerTerminalDropTarget } from "@/lib/terminalDrop";
 import { HOOK_OSC_TITLE, HOOK_OSC_READY_BODY, hookOscSessionId } from "@/lib/agentHooks";
 import { parseUsageBody } from "@/lib/agentUsage";
-import { UsageChip } from "./UsageChip";
+import { AgentChip } from "./AgentChip";
+import { useAgentAccounts } from "@/hooks/useAgentAccounts";
 import { useAgentUsage } from "@/store/agentUsage";
 import { imageFromClipboard, pastePathText } from "@/lib/clipboardImage";
 import { setupImeReplacementBridge } from "@/lib/ime";
@@ -211,6 +212,10 @@ export function TerminalPane({ task, tab, active }: Props) {
   const unlistenDataRef = useRef<(() => void) | null>(null);
   const unlistenExitRef = useRef<(() => void) | null>(null);
   const ptyRef = useRef<string | null>(null);
+  // The account the CURRENT process was spawned with (GH #278). A ref rather
+  // than state: it is read on the OSC path, which runs on every turn, and it
+  // never needs to paint anything by itself.
+  const spawnAccountRef = useRef<string | null>(null);
   // Settled-detection state: hash of the last sampled viewport + count of
   // consecutive identical samples + whether we've already marked this cycle
   // (so we mark once per "agent goes from working → settled" transition).
@@ -1823,7 +1828,31 @@ const captureArmedRef = useRef(false);
         // unchanged reading, which matters here more than anywhere else in this
         // handler (docs/performance.md bear trap 8): most turns move a
         // percentage by nothing at all.
-        useAgentUsage.getState().report(tab.cli ?? "claude", usage, "statusline");
+        useAgentUsage.getState().report(
+          tab.cli ?? "claude",
+          // The account THIS process is running as, captured at spawn. Not the
+          // configured one: a switch applies on the next spawn, so between the
+          // click and the restart the setting names an account this process is
+          // not using, and filing under it would credit one subscription's
+          // spending to another (GH #278).
+          spawnAccountRef.current,
+          usage,
+          "statusline",
+          // The SESSION this reading belongs to, for the spend accumulator.
+          //
+          // claude's cost is a per-session RUNNING TOTAL, so the key has to be
+          // the session. The tab is not it: resuming a session in a different
+          // tab (reopen a task, or a second tab on the same conversation)
+          // reports the same cumulative figure again, and a tab-keyed
+          // accumulator adds it on top of what it already had. The spend then
+          // doubles for work nobody did.
+          //
+          // The tab id is only the fallback for an agent that has not reported
+          // a session id yet, where "this tab" is the best identity there is.
+          (useApp.getState().tabs[task.id]
+            ?.find(t => t.id === tab.id) as TerminalTab | undefined)?.sessionId
+            || `${task.id}:${tab.id}`,
+        );
         return false;
       }
       wdlog(`OSC 777 notify${trusted ? " (termic hook)" : ""}`, body);
@@ -2198,9 +2227,13 @@ const captureArmedRef = useRef(false);
         const ptyId = spawn.id;
         if (cancelled) { ipc.ptyKill(ptyId).catch(() => {}); return; }
         ptyRef.current = ptyId;
+        spawnAccountRef.current = spawn.account ?? null;
         // firstOutputAt starts null: this PTY has not painted yet.
         firstOutputPatchedRef.current = false;
-        patchTab(task.id, tab.id, { ptyId, lastOutputAt: Date.now(), firstOutputAt: null });
+        patchTab(task.id, tab.id, {
+          ptyId, lastOutputAt: Date.now(), firstOutputAt: null,
+          liveAccount: spawn.account ?? null,
+        });
         // Per-PTY debug logger — active only when localStorage.ptyDebug === "1".
         // Writes to termic-pty-<task>-<cli>-<ptyId>.log in OS temp dir.
         // Find it: python3 -c 'import tempfile; print(tempfile.gettempdir())'
@@ -3136,6 +3169,28 @@ export function FooterBar({ task, sandboxWarning }: {
   // re-renders every task's footer on every task switch.
   const isActiveTask = useApp(s => s.activeTaskId === task.id);
 
+  // The account the task's PRIMARY agent process is running as (GH #278). The
+  // footer's two account-aware chips are about that process, so the answer has
+  // to come from the tab that owns it rather than from the task's setting: a
+  // staged switch changes the setting immediately and the process not at all.
+  //
+  // Selected as the string, so this footer re-renders when its own agent
+  // restarts on another account and not when any other tab changes.
+  const liveAccount = useApp(s => {
+    const primary = (s.tabs[task.id] || []).find(
+      t => t.type === "terminal" && (t as TerminalTab).cli === (task.cli ?? "claude"),
+    ) as TerminalTab | undefined;
+    // `undefined` when nothing has spawned yet; `null` once a process is
+    // running on the agent's ordinary login. The distinction is load-bearing:
+    // merging them re-keys a running task's usage the moment the user names
+    // their first credential set, and the numbers disappear mid-session.
+    return primary && "liveAccount" in primary ? (primary.liveAccount ?? null) : undefined;
+  });
+  // One owner for the account, shared by the pill and the usage chip: they are
+  // two views of one fact, and fetching it twice is two chances to disagree.
+  const accounts = useAgentAccounts(
+    task.id, task.cli ?? "claude", !!task.docker_sandbox_enabled, liveAccount, isActiveTask);
+
   // no right-split agent queue state needed; split panes show their own queue via SplitView
 
   // Live counter. ENFORCING polls the deny counter ("N blocked");
@@ -3168,12 +3223,12 @@ export function FooterBar({ task, sandboxWarning }: {
   ) : task.docker_sandbox_enabled ? (
     <>
       <DockerSandboxIcon className="h-3.5 w-3.5" />
-      <span>Sandbox: docker container</span>
+      <span className="@max-[560px]:hidden">Sandbox: docker container</span>
     </>
   ) : (
     <>
       <SandboxIcon mode={mode} className="h-3.5 w-3.5" />
-      <span>Sandbox: {SANDBOX_VISUALS[mode].shortLabel.toLowerCase()}</span>
+      <span className="@max-[560px]:hidden">Sandbox: {SANDBOX_VISUALS[mode].shortLabel.toLowerCase()}</span>
     </>
   );
 
@@ -3184,7 +3239,10 @@ export function FooterBar({ task, sandboxWarning }: {
         // matches the queue/terminal buttons and the right-panel footer tabs.
         // Suppress border-t when the split is collapsed: the strip's border-b
         // already provides the separator; two adjacent 1px lines look doubled.
-        "flex h-[var(--bottom-bar-h)] shrink-0 items-center gap-1.5 px-3 text-[12.5px]",
+        // `@container`: the collapse below is CSS, not a ResizeObserver, so a
+        // window drag costs no React render on a bar that sits under a
+        // streaming terminal.
+        "@container flex h-[var(--bottom-bar-h)] shrink-0 items-center gap-1.5 px-3 text-[12.5px]",
         !(splitOpen && splitCollapsed) && "border-t",
         sandboxWarning
           ? "border-[var(--color-warn)]/40 bg-[var(--color-warn)] text-[var(--color-fg)]"
@@ -3211,7 +3269,10 @@ export function FooterBar({ task, sandboxWarning }: {
           className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[12.5px] text-[var(--color-fg-faint)] hover:bg-[var(--color-bg-2)] hover:text-[var(--color-fg)]"
         >
           <TerminalSquare className="h-3.5 w-3.5" />
-          <span>Terminal</span>
+          {/* Label goes before the numbers do: the icon is unambiguous next
+              to the one beside it, and the usage figures are what the user is
+              actually reading in a narrow footer. */}
+          <span className="@max-[680px]:hidden">Terminal</span>
         </button>
       )}
       {/* Right group: the blocked-hosts chip on the LEFT, the sandbox status
@@ -3225,7 +3286,22 @@ export function FooterBar({ task, sandboxWarning }: {
             the sandbox status stays pinned as the rightmost item. It self-hides
             until an account has actually reported, so an agent with no usage
             feed costs this row no width at all. */}
-        <UsageChip agentId={task.cli ?? "claude"} cwd={task.path} docker={!!task.docker_sandbox_enabled} visible={isActiveTask} />
+        {/* GH #278. Immediately left of the usage chip and one unit with it:
+            usage is THAT account's usage, so with two accounts a bare
+            percentage is ambiguous. Renders nothing until a second credential
+            set exists. */}
+        {/* ONE control: which account this agent runs as, and what that
+            account has spent. They were two chips and two panels, which the
+            account pill's own comment already argued against ("forms one unit
+            with the usage chip"). */}
+        <AgentChip
+          taskId={task.id}
+          agentId={task.cli ?? "claude"}
+          cwd={task.path}
+          docker={!!task.docker_sandbox_enabled}
+          accounts={accounts}
+          visible={isActiveTask}
+        />
         {mode !== "off" && total > 0 && (
           <DeniedHostsPopover taskId={task.id} cli={task.cli ?? "claude"} count={total} mode={mode} />
         )}

@@ -52,6 +52,7 @@ const LS_DESKTOPNOTIF  = "desktopNotifications";
 const LS_SETTLED_HIGHLIGHT = "settledHighlight";
 const LS_CONFIRM_CLOSE_AGENT_TAB = "confirmBeforeCloseAgentTab";
 const LS_CONFIRM_ARCHIVE_TASK = "confirmBeforeArchiveTask";
+const LS_CONFIRM_ACCOUNT_RESTART = "confirmBeforeAccountRestart";
 const LS_ARCHIVE_DELETE_BRANCH = "archiveDeleteBranch";
 const LS_WORKING_INDICATOR = "workingIndicator";
 const LS_DEFAULT_SANDBOX = "globalDefaultSandbox";
@@ -496,6 +497,16 @@ interface PrefsState {
    *  last explicit branch decision. Archiving can't be undone from inside
    *  Termic, so both halves are re-exposed in Settings, Tasks. */
   confirmBeforeArchiveTask: boolean;
+  /** Whether switching a task to another account ASKS before restarting the
+   *  running agent. ON by default.
+   *
+   *  Off means the restart just happens on the switch, which is what someone
+   *  who switches often wants: the dialog says the same thing every time and
+   *  the action is recoverable (the conversation is resumed, and switching
+   *  back is one more click). Turned off by unticking "Show this every time"
+   *  in that dialog, and re-exposed here because a dialog you dismissed once
+   *  is otherwise unreachable. */
+  confirmBeforeAccountRestart: boolean;
   /** Whether a silent archive (see `confirmBeforeArchiveTask`) also deletes
    *  the task's git branch. OFF by default, matching the dialog checkbox's
    *  default. Ignored while the confirm dialog is on: there the checkbox is
@@ -783,6 +794,7 @@ interface PrefsState {
   setSettledHighlight: (v: boolean) => void;
   setConfirmBeforeCloseAgentTab: (v: boolean) => void;
   setConfirmBeforeArchiveTask: (v: boolean) => void;
+  setConfirmBeforeAccountRestart: (v: boolean) => void;
   setArchiveDeleteBranch: (v: boolean) => void;
   setWorkingIndicator: (v: boolean) => void;
   setLoadRemoteImages: (v: boolean) => void;
@@ -938,6 +950,7 @@ const initialCompletionSoundId = readCompletionSoundId();
 const initialSettledHighlight = lsGetBool(LS_SETTLED_HIGHLIGHT, true);
 const initialConfirmCloseAgentTab = lsGetBool(LS_CONFIRM_CLOSE_AGENT_TAB, true);
 const initialConfirmArchiveTask = lsGetBool(LS_CONFIRM_ARCHIVE_TASK, true);
+const initialConfirmAccountRestart = lsGetBool(LS_CONFIRM_ACCOUNT_RESTART, true);
 const initialArchiveDeleteBranch = lsGetBool(LS_ARCHIVE_DELETE_BRANCH, false);
 // OFF by default — experimental re-introduction of the work-in-progress
 // spinner. Opt in via Settings → General.
@@ -1000,6 +1013,7 @@ export const usePrefs = create<PrefsState>(set => ({
   settledHighlight: initialSettledHighlight,
   confirmBeforeCloseAgentTab: initialConfirmCloseAgentTab,
   confirmBeforeArchiveTask: initialConfirmArchiveTask,
+  confirmBeforeAccountRestart: initialConfirmAccountRestart,
   archiveDeleteBranch: initialArchiveDeleteBranch,
   workingIndicator: initialWorkingIndicator,
   loadRemoteImages: initialLoadRemoteImages,
@@ -1256,6 +1270,10 @@ export const usePrefs = create<PrefsState>(set => ({
   setConfirmBeforeArchiveTask: (v) => {
     try { localStorage.setItem(LS_CONFIRM_ARCHIVE_TASK, v ? "1" : "0"); } catch {}
     set({ confirmBeforeArchiveTask: v });
+  },
+  setConfirmBeforeAccountRestart: (v) => {
+    try { localStorage.setItem(LS_CONFIRM_ACCOUNT_RESTART, v ? "1" : "0"); } catch {}
+    set({ confirmBeforeAccountRestart: v });
   },
   setArchiveDeleteBranch: (v) => {
     try { localStorage.setItem(LS_ARCHIVE_DELETE_BRANCH, v ? "1" : "0"); } catch {}

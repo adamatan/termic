@@ -76,7 +76,7 @@ use std::path::{Path, PathBuf};
 // hash the hooks.json ENTRY (command path, timeout, status message), none of
 // which this changes, so a reinstall re-asks codex and writes back the same
 // hashes rather than orphaning them.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Directory we create inside the agent's config dir. Also the prefix that
 /// identifies our entries for removal, which is why it must never be renamed
@@ -274,8 +274,11 @@ payload=$(cat | tr -d '[:space:]')
 # The user never opted grok in here. Same provenance rule as its hook siblings.
 [ -z "$GROK_HOOK_EVENT" ] || exit 0
 
+# An API-KEY account has no rate_limits at all: plan windows are a subscription
+# concept. That is precisely the account whose cost is worth reporting, so the
+# early exit checks for BOTH sources and gives up only when neither is there.
 case "$payload" in
-  *'"rate_limits":'*) ;;
+  *'"rate_limits":'*|*'"total_cost_usd":'*) ;;
   *) exit 0 ;;
 esac
 rl=${payload#*'"rate_limits":'}
@@ -325,8 +328,19 @@ case "$rl" in
     ;;
 esac
 
-# Nothing readable in the payload: say nothing rather than report two dashes.
-[ "$five" = '-' ] && [ "$seven" = '-' ] && exit 0
+# Session cost in USD, which claude sends on EVERY account, including one with
+# no plan at all. Same two-cut parse as the windows above, and the same rule:
+# anything that is not a bare number is dropped rather than passed into an OSC
+# payload. A dot is allowed because this is dollars and cents.
+cost='-'
+case "$payload" in
+  *'"total_cost_usd":'*)
+    v=${payload#*'"total_cost_usd":'}; v=${v%%,*}; v=${v%%\}*}
+    case "$v" in ''|*[!0-9.]*) ;; *) cost=$v ;; esac ;;
+esac
+
+# Nothing readable in the payload: say nothing rather than report three dashes.
+[ "$five" = '-' ] && [ "$seven" = '-' ] && [ "$cost" = '-' ] && exit 0
 
 # THREE targets, tried in order, exactly as the hooks do: $TERMIC_PTY is a HOST
 # path a Docker-sandboxed agent cannot see, /proc/1/fd/1 is the container's own
@@ -334,7 +348,7 @@ esac
 # usually fails because these run with no controlling terminal.
 #
 # The values go through printf's %s, never into its FORMAT string.
-emit() { printf ']@NOTIFY@@USAGE@%s %s %s %s' "$five" "$seven" "$fivereset" "$sevenreset" > "$1" 2>/dev/null; }
+emit() { printf ']@NOTIFY@@USAGE@%s %s %s %s %s' "$five" "$seven" "$fivereset" "$sevenreset" "$cost" > "$1" 2>/dev/null; }
 emit "$TERMIC_PTY" || emit /proc/1/fd/1 || emit /dev/tty || true
 exit 0
 "#;
@@ -1908,6 +1922,50 @@ pub fn agent_hooks_status(agent_id: String) -> AgentHookStatus {
     }
 }
 
+/// What sync knows about one target when it decides whether to write.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SyncCheck {
+    pub is_docker: bool,
+    /// Does the same agent have hooks on the HOST? Only meaningful for a
+    /// Docker target, where it stands in for "the user asked for hooks here".
+    pub host_installed: bool,
+    pub ours_present: bool,
+    pub stale: bool,
+    pub has_error: bool,
+    pub disabled_all: bool,
+}
+
+/// Should `agent_hooks_sync` write to this target?
+///
+/// Extracted because the rule has two halves that pull opposite ways and the
+/// function around it reads real config directories, so this is the only part
+/// that can be tested.
+pub(crate) fn should_sync(c: SyncCheck) -> bool {
+    if c.has_error {
+        return false;
+    }
+    // A Docker target with NOTHING gets a first install, provided the user has
+    // hooks on the host for the same agent.
+    //
+    // Sync otherwise only ever UPGRADES, so a Docker install that was never
+    // made, or that was lost when its config dir was cleared, stayed missing
+    // forever and in silence: the container's agent ran with no hooks and no
+    // status line, so a sandboxed task reported no work state and no plan
+    // usage while the same agent on the host reported both, with nothing on
+    // screen saying why.
+    //
+    // Safe to do unasked, unlike the host: the Docker config dir is
+    // termic-owned (see this file's header), so there is no user
+    // configuration here to merge with or clobber.
+    if c.is_docker && c.host_installed && !c.ours_present {
+        return true;
+    }
+    // `ours_present`, not `installed`: see its doc comment. Gating an upgrade
+    // on the CURRENT set already being complete means an upgrade can never add
+    // an event, which is most of what an upgrade is for.
+    c.ours_present && c.stale && !c.disabled_all
+}
+
 /// Bring every ALREADY-INSTALLED agent's hooks up to this build's set.
 ///
 /// The user's consent is "hooks on for this agent", not "these exact three
@@ -1917,9 +1975,12 @@ pub fn agent_hooks_status(agent_id: String) -> AgentHookStatus {
 /// heartbeat that stops a cleared spinner staying gone shipped this way, and
 /// every existing install would have missed it.
 ///
-/// Only touches agents that are already installed, so it never introduces hooks
-/// for an agent the user declined, and it re-runs `install`, which preserves the
-/// pre-install backup (`if !backup.exists()`), so clean removal survives.
+/// Only touches agents that are already installed on the HOST, so it never
+/// introduces hooks for an agent the user declined, and it re-runs `install`,
+/// which preserves the pre-install backup (`if !backup.exists()`), so clean
+/// removal survives. The one thing it CREATES rather than upgrades is a
+/// missing DOCKER install for an agent whose host hooks exist; see
+/// `should_sync` for why that is the user's decision already.
 /// Refuses the same cases install refuses: an unreadable config or
 /// `disableAllHooks` is left exactly as found.
 ///
@@ -1936,16 +1997,22 @@ pub fn agent_hooks_sync() -> Vec<String> {
         .map(|a| a.id.clone())
         .collect();
     for agent in &ids {
+        // Whether the user has hooks for this agent AT ALL, which is what
+        // makes seeding the Docker side below their decision rather than ours.
+        let host_installed = status(&Target::Host(agent.clone())).ours_present;
         for target in [
             Target::Host(agent.clone()),
             Target::Docker(agent.clone()),
         ] {
             let st = status(&target);
-            // `ours_present`, not `installed`: see its doc comment. Gating
-            // an upgrade on the CURRENT set already being complete means an
-            // upgrade can never add an event, which is most of what an
-            // upgrade is for.
-            if !st.ours_present || !st.stale || st.error.is_some() || st.disabled_all {
+            if !should_sync(SyncCheck {
+                is_docker: matches!(target, Target::Docker(_)),
+                host_installed,
+                ours_present: st.ours_present,
+                stale: st.stale,
+                has_error: st.error.is_some(),
+                disabled_all: st.disabled_all,
+            }) {
                 continue;
             }
             if install(&target).is_ok() && matches!(target, Target::Host(_)) {
@@ -2361,11 +2428,13 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         use std::io::Read;
         use std::process::{Command, Stdio};
 
-        let dir = std::env::temp_dir().join(format!(
-            "termic-statusline-test-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        // A UUID, not a TIMESTAMP. Several of these tests run in parallel in
+        // one process, and `SystemTime` is not nanosecond-resolution on macOS:
+        // two of them landed on the same directory name, and the first to
+        // finish deleted the other's pty file mid-read. That is a flake with a
+        // symptom nowhere near its cause, in a test that passes alone.
+        let dir = std::env::temp_dir()
+            .join(format!("termic-statusline-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("usage.sh");
         let pty = dir.join("pty");
@@ -2436,15 +2505,55 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         assert!(emitted.contains(&format!("{USAGE_BODY_PREFIX}7 3 - 9")), "got {emitted:?}");
     }
 
-    /// A payload with no rate limits at all writes NOTHING, rather than a row
-    /// of dashes. claude sends one on a turn that never reached the API, and a
+    /// A payload with NOTHING readable writes nothing, rather than a row of
+    /// dashes. claude sends one on a turn that never reached the API, and a
     /// footer that blanked itself on those would flicker on every such turn.
     #[test]
     #[cfg(unix)]
-    fn a_payload_without_rate_limits_emits_nothing() {
-        let (emitted, stdout) = statusline_run(r#"{"session_id":"x","cost":{"total_cost_usd":0.1}}"#);
+    fn a_payload_with_neither_limits_nor_cost_emits_nothing() {
+        let (emitted, stdout) = statusline_run(r#"{"session_id":"x","model":{"id":"m"}}"#);
         assert_eq!(emitted, "");
         assert_eq!(stdout, "");
+    }
+
+    /// Cost WITHOUT rate limits is the API-key account, and it is the whole
+    /// reason cost is read at all: plan windows are a subscription concept, so
+    /// that account reports no percentages and its footer was empty.
+    ///
+    /// This test used to assert the opposite. It was called
+    /// `a_payload_without_rate_limits_emits_nothing` and its fixture was this
+    /// exact payload, which means the repo had a passing test pinning that we
+    /// were handed a cost figure every turn and threw it away.
+    #[test]
+    #[cfg(unix)]
+    fn cost_alone_is_reported_because_that_is_the_api_key_account() {
+        let (emitted, stdout) = statusline_run(r#"{"session_id":"x","cost":{"total_cost_usd":0.1}}"#);
+        assert!(emitted.contains(&format!("{USAGE_BODY_PREFIX}- - - - 0.1")), "got {emitted:?}");
+        assert_eq!(stdout, "", "a status line must never print");
+    }
+
+    /// The subscription account: percentages AND cost, in one body.
+    #[test]
+    #[cfg(unix)]
+    fn cost_rides_alongside_the_plan_windows_as_a_fifth_field() {
+        let (emitted, _) = statusline_run(
+            r#"{"cost":{"total_cost_usd":12.5},"rate_limits":{"five_hour":{"used_percentage":7,"resets_at":9},"seven_day":{"used_percentage":3}}}"#,
+        );
+        // APPENDED, never inserted: an older frontend reads the first four
+        // fields and ignores the rest, so a stale install keeps working.
+        assert!(emitted.contains(&format!("{USAGE_BODY_PREFIX}7 3 9 - 12.5")), "got {emitted:?}");
+    }
+
+    /// The same rule every other field obeys: a value that is not a bare
+    /// number is dropped rather than passed into a ';'-separated OSC payload.
+    #[test]
+    #[cfg(unix)]
+    fn a_hostile_cost_is_dropped_rather_than_forwarded() {
+        let (emitted, _) = statusline_run(
+            r#"{"cost":{"total_cost_usd":"1;rm -rf /"},"rate_limits":{"five_hour":{"used_percentage":7}}}"#,
+        );
+        assert!(emitted.contains(&format!("{USAGE_BODY_PREFIX}7 - - - -")), "got {emitted:?}");
+        assert!(!emitted.contains("rm -rf"), "got {emitted:?}");
     }
 
     /// The body reaches an OSC 777 payload, whose fields are ';'-separated, and
@@ -2614,13 +2723,65 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn chk(is_docker: bool, host_installed: bool, ours_present: bool, stale: bool) -> SyncCheck {
+        SyncCheck { is_docker, host_installed, ours_present, stale,
+                    has_error: false, disabled_all: false }
+    }
+
+    #[test]
+    fn sync_seeds_a_missing_docker_install_when_the_host_has_one() {
+        // THE BUG. Sync only ever upgraded, so a Docker install that was never
+        // made (or was lost when its config dir was cleared) stayed missing
+        // forever, in silence: the container's agent ran with no hooks and no
+        // status line, so a sandboxed task reported no work state and no plan
+        // usage while the SAME agent on the host reported both.
+        assert!(should_sync(chk(true, true, false, false)));
+    }
+
+    #[test]
+    fn sync_never_introduces_hooks_for_an_agent_the_user_declined() {
+        // No host install means no consent. The Docker dir is termic-owned, so
+        // writing there is harmless, but hooks the user never asked for would
+        // start reporting from an agent they deliberately left alone.
+        assert!(!should_sync(chk(true, false, false, false)));
+        // ...and the host itself is never seeded from nothing.
+        assert!(!should_sync(chk(false, false, false, false)));
+        assert!(!should_sync(chk(false, true, false, false)));
+    }
+
+    #[test]
+    fn sync_upgrades_a_stale_install_on_either_side() {
+        assert!(should_sync(chk(false, true, true, true)));
+        assert!(should_sync(chk(true, true, true, true)));
+    }
+
+    #[test]
+    fn sync_leaves_a_current_install_alone() {
+        assert!(!should_sync(chk(false, true, true, false)));
+        assert!(!should_sync(chk(true, true, true, false)));
+    }
+
+    #[test]
+    fn sync_refuses_a_target_it_could_not_read_or_that_is_switched_off() {
+        // An unreadable config and `disableAllHooks` are both the user's
+        // state, not ours to overwrite, and that holds for the Docker seed
+        // too: an error there means we do not know what is in the directory.
+        let mut c = chk(true, true, false, false);
+        c.has_error = true;
+        assert!(!should_sync(c), "an unreadable target is never written to");
+
+        let mut c = chk(false, true, true, true);
+        c.disabled_all = true;
+        assert!(!should_sync(c), "disableAllHooks is left exactly as found");
+    }
+
     #[test]
     fn the_schema_bump_is_what_makes_sync_replace_old_installs() {
         // The upgrade path rests entirely on this. An install from the build
         // before the current set must read as stale, or `agent_hooks_sync`
         // skips it and the user keeps that set forever: v3 types into startup
         // dialogs, v4 holds a tab on `working` for the rest of the session.
-        assert_eq!(SCHEMA_VERSION, 7, "bump me with the hook set, or installs go stale silently");
+        assert_eq!(SCHEMA_VERSION, 8, "bump me with the hook set, or installs go stale silently");
     }
 
     #[test]

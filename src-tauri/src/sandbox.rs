@@ -478,6 +478,13 @@ pub fn compute_monitor_policy(task: &Task, agent_override: Option<&str>) -> Moni
     if let Some(dir) = crate::agent_dirs::instance_config_dir(&settings.agents, effective_cli, std::path::Path::new(&home)) {
         collect(&dir.to_string_lossy(), &mut rw_subpaths, &mut rw_regexes);
     }
+    // ...and the named account's login store, which is somewhere else entirely
+    // (GH #278). Monitor mode never blocks, but it DECIDES what would have
+    // been blocked, and an answer that differs from the enforcing profile is
+    // worse than no answer: it teaches the user to distrust the report.
+    if let Some(dir) = crate::task_login_store(task, effective_cli) {
+        collect(&dir.to_string_lossy(), &mut rw_subpaths, &mut rw_regexes);
+    }
     // Runtime dirs (also canonicalized symlink targets).
     for p in builtin_runtime_paths(&home, &task_path) {
         let canon = canonicalize_or_keep(&p);
@@ -960,6 +967,35 @@ pub fn control_plane_paths() -> ControlPlanePaths {
     }
 }
 
+/// This task's account login store, as a canonical path for the profile.
+///
+/// Wrapped rather than called inline so the ordering rule is stated once: the
+/// result is emitted AFTER the control-plane deny, never with the agent's
+/// other allowed paths, because that deny is the final filesystem rule and
+/// would swallow it.
+fn task_login_store_for_sandbox(
+    task: &Task,
+    effective_cli: &str,
+    control: &ControlPlanePaths,
+) -> Option<String> {
+    let raw = crate::task_login_store(task, effective_cli)?.to_string_lossy().into_owned();
+    let canon = canonicalize_or_keep(&raw);
+    if canon != raw {
+        return Some(canon);
+    }
+    // Canonicalizing did nothing, which means the store does not exist yet:
+    // `canonicalize` on a missing path returns the path it was given. That is
+    // not harmless here. Seatbelt evaluates CANONICAL paths, and on macOS a
+    // data dir under `/var` is really `/private/var`, so the allow would name
+    // a path the kernel never matches and the agent would stay denied for the
+    // one spawn that has to create the directory.
+    //
+    // Rebase onto the canonical data dir instead, which always exists.
+    let dd_raw = crate::global_dir().ok()?.to_string_lossy().into_owned();
+    let dd_canon = control.data_dir.as_deref()?;
+    Some(raw.replacen(&dd_raw, dd_canon, 1))
+}
+
 pub fn render_profile(task: &Task, proxy_port: u16, agent_override: Option<&str>, mode: SandboxMode) -> Result<String> {
     // Per-agent allowed paths from the agent registry (Settings → Agents).
     // Resolved here so render_profile_with is a pure function of its
@@ -1275,6 +1311,25 @@ pub(crate) fn render_profile_with(
         out.push_str(";;     rules; last-match-wins beats any ancestor allow above. ---\n");
         out.push_str(&format!("(deny file-write* (subpath \"{}\"))\n", sbpl_escape(dd)));
         out.push_str(&format!("(deny file-read* (subpath \"{}\"))\n", sbpl_escape(dd)));
+        // ...EXCEPT this task's own login store, re-allowed AFTER the deny so
+        // last-match-wins puts it back (GH #278).
+        //
+        // A named account's config dir lives inside termic's data dir, so the
+        // blanket deny above swallowed it and the agent could not open its own
+        // credential: codex died on `unable to open database file` for
+        // `logins/codex/<account>/state_5.sqlite`, with the deny counter
+        // ticking up in the footer. An allow placed with the other agent paths
+        // was inert, because this deny is deliberately the FINAL rule.
+        //
+        // Narrow on purpose: ONE account's directory, never `logins/` and
+        // never the data dir. The CLI token, `projects.json` and `tasks/` are
+        // siblings of it and stay denied, which is the property this whole
+        // block exists to hold.
+        if let Some(store) = task_login_store_for_sandbox(task, effective_cli, control) {
+            out.push_str(";;     ...except this task's own account login store.\n");
+            out.push_str(&format!("(allow file-read* file-write* (subpath \"{}\"))\n",
+                                  sbpl_escape(&store)));
+        }
     }
 
     // Control-plane socket deny, emitted per-branch below: it must be the
@@ -2543,6 +2598,61 @@ mod tests {
     }
 
     // ── builtin_runtime_paths ─────────────────────────────────────────
+
+    #[test]
+    fn the_login_store_allow_survives_the_control_plane_deny() {
+        // ORDER, not presence. The control-plane deny covers the whole termic
+        // data dir and is deliberately the FINAL filesystem rule, so an allow
+        // for the account's store placed with the agent's other paths was
+        // rendered and then silently overridden: codex died on `unable to open
+        // database file` for `logins/codex/<account>/state_5.sqlite` while the
+        // profile visibly contained an allow for it.
+        //
+        // A textual "contains" check cannot catch that, so this asserts the
+        // POSITION: the allow must come after both denies.
+        // Inside the scratch data dir, because this reads that dir TWICE (once
+        // through `control_plane_paths`, once through `login_store_dir`) and
+        // other tests swap it under us. Without the lock the two reads can see
+        // different roots and the subpath assertion below fails at random,
+        // which is exactly how this showed up: one failure in a full run,
+        // green on every rerun.
+        crate::test_support::with_scratch_data_dir(|_| {
+        let mut task = crate::Task::default();
+        task.id = "t".into();
+        task.path = "/tmp".into();
+        task.cli = "codex".into();
+        task.sandbox_enabled = true;
+        task.accounts.insert("codex".into(), "Work".into());
+
+        let control = control_plane_paths();
+        let p = render_profile_with(&task, 1, "codex", &[], crate::SandboxMode::Enforce, &control).unwrap();
+        let dd = control.data_dir.clone().expect("a data dir");
+        // Rebased onto the CANONICAL data dir, exactly as the profile does:
+        // the store does not exist in this test, and on macOS a `/var` data
+        // dir is really `/private/var`, which is the form seatbelt matches.
+        let raw = crate::login_store_dir("codex", Some("Work"), crate::LoginRealm::Host)
+            .unwrap().to_string_lossy().into_owned();
+        let dd_raw = crate::global_dir().unwrap().to_string_lossy().into_owned();
+        let store = raw.replacen(&dd_raw, &dd, 1);
+        assert!(store.starts_with(&dd), "rebasing failed: {store} vs {dd}");
+
+        let allow_at = p.find(&format!(r#"(allow file-read* file-write* (subpath "{store}"))"#))
+            .expect("the account's login store must be allowed");
+        let deny_at = p.rfind(&format!(r#"(deny file-read* (subpath "{dd}"))"#))
+            .expect("the data dir must still be denied");
+        assert!(allow_at > deny_at,
+            "the allow must come AFTER the deny or last-match-wins makes it inert");
+
+        // ...and the deny it re-opens a hole in is still doing its job. The
+        // CLI token is a sibling of `logins/`, and a caged agent holding it
+        // has escaped the sandbox.
+        assert!(!p.contains(&format!(r#"(allow file-read* file-write* (subpath "{dd}"))"#)),
+            "the data dir itself must never be re-allowed");
+        assert!(store.starts_with(&dd),
+            "the allow must be a NARROW subpath of the denied dir\n  store: {store}\n  denied: {dd}");
+        assert!(store.ends_with("/logins/codex/work"), "one account only: {store}");
+        });
+    }
 
     #[test]
     fn library_is_a_read_root_but_never_writable() {

@@ -143,8 +143,27 @@ pub fn persist_offerable(agent_id: &str) -> bool {
 /// and returns an owned-by-'static id, since every base we care about is a
 /// built-in name. Falls back to the id itself when the registry cannot be read,
 /// which is the same answer `base_agent_id` gives for an unknown agent.
+/// The built-ins `base_agent_id_str` can resolve a clone down to.
+///
+/// Hoisted out of that function so a test can see it: an id missing from here
+/// resolves to "claude" SILENTLY, which for a clone means it is handed another
+/// agent's config shape. `a_new_builtin_agent_is_registered_in_every_table_that_needs_it`
+/// (agent_dirs.rs) is what makes that loud.
+pub(crate) const BASE_BUILTINS: &[&str] =
+    &["claude", "codex", "copilot", "agy", "antigravity", "opencode", "pi", "grok", "gemini", "muse"];
+
+/// Is this a base id `base_agent_id_str` actually knows, rather than one it
+/// would quietly answer "claude" for?
+/// Test-only: the exhaustiveness guard in `agent_dirs` asks this, and nothing
+/// in the app does. Gated rather than left public so a dead-code warning is
+/// never suppressed on a table this important.
+#[cfg(test)]
+pub(crate) fn base_agent_id_is_known(id: &str) -> bool {
+    BASE_BUILTINS.contains(&id)
+}
+
 pub fn base_agent_id_str(id: &str) -> &'static str {
-    const BUILTINS: &[&str] = &["claude", "codex", "copilot", "agy", "antigravity", "opencode", "pi", "grok", "gemini", "muse"];
+    const BUILTINS: &[&str] = BASE_BUILTINS;
     let agents = crate::load_settings_inner().agents;
     let base = base_agent_id(&agents, id);
     BUILTINS.iter().copied().find(|b| *b == base).unwrap_or("claude")
@@ -572,6 +591,12 @@ pub fn build_spec(
     // container dirs mounted into EVERY container from one shared host dir
     // each, regardless of agent. See step 4b.
     shared_config_dirs: &[String],
+    // The account this spawn runs as (GH #278), or `None` for the agent's
+    // ordinary login. `Some` adds a segment to the HOST side of the config
+    // mount so two accounts of one agent get two directories; `None` leaves
+    // the path exactly as it was before accounts existed, which is what stops
+    // an existing Docker login being orphaned by shipping this.
+    account: Option<&str>,
 ) -> DockerSpec {
     let mut mounts: Vec<Mount> = Vec::new();
 
@@ -681,7 +706,12 @@ pub fn build_spec(
     ];
     let mut relocation: Option<(String, String)> = None;
     if let Some(cfg) = agent_config(base_id, agent_extra_dirs, agent_persist_enabled) {
-        let host_cfg = agent_config_host_dir(agent_id).to_string_lossy().into_owned();
+        let host_cfg = match account {
+            Some(a) => agent_config_host_dir(agent_id).join(crate::account_slug(a)),
+            None => agent_config_host_dir(agent_id),
+        }
+        .to_string_lossy()
+        .into_owned();
         // Create it OURSELVES, as the app user, before it becomes a `-v`
         // source. A missing bind-mount source is created by the daemon
         // instead, and who owns the result is the daemon's business: Docker
@@ -698,6 +728,37 @@ pub fn build_spec(
             "your Docker agent: login, MCP servers, settings, history (shared across all your Docker tasks)",
             false,
         ));
+        // A NAMED account gets its own directory, which means its own
+        // credential AND, without this, its own empty everything else: no
+        // transcripts, so `--resume` answers "No conversation found"; no
+        // settings.json, so no permissions and no termic status line. The host
+        // solves that by making the account store a symlink farm back to the
+        // primary config dir, but a host symlink is dangling inside a
+        // container, so Docker gets the same sharing as MOUNTS instead.
+        //
+        // Each shared entry is bind-mounted from the PRIMARY Docker config dir
+        // over the account dir already mounted above. Nested mounts are the
+        // pattern `extra_dirs` below already uses, and the daemon applies them
+        // by path depth, so the order here does not matter.
+        if account.is_some() {
+            let primary = agent_config_host_dir(agent_id);
+            for name in crate::agent_dirs::shared_config_entries(base_id) {
+                let src = primary.join(name);
+                // Only what already EXISTS. A missing source is created by the
+                // daemon, root-owned on Linux, and the agent then cannot write
+                // its own transcripts into it.
+                if !src.exists() {
+                    continue;
+                }
+                mounts.push(Mount::implicit(
+                    src.to_string_lossy().into_owned(),
+                    format!("{}/{}", cfg.container_dir.trim_end_matches('/'), name),
+                    false,
+                    "shared with your other Docker accounts for this agent: settings, instructions and conversations",
+                    false,
+                ));
+            }
+        }
         for extra in &cfg.extra_dirs {
             // Extra dirs share the same host config dir subtree by name.
             //
@@ -1847,7 +1908,7 @@ mod tests {
         let mut env = std::collections::HashMap::new();
         env.insert("CLAUDE_CONFIG_DIR".to_string(), "/Users/me/.next-claude".to_string());
         let spec = with_scratch_data_dir(|| build_spec(&task, "next-claude", "img", &task.path,
-            vec![], &env, &[], false, &[], &[], "pty-env000001", "claude", &[]));
+            vec![], &env, &[], false, &[], &[], "pty-env000001", "claude", &[], None));
 
         // LAST value wins with `docker run -e`, so the last one is the one
         // that counts.
@@ -1866,7 +1927,7 @@ mod tests {
         let mut env = std::collections::HashMap::new();
         env.insert("CLAUDE_CONFIG_DIR".to_string(), "/root/.claude/alt".to_string());
         let spec = with_scratch_data_dir(|| build_spec(&task, "claude", "img", &task.path,
-            vec![], &env, &[], false, &[], &[], "pty-env000002", "claude", &[]));
+            vec![], &env, &[], false, &[], &[], "pty-env000002", "claude", &[], None));
         let effective = spec.env.iter().rev()
             .find(|(k, _)| k == "CLAUDE_CONFIG_DIR").map(|(_, v)| v.clone()).unwrap();
         assert_eq!(effective, "/root/.claude/alt");
@@ -1901,7 +1962,7 @@ mod tests {
         let task = stub_task("t-clone", "/tmp/termic-docker-test-does-not-exist");
         let env = std::collections::HashMap::new();
         let spec = with_scratch_data_dir(|| build_spec(&task, "next-claude", "img", &task.path,
-            vec![], &env, &[], false, &[], &[], "pty-clone0001", "claude", &[]));
+            vec![], &env, &[], false, &[], &[], "pty-clone0001", "claude", &[], None));
 
         // claude's shape: the config dir is mounted and relocated onto it, so
         // `.claude.json` (which lives at HOME root until relocated) is inside
@@ -1963,7 +2024,7 @@ mod tests {
                 let task = stub_task("t-realm", "/tmp/termic-docker-test-does-not-exist");
                 let env = std::collections::HashMap::new();
                 let spec = build_spec(&task, agent, "img", &task.path, vec![], &env,
-                    &[], false, &[], &[], "pty-realm00001", agent, &[]);
+                    &[], false, &[], &[], "pty-realm00001", agent, &[], None);
                 let m = spec.mounts.iter().find(|m| m.container == container)
                     .unwrap_or_else(|| panic!("{agent}: no config mount at {container}"));
                 assert!(m.host.contains(&format!("docker-agents/{agent}")), "{agent}: {}", m.host);
@@ -1985,7 +2046,7 @@ mod tests {
             let task = stub_task("t-noreloc", "/tmp/termic-docker-test-does-not-exist");
             let env = std::collections::HashMap::new();
             let spec = build_spec(&task, "agy", "img", &task.path, vec![], &env,
-                &[], false, &[], &[], "pty-noreloc0001", "agy", &[]);
+                &[], false, &[], &[], "pty-noreloc0001", "agy", &[], None);
             let m = spec.mounts.iter().find(|m| m.container == "/root/.gemini")
                 .expect("agy's primary config dir must be mounted");
             assert!(m.host.contains("docker-agents/agy"), "{}", m.host);
@@ -2020,7 +2081,7 @@ mod tests {
             let task = stub_task("t-mk", "/tmp/termic-docker-test-does-not-exist");
             let env = std::collections::HashMap::new();
             let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false,
-                &[], &[], "pty-mkdir0001", "claude", &[]);
+                &[], &[], "pty-mkdir0001", "claude", &[], None);
             let cfg = spec.mounts.iter().find(|m| m.container == "/root/.claude").unwrap();
             assert!(std::path::Path::new(&cfg.host).is_dir(),
                 "host config dir must exist before docker sees it: {}", cfg.host);
@@ -2057,7 +2118,7 @@ mod tests {
 
         let task = stub_task("t-pi", "/tmp/termic-docker-test-does-not-exist");
         let env = std::collections::HashMap::new();
-        let spec = build_spec(&task, "pi", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-pi000001", "pi", &[]);
+        let spec = build_spec(&task, "pi", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-pi000001", "pi", &[], None);
         assert!(spec.mounts.iter().any(|m| m.container == "/root/.pi"),
             "pi's config dir must be mounted, or every Docker launch re-authenticates");
         // No relocation env var is claimed for pi: the docs describe no
@@ -2082,7 +2143,7 @@ mod tests {
         let task = stub_task("t-hooks", "/tmp/termic-docker-test-does-not-exist");
         let env = std::collections::HashMap::new();
         let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false,
-                              &[], &[], "pty-hooks01", "claude", &[]);
+                              &[], &[], "pty-hooks01", "claude", &[], None);
         let get = |k: &str| spec.env.iter().rev().find(|(a, _)| a == k).map(|(_, v)| v.clone());
         assert_eq!(get("TERMIC_TASK_ID"), Some(task.id.clone()));
         // NOT the host device path: the container has no entry for it, which
@@ -2100,13 +2161,73 @@ mod tests {
         // archive and the Docker toggle do want to reap the whole task.
         let task = stub_task("task-1", "/tmp/termic-docker-test-does-not-exist");
         let env = std::collections::HashMap::new();
-        let a = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "aaaaaaaa-1111-2222-3333-444444444444", "claude", &[]);
-        let b = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "bbbbbbbb-1111-2222-3333-444444444444", "claude", &[]);
+        let a = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "aaaaaaaa-1111-2222-3333-444444444444", "claude", &[], None);
+        let b = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "bbbbbbbb-1111-2222-3333-444444444444", "claude", &[], None);
         assert_ne!(a.container_name, b.container_name,
             "two tabs of one task must not share a container name");
         assert!(a.container_name.starts_with("termic-task-1-"));
         assert_eq!(a.label, b.label, "the task label is shared, so archive reaps both");
         assert_eq!(a.label, "termic.task=task-1");
+    }
+
+    #[test]
+    fn a_named_account_shares_the_agents_conversations_into_the_container() {
+        // Switching a DOCKER task to a named account gave it a fresh config
+        // dir and therefore a fresh everything: `--resume` answered "No
+        // conversation found", and the same switch on the host worked, because
+        // the host store is a symlink farm back to the primary dir. A host
+        // symlink is dangling inside a container, so Docker shares the same
+        // entries as bind MOUNTS instead.
+        let dir = std::env::temp_dir().join(format!("termic-docker-share-{}", uuid::Uuid::new_v4()));
+        let primary = crate::docker::agent_config_host_dir("claude");
+        // Only entries that EXIST are mounted, so seed one and check both
+        // directions in a single spec.
+        // Seed a couple of entries of BOTH kinds, so the parity loop below
+        // covers a directory and a file rather than just one shape.
+        std::fs::create_dir_all(primary.join("projects")).unwrap();
+        std::fs::create_dir_all(primary.join("termic-hooks")).unwrap();
+        std::fs::write(primary.join("settings.json"), b"{}").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let task = stub_task("task-1", dir.to_str().unwrap());
+        let env = std::collections::HashMap::new();
+        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[],
+                              "aaaaaaaa-1111-2222-3333-444444444444", "claude", &[], Some("Work"));
+
+        let mounted_at = |c: &str| spec.mounts.iter().any(|m| m.container == c);
+        assert!(mounted_at("/root/.claude/projects"),
+            "the account's container must see the agent's conversations, or --resume finds nothing");
+
+        // REALM PARITY, which is the rule this whole class of bug came from.
+        // The host shares these entries by symlink and Docker by mount, and
+        // three separate bugs were "implemented on the host, silently not in
+        // the container": the adopted account relocating the mount, the hooks
+        // never being installed, and `termic-hooks` missing so the shared
+        // settings pointed at scripts that were not there.
+        //
+        // So: every shared entry that EXISTS in the primary dir must be
+        // mounted. Adding one to `shared_config_entries` without Docker
+        // honouring it now fails here rather than in a container weeks later.
+        for name in crate::agent_dirs::shared_config_entries("claude") {
+            if !primary.join(name).exists() {
+                continue; // nothing to share yet; the mount is skipped by design
+            }
+            assert!(
+                mounted_at(&format!("/root/.claude/{name}")),
+                "{name} is shared on the host but not mounted into the container",
+            );
+        }
+        // The account's own directory is still what the config dir points at,
+        // so the CREDENTIAL stays per-account. That is the whole feature.
+        assert!(spec.mounts.iter().any(|m| m.host.ends_with("/claude/work") && m.container == "/root/.claude"),
+            "the account keeps its own config dir: {:?}", spec.mounts);
+
+        // Without an account nothing is overlaid: the primary dir IS the
+        // config dir, and mounting its own children on top of it is noise.
+        let plain = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[],
+                               "aaaaaaaa-1111-2222-3333-444444444444", "claude", &[], None);
+        assert!(!plain.mounts.iter().any(|m| m.container == "/root/.claude/projects"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2125,7 +2246,7 @@ mod tests {
         let task = stub_task("t1", "/tmp/termic-docker-test-does-not-exist");
         let mut spawn_env = std::collections::HashMap::new();
         spawn_env.insert("MY_CUSTOM_VAR".to_string(), "hello".to_string());
-        let spec = build_spec(&task, "claude", "termic-sandbox:abc", &task.path, vec![], &spawn_env, &[], false, &[], &[], "pty-aaaa1111", "claude", &[]);
+        let spec = build_spec(&task, "claude", "termic-sandbox:abc", &task.path, vec![], &spawn_env, &[], false, &[], &[], "pty-aaaa1111", "claude", &[], None);
         assert!(spec.env.iter().any(|(k, v)| k == "MY_CUSTOM_VAR" && v == "hello"));
         assert!(spec.env.iter().any(|(k, _)| k == "TERM"));
     }
@@ -2138,7 +2259,7 @@ mod tests {
         let task = stub_task("t2", "/tmp/termic-docker-test-does-not-exist-2");
         let mut spawn_env = std::collections::HashMap::new();
         spawn_env.insert("TERM".to_string(), "dumb".to_string());
-        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &spawn_env, &[], false, &[], &[], "pty-aaaa1111", "claude", &[]);
+        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &spawn_env, &[], false, &[], &[], "pty-aaaa1111", "claude", &[], None);
         let term_values: Vec<&str> = spec.env.iter().filter(|(k, _)| k == "TERM").map(|(_, v)| v.as_str()).collect();
         assert_eq!(term_values, vec!["xterm-256color", "dumb"]);
     }
@@ -2162,7 +2283,7 @@ mod tests {
             ("opencode", "/root/.config/opencode", &["/root/.local/share/opencode"]),
         ];
         for (agent, primary, extras) in cases {
-            let spec = build_spec(&task, agent, "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-aaaa1111", agent, &[]);
+            let spec = build_spec(&task, agent, "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-aaaa1111", agent, &[], None);
             let mounted: Vec<&str> = spec.mounts.iter().map(|m| m.container.as_str()).collect();
             assert!(mounted.contains(primary), "{agent}: expected {primary} in {mounted:?}");
             for e in *extras {
@@ -2171,7 +2292,7 @@ mod tests {
         }
         // grok stays unsupported in Docker mode regardless of what
         // agent_dirs lists for Seatbelt's sake.
-        let grok_spec = build_spec(&task, "grok", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-aaaa1111", "grok", &[]);
+        let grok_spec = build_spec(&task, "grok", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-aaaa1111", "grok", &[], None);
         assert!(!grok_spec.mounts.iter().any(|m| m.container.contains("grok")));
     }
 
@@ -2180,7 +2301,7 @@ mod tests {
         let task = stub_task("t4", "/tmp/termic-docker-test-does-not-exist-4");
         let env = std::collections::HashMap::new();
         for (agent, var) in [("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")] {
-            let spec = build_spec(&task, agent, "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-aaaa1111", agent, &[]);
+            let spec = build_spec(&task, agent, "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-aaaa1111", agent, &[], None);
             let val = spec.env.iter().find(|(k, _)| k == var).map(|(_, v)| v.as_str());
             assert_eq!(val, Some(format!("/root/.{agent}").as_str()));
         }
@@ -2297,7 +2418,7 @@ mod tests {
         // explicitly since that uid has no /etc/passwd entry in the image.
         let task = stub_task("t13", "/tmp/termic-docker-test-does-not-exist-13");
         let env = std::collections::HashMap::new();
-        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-aaaa1111", "claude", &[]);
+        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-aaaa1111", "claude", &[], None);
         let argv = render_argv(&spec, "claude", &[]);
         let user_idx = argv.iter().position(|a| a == "--user").expect("--user flag missing");
         assert_eq!(argv[user_idx + 1], host_uid_gid());
@@ -2356,7 +2477,7 @@ mod tests {
         // tempdir that is deleted the moment it returns, and the whole point
         // of one of these is that the host path exists on disk by then.
         with_scratch_data_dir(|| {
-        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-forge001", "claude", &default_shared_config_dirs());
+        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-forge001", "claude", &default_shared_config_dirs(), None);
         for (container, var) in [("/root/.config/gh", "GH_CONFIG_DIR"), ("/root/.config/glab-cli", "GLAB_CONFIG_DIR")] {
             let m = spec.mounts.iter().find(|m| m.container == container)
                 .unwrap_or_else(|| panic!("{container} should be mounted"));
@@ -2380,7 +2501,7 @@ mod tests {
         let task = stub_task("t-forge2", "/tmp/termic-docker-test-does-not-exist-forge2");
         let env = std::collections::HashMap::new();
         let spec = with_scratch_data_dir(|| {
-            build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-forge002", "claude", &default_shared_config_dirs())
+            build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-forge002", "claude", &default_shared_config_dirs(), None)
         });
         let home = dirs::home_dir().unwrap_or_default().to_string_lossy().into_owned();
         if home.is_empty() { return }
@@ -2400,7 +2521,7 @@ mod tests {
         let env = std::collections::HashMap::new();
         let extras = vec![".config/gh".to_string()];
         let spec = with_scratch_data_dir(|| {
-            build_spec(&task, "copilot", "img", &task.path, vec![], &env, &extras, false, &[], &[], "pty-forge003", "copilot", &default_shared_config_dirs())
+            build_spec(&task, "copilot", "img", &task.path, vec![], &env, &extras, false, &[], &[], "pty-forge003", "copilot", &default_shared_config_dirs(), None)
         });
         let gh: Vec<&Mount> = spec.mounts.iter().filter(|m| m.container == "/root/.config/gh").collect();
         assert_eq!(gh.len(), 1, "exactly one mount per container path: {gh:?}");
@@ -2427,7 +2548,7 @@ mod tests {
         let task = stub_task("t-clip", "/tmp/termic-docker-test-does-not-exist-clip");
         let env = std::collections::HashMap::new();
         with_scratch_data_dir(|| {
-            let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-clip0001", "claude", &[]);
+            let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-clip0001", "claude", &[], None);
             let att = spec.mounts.iter().find(|m| m.host.ends_with("termic-attachments"))
                 .expect("the attachments dir should be mounted");
             assert_eq!(att.host, att.container, "same path both sides or the typed path is a lie");
@@ -2458,7 +2579,7 @@ mod tests {
             String::new(),           // inert
         ];
         with_scratch_data_dir(|| {
-            let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-shared01", "claude", &dirs);
+            let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-shared01", "claude", &dirs, None);
             let nvim = spec.mounts.iter().find(|m| m.container == "/root/.config/nvim")
                 .expect("a shared dir the user listed should be mounted");
             // Host layout mirrors the container path, so two entries with the
@@ -2471,7 +2592,7 @@ mod tests {
             assert!(!spec.mounts.iter().any(|m| m.container.contains("escape") || m.container == "/etc"));
             // And an empty list is a real answer: gh/glab are a DEFAULT, not
             // a floor, so a user who clears the field gets no shared mounts.
-            let none = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-shared02", "claude", &[]);
+            let none = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-shared02", "claude", &[], None);
             // The git identity file (step 4d) also lands under `/root/.config`
             // and is not a shared config dir: it is mounted for every task
             // regardless of this list, so it is exempt from the check.
@@ -2490,7 +2611,7 @@ mod tests {
         let env = std::collections::HashMap::new();
         let dirs = vec!["/opt/forge/gh".to_string()];
         with_scratch_data_dir(|| {
-            let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-shared03", "claude", &dirs);
+            let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &[], "pty-shared03", "claude", &dirs, None);
             assert!(spec.mounts.iter().any(|m| m.container == "/opt/forge/gh"));
             assert!(spec.env.iter().any(|(k, v)| k == "GH_CONFIG_DIR" && v == "/opt/forge/gh"));
         });
@@ -2502,7 +2623,7 @@ mod tests {
         let env = std::collections::HashMap::new();
         let extras = vec!["/tmp/whatever:/root/.config/gh".to_string()];
         let spec = with_scratch_data_dir(|| {
-            build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &extras, "pty-forge004", "claude", &default_shared_config_dirs())
+            build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &extras, "pty-forge004", "claude", &default_shared_config_dirs(), None)
         });
         let gh: Vec<&str> = spec.mounts.iter().filter(|m| m.container == "/root/.config/gh").map(|m| m.host.as_str()).collect();
         assert_eq!(gh.len(), 1, "{gh:?}");
@@ -2519,7 +2640,7 @@ mod tests {
             "/etc:/data/unsafe".to_string(),    // denylisted host isn't the point; container is fine, host stays as-is
             "not-an-entry".to_string(),         // malformed - dropped
         ];
-        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &extras, "pty-aaaa1111", "claude", &[]);
+        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &extras, "pty-aaaa1111", "claude", &[], None);
         let containers: Vec<&str> = spec.mounts.iter().map(|m| m.container.as_str()).collect();
         assert_eq!(containers.iter().filter(|c| **c == "/data/mcp").count(), 1, "{containers:?}");
         let mcp_mount = spec.mounts.iter().find(|m| m.container == "/data/mcp").unwrap();
@@ -2531,7 +2652,7 @@ mod tests {
         let task = stub_task("t12", "/tmp/termic-docker-test-does-not-exist-12");
         let env = std::collections::HashMap::new();
         let extras = vec!["/tmp/whatever:/root/.claude".to_string()];
-        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &extras, "pty-aaaa1111", "claude", &[]);
+        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &[], &extras, "pty-aaaa1111", "claude", &[], None);
         let claude_mounts: Vec<&str> = spec
             .mounts
             .iter()
@@ -2549,7 +2670,7 @@ mod tests {
         let task = stub_task("t5", "/tmp/termic-docker-test-does-not-exist-5");
         let env = std::collections::HashMap::new();
         let extras = vec![".mytool".to_string(), "../escape".to_string(), "/etc".to_string()];
-        let spec = build_spec(&task, "copilot", "img", &task.path, vec![], &env, &extras, false, &[], &[], "pty-aaaa1111", "copilot", &[]);
+        let spec = build_spec(&task, "copilot", "img", &task.path, vec![], &env, &extras, false, &[], &[], "pty-aaaa1111", "copilot", &[], None);
         let mounted: Vec<&str> = spec.mounts.iter().map(|m| m.container.as_str()).collect();
         assert!(mounted.contains(&"/root/.copilot"), "{mounted:?}");
         assert!(mounted.contains(&"/root/.mytool"), "{mounted:?}");
@@ -2566,7 +2687,7 @@ mod tests {
         let task = stub_task("t6", "/tmp/termic-docker-test-does-not-exist-6");
         let env = std::collections::HashMap::new();
         let extras = vec![".grok".to_string()];
-        let spec = build_spec(&task, "grok", "img", &task.path, vec![], &env, &extras, true, &[], &[], "pty-aaaa1111", "grok", &[]);
+        let spec = build_spec(&task, "grok", "img", &task.path, vec![], &env, &extras, true, &[], &[], "pty-aaaa1111", "grok", &[], None);
         assert!(!spec.mounts.iter().any(|m| m.container.contains("grok")));
         assert!(!persist_offerable("grok"));
     }
@@ -2578,13 +2699,13 @@ mod tests {
         let extras = vec![".mytool".to_string()];
         // Off by default: an unrecognized agent id with extras configured
         // but the opt-in switch still off mounts nothing at all.
-        let off = build_spec(&task, "my-custom-agent", "img", &task.path, vec![], &env, &extras, false, &[], &[], "pty-aaaa1111", "my-custom-agent", &[]);
+        let off = build_spec(&task, "my-custom-agent", "img", &task.path, vec![], &env, &extras, false, &[], &[], "pty-aaaa1111", "my-custom-agent", &[], None);
         assert!(off.mounts.iter().all(|m| !m.container.contains("mytool")));
 
         // Once opted in, the user's own dirs become the mount (there is no
         // confirmed built-in dir to fall back on for an agent this module
         // has never seen).
-        let on = build_spec(&task, "my-custom-agent", "img", &task.path, vec![], &env, &extras, true, &[], &[], "pty-aaaa1111", "my-custom-agent", &[]);
+        let on = build_spec(&task, "my-custom-agent", "img", &task.path, vec![], &env, &extras, true, &[], &[], "pty-aaaa1111", "my-custom-agent", &[], None);
         let mounted: Vec<&str> = on.mounts.iter().map(|m| m.container.as_str()).collect();
         assert!(mounted.contains(&"/root/.mytool"), "{mounted:?}");
     }
@@ -2593,7 +2714,7 @@ mod tests {
     fn custom_agent_persist_enabled_with_no_dirs_mounts_nothing() {
         let task = stub_task("t8", "/tmp/termic-docker-test-does-not-exist-8");
         let env = std::collections::HashMap::new();
-        let spec = build_spec(&task, "my-custom-agent", "img", &task.path, vec![], &env, &[], true, &[], &[], "pty-aaaa1111", "my-custom-agent", &[]);
+        let spec = build_spec(&task, "my-custom-agent", "img", &task.path, vec![], &env, &[], true, &[], &[], "pty-aaaa1111", "my-custom-agent", &[], None);
         // Only the always-there worktree/.git mounts - no agent config dir.
         assert!(spec.mounts.iter().all(|m| !m.why.contains("Docker agent")));
     }
@@ -2611,7 +2732,7 @@ mod tests {
         let task = stub_task("t9", "/tmp/termic-docker-test-does-not-exist-9");
         let env = std::collections::HashMap::new();
         let allowed = vec![shared_path.clone()];
-        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &allowed, &[], "pty-aaaa1111", "claude", &[]);
+        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &allowed, &[], "pty-aaaa1111", "claude", &[], None);
         let mounted: Vec<String> = spec.mounts.iter().map(|m| m.container.clone()).collect();
         let canon = canonicalize_or_keep(&shared_path);
         assert!(mounted.contains(&canon), "{mounted:?}");
@@ -2637,7 +2758,7 @@ mod tests {
 
     fn spec_for(task: &Task, env: &std::collections::HashMap<String, String>) -> DockerSpec {
         build_spec(task, "claude", "img", &task.path, vec![], env, &[], false, &[], &[],
-            "pty-gitid001", "claude", &[])
+            "pty-gitid001", "claude", &[], None)
     }
 
     #[test]
@@ -2876,7 +2997,7 @@ mod tests {
         let task = stub_task("t9b", "/tmp/termic-docker-test-does-not-exist-9b");
         let env = std::collections::HashMap::new();
         let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false,
-            &[gone.to_string()], &[], "pty-aaaa1111", "claude", &[]);
+            &[gone.to_string()], &[], "pty-aaaa1111", "claude", &[], None);
         assert!(!spec.mounts.iter().any(|m| m.host == gone),
             "a vanished allow-list entry must not become a -v flag");
     }
@@ -2888,7 +3009,7 @@ mod tests {
         // A regex: entry (Seatbelt-only, no literal path) and the task's own
         // path (already mounted implicitly as step 1) should both be no-ops.
         let allowed = vec!["regex:^$HOME/\\.foo$".to_string(), task.path.clone()];
-        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &allowed, &[], "pty-aaaa1111", "claude", &[]);
+        let spec = build_spec(&task, "claude", "img", &task.path, vec![], &env, &[], false, &allowed, &[], "pty-aaaa1111", "claude", &[], None);
         let host_paths: Vec<&str> = spec.mounts.iter().map(|m| m.host.as_str()).collect();
         // No stray mount was added for either entry - just the one implicit
         // worktree mount already covering task.path.
