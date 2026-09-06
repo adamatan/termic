@@ -23,8 +23,21 @@ export const ACCENTS: { key: string; label: string; css: string }[] = [
 export const accentCss = (key: string | undefined): string | undefined =>
   ACCENTS.find(c => c.key === key)?.css;
 
+/** Is this stored accent a literal colour rather than a palette key?
+ *
+ *  Profiles may carry a hex the user picked, so the stored value is either a
+ *  key from the table above or `#rgb` / `#rrggbb` / `#rrggbbaa`. Checked by
+ *  shape rather than trusted: it is written straight into a `backgroundColor`,
+ *  and a value that is neither has to fall back rather than paint nothing.
+ *
+ *  A user-chosen hex in `profiles.json` is DATA, not a hardcoded style, so it
+ *  does not conflict with the rule against hex outside `@theme`: that rule is
+ *  about the app's own colours, which still all come from tokens. */
+export const isHexAccent = (v: string | undefined): boolean =>
+  !!v && /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(v);
+
 /** Profiles always render an accent (the strip is tinted by it), so they need
  *  a fallback where groups fall back to "no styling". */
 export const PROFILE_ACCENT_FALLBACK = "var(--color-fg-faint)";
 export const profileAccentCss = (key: string | undefined): string =>
-  accentCss(key) ?? PROFILE_ACCENT_FALLBACK;
+  (isHexAccent(key) ? key : accentCss(key)) ?? PROFILE_ACCENT_FALLBACK;

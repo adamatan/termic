@@ -24,40 +24,11 @@ import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { profileCreate, profileOpen, profileSeededTasksPath } from "@/lib/ipc";
-import { ACCENTS, profileAccentCss } from "@/lib/accents";
+import { profileAccentCss } from "@/lib/accents";
+import { AccentDots } from "@/components/ui/AccentDots";
 import { monogram } from "@/components/sidebar/ProfileStrip";
 import { cn } from "@/lib/utils";
 
-function AccentPicker({ value, onChange, idPrefix }: {
-  value: string;
-  onChange: (k: string) => void;
-  /** Scopes the swatch test ids. The dialog renders TWO pickers (the existing
-   *  profile and the new one) and identical ids meant a spec silently drove
-   *  the first, colouring the wrong profile while still passing. */
-  idPrefix: string;
-}) {
-  return (
-    <div className="flex flex-wrap gap-1.5">
-      {ACCENTS.map(a => (
-        <button
-          key={a.key}
-          type="button"
-          aria-label={a.label}
-          aria-pressed={value === a.key}
-          data-testid={`${idPrefix}-accent-${a.key}`}
-          onClick={() => onChange(a.key)}
-          className={cn(
-            "h-6 w-6 rounded-md border transition-transform",
-            value === a.key
-              ? "scale-110 border-[var(--color-fg)]"
-              : "border-transparent hover:scale-105",
-          )}
-          style={{ backgroundColor: a.css }}
-        />
-      ))}
-    </div>
-  );
-}
 
 export function NewProfileDialog() {
   const open = useUI(s => s.newProfileOpen);
@@ -152,7 +123,7 @@ export function NewProfileDialog() {
                 className="flex-1"
               />
             </div>
-            <div className="mt-2"><AccentPicker value={existingAccent} onChange={setExistingAccent} idPrefix="existing" /></div>
+            <div className="mt-2"><AccentDots value={existingAccent} onChange={setExistingAccent} idPrefix="existing" /></div>
           </div>
         )}
 
@@ -174,7 +145,7 @@ export function NewProfileDialog() {
               className="flex-1"
             />
           </div>
-          <div className="mt-2"><AccentPicker value={accent} onChange={setAccent} idPrefix="new" /></div>
+          <div className="mt-2"><AccentDots value={accent} onChange={setAccent} idPrefix="new" /></div>
         </div>
 
         <div>

@@ -106,3 +106,36 @@ describe("monogram", () => {
     expect(monogram("")).toBe("?");
   });
 });
+
+describe("profile accents", () => {
+  it("resolves a palette key to its theme token", async () => {
+    const { profileAccentCss } = await import("@/lib/accents");
+    expect(profileAccentCss("blue")).toBe("var(--color-palette-blue)");
+  });
+
+  it("passes a user-chosen hex straight through", async () => {
+    // Profiles may carry a literal colour the user picked. That is DATA in
+    // profiles.json, not a hardcoded style, so it does not conflict with the
+    // rule keeping the app's own colours in @theme.
+    const { profileAccentCss } = await import("@/lib/accents");
+    expect(profileAccentCss("#ff8800")).toBe("#ff8800");
+    expect(profileAccentCss("#f80")).toBe("#f80");
+    expect(profileAccentCss("#FF8800AA")).toBe("#FF8800AA");
+  });
+
+  it("falls back rather than painting nothing for a value that is neither", async () => {
+    // A hand-edited profiles.json, or a palette entry removed in a future
+    // version. The tile still has to render.
+    const { profileAccentCss, PROFILE_ACCENT_FALLBACK } = await import("@/lib/accents");
+    for (const bad of ["nope", "#12", "rgb(1,2,3)", "red; background:url(x)", "", undefined]) {
+      expect(profileAccentCss(bad as string | undefined)).toBe(PROFILE_ACCENT_FALLBACK);
+    }
+  });
+
+  it("tells a hex apart from a key", async () => {
+    const { isHexAccent } = await import("@/lib/accents");
+    expect(isHexAccent("#abc")).toBe(true);
+    expect(isHexAccent("blue")).toBe(false);
+    expect(isHexAccent("#abcd")).toBe(false);
+  });
+});

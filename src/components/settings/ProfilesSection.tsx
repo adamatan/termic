@@ -12,7 +12,8 @@ import { useProfiles } from "@/store/profiles";
 import { useUI } from "@/store/ui";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { ACCENTS, profileAccentCss } from "@/lib/accents";
+import { profileAccentCss } from "@/lib/accents";
+import { AccentDots } from "@/components/ui/AccentDots";
 import { profileOpen, profileUpdate, profilesDisable } from "@/lib/ipc";
 import { monogram } from "@/components/sidebar/ProfileStrip";
 import { cn } from "@/lib/utils";
@@ -140,21 +141,12 @@ function ProfileRow({ slug, name, accent, isCurrent, isOpen, onChanged, onDelete
           data-testid={`profile-name-${slug}`}
           className="h-7"
         />
-        <div className="mt-1.5 flex gap-1">
-          {ACCENTS.map(a => (
-            <button
-              key={a.key}
-              type="button"
-              aria-label={a.label}
-              aria-pressed={a.key === accent}
-              onClick={() => void profileUpdate(slug, undefined, a.key).then(onChanged).catch(() => {})}
-              className={cn(
-                "h-4 w-4 rounded border transition-transform",
-                a.key === accent ? "scale-110 border-[var(--color-fg)]" : "border-transparent hover:scale-105",
-              )}
-              style={{ backgroundColor: a.css }}
-            />
-          ))}
+        <div className="mt-1.5">
+          <AccentDots
+            value={accent}
+            idPrefix={`profile-${slug}`}
+            onChange={next => void profileUpdate(slug, undefined, next).then(onChanged).catch(() => {})}
+          />
         </div>
         {/* The slug is frozen and visible on purpose: it names the folders on
             disk, so someone looking for their worktrees can find them. */}

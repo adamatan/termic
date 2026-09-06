@@ -129,6 +129,14 @@ describe("profiles", () => {
     await setInput('[data-testid="existing-profile-name"]', "Personal");
     await setInput('[data-testid="new-profile-name"]', "Work");
     await clickWhenVisible('[data-testid="new-accent-orange"]');
+    // The dots carry selection with a ring, matching the sidebar's group
+    // colours. Assert the RING, since that is the whole signal: a dot with no
+    // ring and a dot with one are otherwise identical.
+    const ringed = await browser.execute(() => {
+      const el = document.querySelector('[data-testid="new-accent-orange"] span') as HTMLElement;
+      return getComputedStyle(el).boxShadow !== "none";
+    });
+    expect(ringed).toBe(true);
     await snap("profiles-04-wizard-filled.png");
 
     // Create opens the new profile's WINDOW, so hand the suite back its own
