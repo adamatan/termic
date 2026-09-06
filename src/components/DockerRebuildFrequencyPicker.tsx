@@ -23,7 +23,7 @@ export function DockerRebuildFrequencyPicker({ value, onChange }: {
             type="button"
             onClick={() => onChange(f.id)}
             className={cn(
-              "rounded-md border px-2 py-1.5 text-[12px] font-medium transition-colors",
+              "rounded-md border px-2 py-1.5 text-[12px] font-medium transition-[color,background-color]",
               active
                 ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10 text-[var(--color-fg)]"
                 : "border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-fg-dim)] hover:border-[var(--color-accent-soft)]",

@@ -27,13 +27,16 @@ import { PopoverRoot, PopoverTrigger, PopoverContent } from "@/components/ui/Pop
 import { profileAccentCss } from "@/lib/accents";
 import { cn } from "@/lib/utils";
 
-/** A readable monogram for the compact rail, where there is no room for a
- *  name. First letter of each of the first two words, so "Side Project" reads
- *  SP rather than SI. */
+/** A readable monogram for the accent tile.
+ *
+ *  One letter per WORD, capped at two: "Personal" is P, "Side Project" is SP.
+ *  Deliberately not the first two letters of a single word, which gave PE and
+ *  WO and read like ticker symbols rather than the avatar every browser's
+ *  profile switcher uses. */
 export function monogram(name: string): string {
   const words = name.trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) return "?";
-  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  if (words.length === 1) return words[0][0].toUpperCase();
   return (words[0][0] + words[1][0]).toUpperCase();
 }
 

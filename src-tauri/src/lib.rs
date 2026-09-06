@@ -3882,6 +3882,24 @@ fn registry_add_profile(
     Ok(slug)
 }
 
+/// The tasks path a profile called `name` WOULD be seeded with, and the slug
+/// it would get.
+///
+/// Exists so the New Profile dialog can preview both without reimplementing
+/// them. It used to hardcode `~/termic/profiles/<slug>/tasks` in TypeScript,
+/// which is wrong in every debug build (`APP_DIR` is `termic_dev` there) and
+/// was shown to the user as a statement of fact, and it carried a second copy
+/// of `slugify` that could drift from the one that actually decides.
+#[tauri::command]
+fn profile_seeded_tasks_path(name: String) -> (String, String) {
+    let reg = profiles_registry();
+    let taken: std::collections::HashSet<String> =
+        reg.profiles.iter().map(|p| p.slug.clone()).collect();
+    let slug = profiles::slugify(&name, &taken);
+    let path = builtin_profile_tasks_path(&slug);
+    (slug, path)
+}
+
 #[tauri::command]
 fn profile_create(app: AppHandle, args: CreateProfileArgs) -> Result<ProfileView, String> {
     let g = global_dir().map_err(|e| e.to_string())?;
@@ -20111,7 +20129,7 @@ pub fn run() {
             agent_usage::agent_usage_codex,
             perf_boot_elapsed_ms,
             deep_link_take_pending,
-            profiles_list, profiles_disable, profile_create, profile_close, profile_update, profile_open, profile_delete_preview, profile_delete,
+            profiles_list, profiles_disable, profile_create, profile_close, profile_seeded_tasks_path, profile_update, profile_open, profile_delete_preview, profile_delete,
             projects_list, project_add, project_add_multi, project_set_members, project_update, project_remove, project_reorder, project_set_group,
             tasks_list, task_create, task_create_multi, task_open_repo, task_importable_worktrees, task_import_worktree, task_archive, task_set_cli, task_set_custom_command, task_set_resume_override, task_set_sandbox, task_set_docker, task_set_yolo,
             sandbox_available, sandbox_deny_counts, sandbox_recent_denied_hosts, sandbox_recent_denied_paths, sandbox_access_counts, sandbox_recent_access_hosts, sandbox_recent_access_paths, sandbox_set_monitor_filters, task_sandbox_add_allowed_host, task_sandbox_add_allowed_path, task_sandbox_remove_allowed_path, agent_sandbox_add_allowed_path, agent_sandbox_add_allowed_host, task_recent_denials,

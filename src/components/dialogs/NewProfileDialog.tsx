@@ -17,26 +17,25 @@
 // discovery against the new tasks path and a profile with no projects is a
 // legitimate end state.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useUI } from "@/store/ui";
 import { useProfiles } from "@/store/profiles";
 import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { profileCreate, profileOpen } from "@/lib/ipc";
+import { profileCreate, profileOpen, profileSeededTasksPath } from "@/lib/ipc";
 import { ACCENTS, profileAccentCss } from "@/lib/accents";
 import { monogram } from "@/components/sidebar/ProfileStrip";
 import { cn } from "@/lib/utils";
 
-/** Mirrors Rust's `profiles::slugify` closely enough to PREVIEW the paths.
- *  Rust remains authoritative (it dedupes against the registry), so this is
- *  deliberately not exported or reused for anything that decides. */
-export function previewSlug(name: string): string {
-  const s = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return s.slice(0, 48).replace(/^-+|-+$/g, "") || "profile";
-}
-
-function AccentPicker({ value, onChange }: { value: string; onChange: (k: string) => void }) {
+function AccentPicker({ value, onChange, idPrefix }: {
+  value: string;
+  onChange: (k: string) => void;
+  /** Scopes the swatch test ids. The dialog renders TWO pickers (the existing
+   *  profile and the new one) and identical ids meant a spec silently drove
+   *  the first, colouring the wrong profile while still passing. */
+  idPrefix: string;
+}) {
   return (
     <div className="flex flex-wrap gap-1.5">
       {ACCENTS.map(a => (
@@ -45,7 +44,7 @@ function AccentPicker({ value, onChange }: { value: string; onChange: (k: string
           type="button"
           aria-label={a.label}
           aria-pressed={value === a.key}
-          data-testid={`accent-${a.key}`}
+          data-testid={`${idPrefix}-accent-${a.key}`}
           onClick={() => onChange(a.key)}
           className={cn(
             "h-6 w-6 rounded-md border transition-transform",
@@ -86,8 +85,19 @@ export function NewProfileDialog() {
     setTasksPath(""); setErr(null); setBusy(false);
   }, [open]);
 
-  const slug = useMemo(() => previewSlug(name), [name]);
-  const seededPath = `~/termic/profiles/${slug}/tasks`;
+  // Asked, never derived. The dialog states this path as a fact ("Leave empty
+  // for ..."), and a second copy of slugify plus a hardcoded app dir made it
+  // wrong in dev builds and liable to drift in release ones.
+  const [seededPath, setSeededPath] = useState("");
+  useEffect(() => {
+    const n = name.trim();
+    if (!n) { setSeededPath(""); return; }
+    let live = true;
+    void profileSeededTasksPath(n)
+      .then(([, path]) => { if (live) setSeededPath(path); })
+      .catch(() => { /* preview only: an empty placeholder beats a wrong one */ });
+    return () => { live = false; };
+  }, [name]);
   const canCreate = name.trim().length > 0 && (!isFirst || existingName.trim().length > 0) && !busy;
 
   const create = async () => {
@@ -142,7 +152,7 @@ export function NewProfileDialog() {
                 className="flex-1"
               />
             </div>
-            <div className="mt-2"><AccentPicker value={existingAccent} onChange={setExistingAccent} /></div>
+            <div className="mt-2"><AccentPicker value={existingAccent} onChange={setExistingAccent} idPrefix="existing" /></div>
           </div>
         )}
 
@@ -164,7 +174,7 @@ export function NewProfileDialog() {
               className="flex-1"
             />
           </div>
-          <div className="mt-2"><AccentPicker value={accent} onChange={setAccent} /></div>
+          <div className="mt-2"><AccentPicker value={accent} onChange={setAccent} idPrefix="new" /></div>
         </div>
 
         <div>
@@ -176,8 +186,8 @@ export function NewProfileDialog() {
             data-testid="new-profile-tasks-path"
           />
           <p className="mt-1 text-[11.5px] text-[var(--color-fg-faint)]">
-            Where this profile's worktrees are created. Leave empty for{" "}
-            <code className="mono">{seededPath}</code>.
+            Where this profile's worktrees are created.
+            {seededPath && <> Leave empty for <code className="mono">{seededPath}</code>.</>}
           </p>
         </div>
 

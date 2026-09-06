@@ -259,3 +259,28 @@ profiles.
 Preferences (theme, fonts, terminal/editor settings, shortcut bindings) are
 deliberately NOT scoped: they are machine-level, and muscle memory does not
 change per identity.
+
+## `transition-colors` freezes a themed border-color change (WKWebView)
+
+A selected/unselected control that swaps `border-[var(--color-a)]` for
+`border-[var(--color-b)]` from React state, on an element that also carries
+`transition-colors`, **never repaints the border**. The class list swaps, the
+`aria-checked` attribute swaps, `getComputedStyle().borderTopColor` keeps
+returning the OLD colour, and it never settles: polling for five seconds does
+not help. The visible symptom is a radio group where the filled dot moves and
+the highlight box does not, so two options look selected at once.
+
+Verified both directions in `e2e/specs/profiles.e2e.ts` (delete-profile
+dialog): removing `transition-colors` fixes it, putting it back reproduces it.
+WKWebView is the only renderer termic ships on, so "it works in Chrome" is not
+a defence.
+
+**Use `transition-[color,background-color]`** when a themed border colour can
+change. That is what `transition-colors` was wanted for anyway; it just also
+covers `border-color`, which is the broken one.
+
+This is easy to miss in review because the JSX is obviously correct, and easy
+to miss in tests because `aria-checked` (the thing a spec naturally asserts) is
+right. It took a screenshot to notice and a computed-style assertion to prove.
+Assert the painted colour, not the attribute, wherever selection is carried by
+colour alone.

@@ -40,7 +40,14 @@ function Choice({ checked, onSelect, title, detail, testid }: {
       data-testid={testid}
       onClick={onSelect}
       className={cn(
-        "flex w-full gap-2.5 rounded-lg border p-3 text-left transition-colors",
+                // `transition-[color,background-color]`, NOT `transition-colors`.
+        // The latter also transitions BORDER-COLOR, and in WKWebView a
+        // border-color change between two `var()` values never repaints when
+        // it is transitioned: the class swaps, aria-checked swaps, and the
+        // painted border stays on the option you deselected. Verified both
+        // ways in profiles.e2e.ts, which polls for 5s and then asserts the
+        // colour actually moved.
+        "flex w-full gap-2.5 rounded-lg border p-3 text-left transition-[color,background-color]",
         checked
           ? "border-[var(--color-accent)] bg-[var(--color-bg-2)]"
           : "border-[var(--color-border-soft)] hover:bg-[var(--color-bg-2)]",

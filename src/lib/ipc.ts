@@ -46,6 +46,11 @@ export const profileOpen = (slug: string) => invoke<void>("profile_open", { slug
 /** Close a profile's window. Deleting is refused while it is open, and "go
  *  find that window" is a poor instruction when it may be on another Space. */
 export const profileClose = (slug: string) => invoke<void>("profile_close", { slug });
+/** `[slug, tasksPath]` a profile called `name` would be seeded with. Asked
+ *  rather than derived: the app dir differs between debug and release builds,
+ *  and slugify has to be the one Rust actually applies. */
+export const profileSeededTasksPath = (name: string) =>
+  invoke<[string, string]>("profile_seeded_tasks_path", { name });
 export const profileDeletePreview = (slug: string) =>
   invoke<ProfileDeletePreview>("profile_delete_preview", { slug });
 export const profileDelete = (slug: string, deleteWorktrees: boolean) =>

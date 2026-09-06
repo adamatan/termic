@@ -23,6 +23,24 @@ import {
 
 const registryPath = path.join(dataDir, "profiles.json");
 
+/** Type into a CONTROLLED React input.
+ *
+ *  `setValue` alone does not reach React: it writes the DOM property behind
+ *  React's own value tracker, so the synthetic change event it fires is
+ *  swallowed as a no-op and the component keeps its old state. Going through
+ *  the prototype setter is what makes React see a real edit. */
+async function setInput(selector: string, value: string): Promise<void> {
+  await browser.execute((sel, val) => {
+    const el = document.querySelector(sel) as HTMLInputElement | null;
+    if (!el) throw new Error("no input at " + sel);
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, "value",
+    )?.set;
+    setter?.call(el, val);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }, selector, value);
+}
+
 /** Return to the dormant state whatever the body left behind, WITHOUT
  *  touching the root profile's data (which is the shared fixture).
  *
@@ -72,6 +90,19 @@ describe("profiles", () => {
     // The footer's entry point IS there, though: it is the whole surface
     // until the first profile is created.
     await waitVisible('[data-testid="footer-profiles"]');
+    await snap("profiles-01-footer-dormant.png");
+  });
+
+  it("offers the first profile from Settings, which is the only route in", async () => {
+    // Drives the real page rather than asserting the store: this is the one
+    // surface a user with no profiles can find, so it has to be reachable and
+    // has to explain itself.
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings("profiles"));
+    await waitForText("You have one setup, and no profiles yet.");
+    await waitVisible('[data-testid="profiles-create-first"]');
+    await snap("profiles-02-settings-empty.png");
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings?.());
+    await dismissOverlays();
   });
 
   it("has dropped Add project from the footer, which the PROJECTS header owns", async () => {
@@ -86,19 +117,51 @@ describe("profiles", () => {
     expect(inHeader).toBe(true);
   });
 
-  it("names the existing install when the first profile is created", async () => {
-    // Creating the FIRST profile turns the current setup into "a profile" and
-    // it needs a name at that moment, or the strip reads Default forever.
+  it("creates the first profile through the wizard, naming the existing one too", async () => {
+    // Driven through the real dialog: the FIRST create is the moment the
+    // current setup becomes "a profile", so the wizard has to ask for both
+    // names or the strip reads Default forever.
+    await browser.execute(() => window.__termic!.useUI.getState().openNewProfile());
+    await waitVisible('[data-testid="new-profile-dialog"]');
+    await waitVisible('[data-testid="existing-profile-name"]');
+    await snap("profiles-03-wizard-first.png");
+
+    await setInput('[data-testid="existing-profile-name"]', "Personal");
+    await setInput('[data-testid="new-profile-name"]', "Work");
+    await clickWhenVisible('[data-testid="new-accent-orange"]');
+    await snap("profiles-04-wizard-filled.png");
+
+    // Create opens the new profile's WINDOW, so hand the suite back its own
+    // before anything else runs.
+    const main = await browser.getWindowHandle();
+    const before = (await browser.getWindowHandles()).length;
+    await clickWhenVisible('[data-testid="new-profile-create"]');
+    await browser.waitUntil(
+      async () => (await browser.getWindowHandles()).length > before,
+      { timeout: 25_000, timeoutMsg: "creating a profile did not open its window" },
+    );
+    await browser.switchToWindow(main);
+    await browser.execute(async () => {
+      await window.__termic!.invoke("profile_close", { slug: "work" });
+      await window.__termic!.useProfiles.getState().refresh();
+    });
+    await browser.waitUntil(
+      async () => (await browser.getWindowHandles()).length === before,
+      { timeout: 20_000, timeoutMsg: "the new profile's window did not close" },
+    );
+    await waitForAppShell();
+
     const view = await browser.execute(async () => {
       const t = window.__termic!;
-      await t.invoke("profile_create", {
-        args: { name: "Work", accent: "orange", existingName: "Personal", existingAccent: "teal" },
-      });
       await t.useProfiles.getState().refresh();
       return t.invoke("profiles_list");
     });
     const names = (view.profiles as any[]).map(p => p.name).sort();
     expect(names).toEqual(["Personal", "Work"]);
+    // The accent has to land on the profile whose picker was clicked. Both
+    // pickers used to carry the same test ids, so this passed while colouring
+    // the other profile; the ids are scoped now and this is what pins it.
+    expect((view.profiles as any[]).find(p => p.slug === "work").accent).toBe("orange");
     // The existing install owns the ROOT data dir, so nothing had to move.
     const root = (view.profiles as any[]).find(p => p.is_root);
     expect(root.name).toBe("Personal");
@@ -122,6 +185,7 @@ describe("profiles", () => {
     await clickWhenVisible('[data-testid="profile-strip"]');
     await waitVisible('[data-testid="profile-row-work"]');
     await waitVisible('[data-testid="profile-row-personal"]');
+    await snap("profiles-06-switcher.png");
     await browser.keys(["Escape"]);
     await waitGone('[data-testid="profile-row-work"]');
   });
@@ -201,6 +265,80 @@ describe("profiles", () => {
     );
     expect(await browser.getWindowHandle()).toBe(main);
     await waitForAppShell();
+  });
+
+  it("manages both profiles from Settings", async () => {
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings("profiles"));
+    await waitVisible('[data-testid="profile-settings-row-personal"]');
+    await waitVisible('[data-testid="profile-settings-row-work"]');
+    await snap("profiles-07-settings-two.png");
+  });
+
+  it("shows what a delete would touch, in the real dialog", async () => {
+    // The counts are the whole point: they make this a decision rather than a
+    // leap. Driven through the dialog so the copy is exercised too.
+    await clickWhenVisible('[data-testid="profile-delete-work"]');
+    await waitVisible('[data-testid="delete-profile-dialog"]');
+    await waitVisible('[data-testid="delete-profile-counts"]');
+    // The safe option is preselected, and the destructive one is a deliberate
+    // second click.
+    await waitVisible('[data-testid="delete-profile-keep"]');
+    await snap("profiles-08-delete-keep.png");
+
+    // The SELECTED option must be the one that looks selected. Measured
+    // rather than eyeballed: a radio group whose border and whose dot
+    // disagree is unreadable, and a screenshot at this size cannot settle it.
+    const borders = () => browser.execute(() => {
+      const of = (sel: string) => {
+        const all = [...document.querySelectorAll(sel)] as HTMLElement[];
+        // Read the LAST match, and report the count. Dialogs stack and a
+        // closing one's unmount lags, so `querySelector` can hand back a
+        // stale node from an earlier case in this file (the e2e skill's
+        // rule 5). That is indistinguishable from a real bug: aria-checked
+        // looks correct on one node while the border is read off another.
+        const el = all[all.length - 1];
+        return {
+          count: all.length,
+          border: getComputedStyle(el).borderTopColor,
+          checked: el.getAttribute("aria-checked"),
+        };
+      };
+      return { keep: of('[data-testid="delete-profile-keep"]'),
+               remove: of('[data-testid="delete-profile-remove"]') };
+    });
+
+    const before = await borders();
+    expect(before.keep.count).toBe(1); // more than one delete dialog mounted = stale node
+    expect(before.keep.checked).toBe("true");
+    expect(before.remove.checked).toBe("false");
+    expect(before.keep.border).not.toBe(before.remove.border);
+
+    await clickWhenVisible('[data-testid="delete-profile-remove"]');
+
+    // POLL, do not sample. The option carries `transition-colors`, so a
+    // computed style read in the same frame as the click returns the colour
+    // it is animating AWAY from. Reading once made this look like a bug where
+    // aria-checked moved and the border did not, and the screenshot taken at
+    // the same instant showed the same stale frame.
+    await browser.waitUntil(async () => {
+      const a = await borders();
+      return a.remove.border === before.keep.border
+          && a.keep.border === before.remove.border;
+    }, {
+      timeout: 5_000,
+      timeoutMsg: `the accent border never moved: ${JSON.stringify(await borders())} `
+        + `(started ${JSON.stringify(before)})`,
+    });
+
+    const after = await borders();
+    expect(after.keep.checked).toBe("false");
+    expect(after.remove.checked).toBe("true");
+    await snap("profiles-09-delete-remove.png");
+    // Leave without deleting: the later cases still need this profile.
+    await browser.keys(["Escape"]);
+    await waitGone('[data-testid="delete-profile-dialog"]');
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings?.());
+    await dismissOverlays();
   });
 
   it("refuses to close the window you are driving from", async () => {

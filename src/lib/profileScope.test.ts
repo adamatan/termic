@@ -84,3 +84,25 @@ describe("profileScope", () => {
     // helper has no secret allow-list that would make that subtle.
   });
 });
+
+describe("monogram", () => {
+  it("uses ONE letter for a one-word name, not the first two", async () => {
+    // "PE" and "WO" read like ticker symbols. Every browser's profile
+    // switcher uses a single initial, and the screenshot is what caught it.
+    const { monogram } = await import("@/components/sidebar/ProfileStrip");
+    expect(monogram("Personal")).toBe("P");
+    expect(monogram("Work")).toBe("W");
+  });
+
+  it("uses one letter per word for a multi-word name, capped at two", async () => {
+    const { monogram } = await import("@/components/sidebar/ProfileStrip");
+    expect(monogram("Side Project")).toBe("SP");
+    expect(monogram("a b c")).toBe("AB");
+  });
+
+  it("never renders empty", async () => {
+    const { monogram } = await import("@/components/sidebar/ProfileStrip");
+    expect(monogram("   ")).toBe("?");
+    expect(monogram("")).toBe("?");
+  });
+});
