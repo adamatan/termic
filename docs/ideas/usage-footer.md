@@ -122,13 +122,14 @@ These are why this is still an idea.
   than zero: a user who later opens `~/.claude/settings.json` finds a termic
   script in a slot they did not fill. The install preview says so in as many
   words, which may or may not be enough.
-- **A project-level status line shadows ours, silently.** Measured: a repo's
-  own `.claude/settings.json` statusLine outranks the user-level one termic
-  installs, and termic's OSC never fires, so tasks in that project show no chip
-  while every other project on the same account does. termic must not write
-  into a repo's settings to win that fight, so the fix is to DETECT it and say
-  so, which means reading the task's repo settings per task rather than per
-  agent. Not built.
+- **A project-level status line shadows ours.** Measured: a repo's own
+  `.claude/settings.json` statusLine outranks the user-level one termic
+  installs, and termic's OSC never fires. termic must not write into a repo's
+  settings to win that fight, so it DETECTS the case instead and says so: a
+  `usage n/a` chip naming the file in force, with a prompt to hand to the agent
+  that owns that status line. What is still not built is termic doing the edit
+  itself, and it probably should not: the script can be in any language and
+  only the file knows how it is structured.
 - **Cold start.** The status line only speaks while a turn runs, so the chip is
   absent until a task takes one, which is the opposite of what a footer is for.
   Today it shows nothing, and codex does not have the problem because the RPC

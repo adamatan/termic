@@ -580,6 +580,15 @@ One invocation costs ~12ms wall / ~11.5ms CPU, of which ~9ms is the bare
 `/bin/sh` spawn and drain: the parsing itself is ~2.5ms. Against a turn
 measured in seconds, per turn, that is not a number worth optimising.
 
+**A session that was already running does not pick it up.** Claude reads
+`settings.json` ONCE, at session start, so every tab open at the moment the
+status line is installed keeps running without one and reports no usage for the
+rest of its life. Restarting that tab is the whole fix. Worth knowing before
+debugging anything else, because it presents exactly as "it worked and then it
+stopped": new tasks show a usage chip, the long-lived tab you have had open all
+afternoon never does, and nothing about the install is actually wrong. The same
+is true of the hooks themselves.
+
 **The slot is not termic's.** A config has exactly one `statusLine`, and a user
 who wrote their own looks at it on every turn. `merge_statusline` claims it only
 when it is free or already ours, decided by the command's path prefix, the same
@@ -603,10 +612,30 @@ path into a file that lives IN THE USER'S REPOSITORY and gets committed, which
 is not a trade any footer is worth. The same is true of
 `.claude/settings.local.json`.
 
-The honest gap is that termic does not currently NOTICE. Detecting it means
-reading the task's repo settings per task rather than per agent, and saying so
-somewhere the user will look; worth doing if this feature ships, and tracked in
-docs/ideas/usage-footer.md rather than pretended away here.
+termic DOES notice, which is the part that stops this being a silent hole.
+`status_line_owner` resolves the slot for a task's cwd in claude's real
+precedence order (`.claude/settings.local.json`, then `.claude/settings.json`,
+then the user's own), measured rather than assumed. When something else owns
+it the footer shows a quiet `usage n/a` chip instead of nothing, naming the
+exact file in force, which is not obvious: a local settings file outranks the
+committed one, so the file a user would go and edit is often the wrong one.
+
+Claude ONLY, and only on a POSITIVE detection. It is the only agent whose
+usage arrives through a status line, so the only one that can be shadowed;
+codex is asked directly and cannot hit this. "We know why this will never
+report" is worth showing, "nothing has reported yet" is not, so the ordinary
+empty case still renders nothing at all. The check is also asked only while
+there is nothing to show, so a working feed never pays for it.
+
+The chip offers a PROMPT to copy rather than instructions to follow. The user
+does not have to learn the wire format: they paste it at the agent that owns
+that status line and it makes the edit. `statusLineAgentPrompt` in
+`lib/agentUsage.ts` carries the three rules that decide whether the result
+works or silently does not, and its test pins them: the `TERMIC_PTY` /
+`TERMIC_TASK_ID` guard (which keeps it a no-op for teammates and CI), that
+stdout IS the status line so the sequence must go to the pty and nowhere else,
+and `-` rather than `0` for a missing value, since a zero reports a spent
+limit as unused.
 
 Sources that are NOT this, all measured and all dead: claude's HOOK payloads
 carry no usage field (a real `Stop` payload has `session_id`,

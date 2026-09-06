@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   USAGE_BODY_PREFIX, parseUsageBody, sameUsage, formatPercent, formatReset,
   usageLevel, drivingWindow, USAGE_WARN_PERCENT, USAGE_CRITICAL_PERCENT,
+  blocksUsageFeed, statusLineAgentPrompt, type StatusLineOwner,
 } from "./agentUsage";
 import { HOOK_OSC_BODY, HOOK_OSC_READY_BODY, parseNotifyBody, hookOscHandlerData } from "./agentHooks";
 import { useAgentUsage } from "@/store/agentUsage";
@@ -248,5 +249,40 @@ describe("sameUsage", () => {
     expect(sameUsage(a, { session: null, weekly: null })).toBe(false);
     expect(sameUsage(undefined, undefined)).toBe(true);
     expect(sameUsage(a, undefined)).toBe(false);
+  });
+});
+
+describe("the blocked-feed explanation", () => {
+  const own = (owner: StatusLineOwner["owner"]): StatusLineOwner =>
+    ({ owner, path: "/repo/.claude/settings.json", command: "node ./bar.js" });
+
+  it("only calls the feed blocked when something else owns the slot", () => {
+    // "termic" and "none" both mean the feed can run, and showing "usage n/a"
+    // in either case would be crying wolf on a working setup.
+    expect(blocksUsageFeed(own("termic"))).toBe(false);
+    expect(blocksUsageFeed(own("none"))).toBe(false);
+    expect(blocksUsageFeed(null)).toBe(false);
+    expect(blocksUsageFeed(own("project"))).toBe(true);
+    expect(blocksUsageFeed(own("project-local"))).toBe(true);
+    expect(blocksUsageFeed(own("user"))).toBe(true);
+  });
+
+  it("hands the agent everything it needs, and the rules that make it work", () => {
+    const p = statusLineAgentPrompt(own("project"));
+    // Which file, and what is in it: the user should not have to hunt.
+    expect(p).toContain("/repo/.claude/settings.json");
+    expect(p).toContain("node ./bar.js");
+    // The wire format, exactly as agent_hooks.rs writes it.
+    expect(p).toContain("777;notify;termic;usage");
+    for (const field of ["five_hour", "seven_day", "used_percentage", "resets_at"]) {
+      expect(p).toContain(field);
+    }
+    // The three rules that decide whether the result works or silently does
+    // not: the env guard, stdout being the status line itself, and "-" rather
+    // than 0 for a missing value.
+    expect(p).toContain("TERMIC_PTY");
+    expect(p).toContain("TERMIC_TASK_ID");
+    expect(p).toMatch(/Print NOTHING extra on stdout/i);
+    expect(p).toMatch(/Never substitute 0/i);
   });
 });

@@ -148,3 +148,82 @@ export function drivingWindow(u: AgentUsage): { window: UsageWindow; label: "5h"
   if (!w) return s;
   return w.window.usedPercent > s.window.usedPercent ? w : s;
 }
+
+/** Who owns claude's `statusLine` slot for a given task, from
+ *  `agent_hooks::status_line_owner`. */
+export interface StatusLineOwner {
+  owner: "termic" | "project" | "project-local" | "user" | "none";
+  path: string;
+  command: string;
+}
+
+/** Is this owner one that STOPS termic's usage feed running? */
+export function blocksUsageFeed(o: StatusLineOwner | null): boolean {
+  return !!o && o.owner !== "termic" && o.owner !== "none";
+}
+
+/** One sentence naming what is in the way, in the user's own terms. */
+export function blockedReason(o: StatusLineOwner): string {
+  switch (o.owner) {
+    case "project":
+      return "This project ships its own status line, which takes priority over Termic's.";
+    case "project-local":
+      return "This project has a local status line, which takes priority over Termic's.";
+    case "user":
+      return "You have your own status line, so Termic left it alone.";
+    default:
+      return "";
+  }
+}
+
+/** A prompt to hand to the agent whose status line is in the way.
+ *
+ *  The point is that the user does not have to understand the wire format to
+ *  fix this: they paste this at the agent that owns the script and it does
+ *  the edit. It is written as instructions rather than as a patch because the
+ *  script could be in any language (the reported case was Python behind a
+ *  Node shim), and only the file itself knows how it is structured.
+ *
+ *  Every rule in here is one that makes the difference between working and
+ *  silently not: the env guard is what keeps it a no-op for teammates and CI,
+ *  the "print nothing extra" rule is because stdout IS the status line, and
+ *  the dash convention is what stops a missing field being read as a zero. */
+export function statusLineAgentPrompt(o: StatusLineOwner): string {
+  return `Add Termic plan-usage reporting to the status line script this project uses.
+
+The status line is configured in ${o.path} and runs:
+  ${o.command}
+
+Termic reads Claude's plan usage from the status line, but that slot is taken
+by this script, so Termic currently receives nothing and its usage indicator
+stays empty. Teach this script to report it as well. Do not change what it
+prints.
+
+The script already receives Claude's status line JSON on stdin. From that JSON
+read:
+  rate_limits.five_hour.used_percentage     (0-100)
+  rate_limits.seven_day.used_percentage     (0-100)
+  rate_limits.five_hour.resets_at           (Unix epoch SECONDS)
+  rate_limits.seven_day.resets_at           (Unix epoch SECONDS)
+
+Then, ONLY when both TERMIC_PTY and TERMIC_TASK_ID are set in the environment,
+open the file named by $TERMIC_PTY and write exactly this, with no newline:
+
+  \\033]777;notify;termic;usage <5h> <7d> <5hResetsAt> <7dResetsAt>\\007
+
+for example:
+  \\033]777;notify;termic;usage 58 41 1788530400 1788937200\\007
+
+Rules that matter:
+- Write "-" for any of the four values that is missing or is not a number.
+  Never substitute 0, which would report a limit as unused.
+- Send nothing at all if BOTH percentages are missing.
+- Print NOTHING extra on stdout. Whatever this script prints is what renders in
+  the status line, so the sequence must go to $TERMIC_PTY and nowhere else.
+- Wrap the write so any failure is ignored. A status line that errors is one
+  the user sees fail on every turn.
+- The environment guard is required, not optional: with it, this is a complete
+  no-op for anyone not running under Termic, including teammates and CI.
+
+Keep the existing output and behaviour byte for byte otherwise.`;
+}

@@ -3,7 +3,7 @@
 // expects (camelCase vs snake_case quirks handled here so call-sites stay clean).
 
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentUsage } from "@/lib/agentUsage";
+import type { AgentUsage, StatusLineOwner } from "@/lib/agentUsage";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Project, ProjectMember, Task, CreateTaskArgs, CreateMultiArgs, Settings, DiscoveredRepo,
@@ -234,6 +234,12 @@ export const sandboxAvailable = () => invoke<boolean>("sandbox_available");
  *  be put on a short timer: see docs/ideas/usage-footer.md.
  *
  *  Keyed by agent ENTRY id so a clone is asked about its own login. */
+/** Who owns claude's statusLine slot for a task, and therefore whether
+ *  Termic's usage feed can run at all. A project that ships its own status
+ *  line wins, and we report that rather than fighting it. */
+export const usageStatusLineOwner = (agentId: string, cwd: string) =>
+  invoke<StatusLineOwner>("usage_status_line_owner", { agentId, cwd });
+
 export const agentUsageCodex = (agentId: string, docker: boolean) =>
   invoke<AgentUsage & { planType: string | null; accountId: string | null }>(
     "agent_usage_codex", { agentId, docker });

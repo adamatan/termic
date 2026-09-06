@@ -1379,6 +1379,82 @@ fn command_for(target: &Target, sig: Signal) -> Result<String, String> {
     Ok(format!("{}{}.sh", command_prefix(target)?, sig.stem()))
 }
 
+/// Who actually owns the `statusLine` slot for a task running in `cwd`, and
+/// therefore whether termic's usage feed can run at all.
+///
+/// This exists because the failure is INVISIBLE. A project that ships its own
+/// status line outranks the one termic installs at user level, so termic's
+/// script never executes, no usage OSC is ever written, and the footer simply
+/// shows nothing. Nothing is broken, nothing is logged, and the user is left
+/// to work out why one repo reports usage and another does not. Reported
+/// exactly that way.
+///
+/// Precedence is MEASURED, not assumed (claude 2.1.260): a project's
+/// `.claude/settings.local.json` beats its `.claude/settings.json`, and either
+/// beats the user's own `~/.claude/settings.json`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusLineOwner {
+    /// `termic`, `project`, `project-local`, `user`, or `none`.
+    pub owner: String,
+    /// The settings file that owns it, so the user can go and look.
+    pub path: String,
+    /// The command in that slot, so the message can name what is running.
+    pub command: String,
+}
+
+/// Read a `statusLine.command` out of one settings file, if it has one.
+fn status_line_command(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("statusLine")?
+        .get("command")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Resolve the slot for `cwd`, in claude's precedence order.
+pub fn status_line_owner(agent_id: &str, cwd: &Path) -> StatusLineOwner {
+    let own = |owner: &str, p: &Path, c: String| StatusLineOwner {
+        owner: owner.to_string(),
+        path: p.display().to_string(),
+        command: c,
+    };
+    // Project first, both files, highest precedence first. A status line here
+    // wins even when termic owns the user-level slot, which is the case that
+    // confuses people: the same account reports usage in one repo and not in
+    // another.
+    for (rel, label) in [
+        (".claude/settings.local.json", "project-local"),
+        (".claude/settings.json", "project"),
+    ] {
+        let p = cwd.join(rel);
+        if let Some(c) = status_line_command(&p) {
+            return own(label, &p, c);
+        }
+    }
+    // Then the user's own, which is where termic installs.
+    let target = Target::Host(agent_id.to_string());
+    let Ok(settings) = settings_path(&target) else {
+        return own("none", Path::new(""), String::new());
+    };
+    match status_line_command(&settings) {
+        Some(c) => {
+            let ours = command_prefix(&target)
+                .map(|prefix| c.starts_with(&prefix))
+                .unwrap_or(false);
+            own(if ours { "termic" } else { "user" }, &settings, c)
+        }
+        None => own("none", &settings, String::new()),
+    }
+}
+
+/// Why the usage feed is or is not running for one task.
+#[tauri::command]
+pub fn usage_status_line_owner(agent_id: String, cwd: String) -> StatusLineOwner {
+    status_line_owner(&base_of(&agent_id), Path::new(&cwd))
+}
+
 /// Claim claude's `statusLine`, but ONLY when it is free or already ours.
 ///
 /// There is exactly one such slot per config, and it is not termic's. A user
@@ -2493,6 +2569,49 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         // A note has to SAY the status line is part of this, since the slot is
         // the one thing in that fragment that is not termic's to take.
         assert!(plan.notes.iter().any(|n| n.contains("status line")));
+    }
+
+    /// Precedence, in the order claude actually applies it. Measured on
+    /// 2.1.260 by rendering a marker from each file and seeing which won.
+    #[test]
+    fn a_projects_own_status_line_is_reported_as_the_owner() {
+        let dir = std::env::temp_dir().join(format!("termic-slowner-{}", std::process::id()));
+        let claude = dir.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+
+        // No project status line: the answer comes from the user level, which
+        // in a test profile is whatever that profile has.
+        let bare = status_line_owner("claude", &dir);
+        assert!(bare.owner != "project" && bare.owner != "project-local", "{bare:?}");
+
+        // A committed project status line wins over the user's, which is the
+        // case that made usage silently stop in one repo and not another.
+        std::fs::write(claude.join("settings.json"),
+            r#"{"statusLine":{"type":"command","command":"node ./bar.js"}}"#).unwrap();
+        let proj = status_line_owner("claude", &dir);
+        assert_eq!(proj.owner, "project");
+        assert_eq!(proj.command, "node ./bar.js");
+        assert!(proj.path.ends_with(".claude/settings.json"), "{}", proj.path);
+
+        // settings.local.json outranks settings.json, so it is the honest
+        // answer when both exist: naming the wrong file sends the user to
+        // edit something that is not in force.
+        std::fs::write(claude.join("settings.local.json"),
+            r#"{"statusLine":{"type":"command","command":"my-local-bar"}}"#).unwrap();
+        let local = status_line_owner("claude", &dir);
+        assert_eq!(local.owner, "project-local");
+        assert_eq!(local.command, "my-local-bar");
+
+        // A settings file with no statusLine at all must not claim the slot.
+        std::fs::write(claude.join("settings.local.json"), r#"{"model":"opus"}"#).unwrap();
+        assert_eq!(status_line_owner("claude", &dir).owner, "project");
+
+        // Malformed JSON is somebody else's problem, not a panic and not an
+        // owner: a config we cannot read tells us nothing about the slot.
+        std::fs::write(claude.join("settings.local.json"), "{ not json").unwrap();
+        assert_eq!(status_line_owner("claude", &dir).owner, "project");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

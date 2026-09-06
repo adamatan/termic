@@ -18811,6 +18811,7 @@ pub fn run() {
             agent_hooks::agent_hooks_install,
             agent_hooks::agent_hooks_remove,
             agent_hooks::agent_hooks_sync,
+            agent_hooks::usage_status_line_owner,
             agent_usage::agent_usage_codex,
             perf_boot_elapsed_ms,
             deep_link_take_pending,

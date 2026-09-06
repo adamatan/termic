@@ -3123,7 +3123,7 @@ const captureArmedRef = useRef(false);
 }
 
 export function FooterBar({ task, sandboxWarning }: {
-  task: { id: string; cli?: string; sandbox_enabled?: boolean; sandbox_mode?: SandboxMode; sandbox_allowed_hosts?: string[]; sandbox_rw_paths?: string[]; docker_sandbox_enabled?: boolean };
+  task: { id: string; cli?: string; path?: string; sandbox_enabled?: boolean; sandbox_mode?: SandboxMode; sandbox_allowed_hosts?: string[]; sandbox_rw_paths?: string[]; docker_sandbox_enabled?: boolean };
   sandboxWarning: string | null;
 }) {
   const splitOpen     = useApp(s => !!s.terminalSplit[task.id]);
@@ -3225,7 +3225,7 @@ export function FooterBar({ task, sandboxWarning }: {
             the sandbox status stays pinned as the rightmost item. It self-hides
             until an account has actually reported, so an agent with no usage
             feed costs this row no width at all. */}
-        <UsageChip agentId={task.cli ?? "claude"} docker={!!task.docker_sandbox_enabled} visible={isActiveTask} />
+        <UsageChip agentId={task.cli ?? "claude"} cwd={task.path} docker={!!task.docker_sandbox_enabled} visible={isActiveTask} />
         {mode !== "off" && total > 0 && (
           <DeniedHostsPopover taskId={task.id} cli={task.cli ?? "claude"} count={total} mode={mode} />
         )}

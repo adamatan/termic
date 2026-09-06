@@ -10,16 +10,18 @@
 // pushes them through its status line on every turn, codex is asked over
 // JSON-RPC. See docs/ideas/usage-footer.md.
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { PopoverRoot, PopoverTrigger, PopoverContent } from "@/components/ui/Popover";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
+import { CircleSlash, Copy, Check } from "lucide-react";
 import * as ipc from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import { useAgentUsage, type UsageEntry } from "@/store/agentUsage";
 import {
   formatPercent, formatReset, usageLevel, drivingWindow,
   USAGE_WARN_PERCENT, USAGE_CRITICAL_PERCENT,
-  type UsageLevel, type UsageWindow,
+  blocksUsageFeed, blockedReason, statusLineAgentPrompt,
+  type UsageLevel, type UsageWindow, type StatusLineOwner,
 } from "@/lib/agentUsage";
 import { builtinBaseId, agentDisplayName } from "@/lib/agents";
 import { useApp } from "@/store/app";
@@ -37,9 +39,12 @@ const CODEX_REFRESH_MS = 120_000;
  *  otherwise present last night's number as current. */
 const STALE_AFTER_MS = 15 * 60_000;
 
-export function UsageChip({ agentId, docker, visible }: {
+export function UsageChip({ agentId, cwd, docker, visible }: {
   /** The agent ENTRY id (a clone keeps its own), which is the account key. */
   agentId: string;
+  /** The task's worktree. A project can ship its own status line, which
+   *  outranks the one termic installs, so the answer is per TASK. */
+  cwd?: string;
   /** Is this task caged in Docker? Its codex logs in INSIDE the container, so
    *  its quota belongs to the config dir termic mounts there, not to the
    *  host's `~/.codex`. Reporting the host's would put another account's
@@ -54,7 +59,23 @@ export function UsageChip({ agentId, docker, visible }: {
   const agents = useApp(a => a.agents);
   // A clone of codex runs codex, so the base decides the transport, not the
   // entry id. `docker.rs` documents the same distinction on the Rust side.
-  const isCodex = builtinBaseId(agentId, agents) === "codex";
+  const base = builtinBaseId(agentId, agents);
+  const isCodex = base === "codex";
+
+  // Why the feed cannot run, when it cannot. claude ONLY: it is the only
+  // agent whose usage arrives through a status line, so it is the only one
+  // that can be shadowed by somebody else's. Asked once, and only while there
+  // is nothing to show anyway, so a working feed never pays for it.
+  const [owner, setOwner] = useState<StatusLineOwner | null>(null);
+  const known = !!entry && (!!entry.session || !!entry.weekly);
+  useEffect(() => {
+    if (base !== "claude" || !visible || !cwd || known) { setOwner(null); return; }
+    let cancelled = false;
+    ipc.usageStatusLineOwner(agentId, cwd)
+      .then(o => { if (!cancelled) setOwner(o); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [agentId, base, cwd, visible, known]);
 
   // codex only. claude arrives on its own through the terminal, and asking it
   // as well would spend a request to learn what it already told us.
@@ -85,7 +106,13 @@ export function UsageChip({ agentId, docker, visible }: {
   // Nothing known yet: render nothing at all rather than a placeholder. An
   // account that has not spoken has no honest number to show, and a row of
   // dashes in the footer reads as a broken feature rather than a quiet one.
-  if (!entry || (!entry.session && !entry.weekly)) return null;
+  //
+  // The ONE exception is a positively detected blocker, below: "we know why
+  // this will never report" is a fact worth showing, where "nothing yet" is
+  // not.
+  if (!entry || (!entry.session && !entry.weekly)) {
+    return blocksUsageFeed(owner) ? <BlockedChip owner={owner!} /> : null;
+  }
 
   const stale = Date.now() - entry.updatedAt > STALE_AFTER_MS;
   // The bar tracks the window closest to its limit, which is not always the
@@ -278,6 +305,90 @@ function UsageRow({ label, sub, window: w, driving, level, source }: {
         <span>{formatReset(w) || "reset time not reported"}</span>
       </div>
     </div>
+  );
+}
+
+/**
+ * Shown when termic KNOWS the usage feed cannot run, never when it merely has
+ * nothing yet.
+ *
+ * The whole point is that this failure is otherwise invisible: a project that
+ * ships its own status line outranks termic's, so termic's script never runs,
+ * no OSC is written, and the footer is empty with nothing logged anywhere. The
+ * user is left to work out why one repo reports usage and another does not.
+ *
+ * Deliberately quiet: faint, no colour, no badge. It is an explanation for
+ * someone who went looking, not a defect to be alarmed about, and the thing
+ * blocking it is usually a status line the user wants more than this one.
+ */
+function BlockedChip({ owner }: { owner: StatusLineOwner }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <PopoverRoot>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-testid="usage-blocked-chip"
+          data-usage-owner={owner.owner}
+          title="Plan usage is not being reported"
+          className={cn(
+            "flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5",
+            "text-[var(--color-fg-faint)] hover:bg-[var(--color-bg-2)] hover:text-[var(--color-fg-dim)]",
+          )}
+        >
+          <CircleSlash className="h-3.5 w-3.5" />
+          <span>usage n/a</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        side="top"
+        align="end"
+        className="w-80 p-0"
+        onOpenAutoFocus={e => e.preventDefault()}
+        onCloseAutoFocus={e => e.preventDefault()}
+      >
+        <div data-testid="usage-blocked-detail" className="text-[12.5px]">
+          <div className="border-b border-[var(--color-border-soft)] px-3 py-2 font-medium text-[var(--color-fg)]">
+            Plan usage is not being reported
+          </div>
+          <div className="flex flex-col gap-2 px-3 py-2.5 text-[var(--color-fg-dim)]">
+            <p>{blockedReason(owner)}</p>
+            {/* Name the FILE. Without it the user has to go and find which of
+                three settings files is in force, and the answer is not
+                obvious: a local one outranks a committed one. */}
+            <p className="break-all text-[var(--color-fg-faint)]">
+              <code className="font-mono">{owner.path}</code>
+            </p>
+            <p>
+              Termic reads plan usage from Claude's status line, so it gets
+              nothing while another one is in place. Your own status line is
+              left exactly as it is.
+            </p>
+          </div>
+          <div className="border-t border-[var(--color-border-soft)] px-3 py-2">
+            {/* The way out, as work someone else does. The user does not have
+                to learn the wire format: they paste this at the agent that
+                owns the script and it makes the edit. */}
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard.writeText(statusLineAgentPrompt(owner))
+                  .then(() => { setCopied(true); setTimeout(() => setCopied(false), 1600); })
+                  .catch(() => {});
+              }}
+              className="flex items-center gap-1.5 text-[12px] text-[var(--color-fg-dim)] underline decoration-dotted underline-offset-2 hover:text-[var(--color-fg)]"
+            >
+              {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+              {copied ? "Copied" : "Copy a prompt to fix it"}
+            </button>
+            <p className="mt-1 text-[12px] text-[var(--color-fg-faint)]">
+              Paste it into the agent that owns that status line. It adds the
+              reporting and changes nothing else.
+            </p>
+          </div>
+        </div>
+      </PopoverContent>
+    </PopoverRoot>
   );
 }
 
