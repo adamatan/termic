@@ -13,9 +13,9 @@ import {
   FolderCog, RefreshCw, ScrollText, Bug, SlidersHorizontal, Bot, BookText,
   Check, ChevronLeft, ListTodo, Bell, SquareTerminal, FolderPlus, History, Square,
   Play, Swords, Megaphone, Columns2, Rows2, Clock, UserPen, GitPullRequest, Activity, Code2,
-  NotepadText, Waypoints, CircleDot, type LucideIcon,
-} from "lucide-react";
+  NotepadText, Waypoints, CircleDot, UsersRound, type LucideIcon } from "lucide-react";
 import { useUI } from "@/store/ui";
+import { useProfiles } from "@/store/profiles";
 import { copyToClipboard } from "@/lib/clipboard";
 import { copyAgentBriefing } from "@/lib/agentBriefing";
 import { useApp } from "@/store/app";
@@ -28,6 +28,7 @@ import { fuzzyMatch, Highlighted } from "@/lib/fuzzy";
 import { bindingGlyphs, type ShortcutId } from "@/lib/shortcuts";
 import { confirmAndArchive } from "@/lib/archiveTask";
 import { taskSetYolo, openPath, procmonOpenWindow } from "@/lib/ipc";
+import { profileOpen } from "@/lib/ipc";
 import { isCustomId } from "@/lib/customTheme";
 import { effectiveLanguageId, languageLabel } from "@/lib/languages";
 import { effectiveSandboxMode, isSandboxEnforced } from "@/lib/types";
@@ -438,6 +439,23 @@ export function CommandPalette() {
     });
 
     // ── Application ─────────────────────────────────────────────────────
+    // Profiles (GH #280). The palette is the switcher's home because Cmd+N,
+    // Chrome's new-window convention, is already "New task..." here. Each
+    // profile is its own row rather than a submenu: switching IS opening a
+    // window, so there is nothing to pick after choosing one.
+    for (const p of useProfiles.getState().profiles) {
+      cmds.push({
+        id: `profile-open-${p.slug}`, section: "Application",
+        label: `Profile: ${p.name}`,
+        icon: UsersRound, keywords: `profile switch window ${p.slug}`,
+        run: act(() => { void profileOpen(p.slug).catch(() => {}); }),
+      });
+    }
+    cmds.push({
+      id: "profile-new", section: "Application", label: "New profile...",
+      icon: UsersRound, keywords: "profile workspace identity account window",
+      run: act(() => useUI.getState().openNewProfile()),
+    });
     cmds.push({
       id: "settings", section: "Application", label: "Settings",
       icon: SettingsIcon, shortcutId: "open-settings", keywords: "preferences config",

@@ -5,7 +5,7 @@
 import { useEffect, useState } from "react";
 import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/Button";
-import { X, Palette, FolderGit2, Settings as SettingsIcon, Keyboard, Terminal, Layers, Library, ListTodo, Bell, ShieldCheck, SquareTerminal, Container } from "lucide-react";
+import { X, Palette, FolderGit2, Settings as SettingsIcon, Keyboard, Terminal, Layers, Library, ListTodo, Bell, ShieldCheck, SquareTerminal, Container, UsersRound } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AppearanceSection } from "./AppearanceSection";
 import { RepositorySection } from "./RepositorySection";
@@ -15,6 +15,7 @@ import { NotificationsSection } from "./NotificationsSection";
 import { SandboxSection } from "./SandboxSection";
 import { CliSection } from "./CliSection";
 import { McpSection } from "./McpSection";
+import { ProfilesSection } from "@/components/settings/ProfilesSection";
 import { ShortcutsSection } from "./ShortcutsSection";
 import { AgentsSection } from "./AgentsSection";
 import { PromptLibrarySection } from "./PromptLibrarySection";
@@ -91,6 +92,8 @@ export function Settings() {
           active={tab === "prompts"} onClick={() => openSettings("prompts")} />
         <RailItem icon={<Keyboard className="h-4 w-4" />} label="Shortcuts" tabId="shortcuts"
           active={tab === "shortcuts"} onClick={() => openSettings("shortcuts")} />
+        <RailItem icon={<UsersRound className="h-4 w-4" />} label="Profiles" tabId="profiles"
+          active={tab === "profiles"} onClick={() => openSettings("profiles")} />
 
         <RailDivider />
 
@@ -146,6 +149,7 @@ export function Settings() {
           {tab === "agents"      && <AgentsSection />}
           {tab === "prompts"     && <PromptLibrarySection />}
           {tab === "shortcuts"   && <ShortcutsSection />}
+          {tab === "profiles"    && <ProfilesSection />}
           {tab === "repositories" && (
             isRepoSelected
               ? <RepositorySection projectId={repoId!} />

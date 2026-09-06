@@ -94,7 +94,7 @@ impl Conn {
     /// the reply arrives later, interleaved with session frames.
     pub fn send_request(&mut self, cmd: proto::Command, token: &str) -> Result<(), CliError> {
         let req =
-            proto::Request { id: "1".into(), token: Some(token.to_string()), cmd };
+            proto::Request { id: "1".into(), token: Some(token.to_string()), profile: profile(), cmd };
         proto::write_msg(&mut self.writer, &req).map_err(lost)
     }
 
@@ -212,7 +212,7 @@ fn exchange(conn: &mut Conn, req: &proto::Request) -> Result<proto::Reply, CliEr
 pub fn hello(conn: &mut Conn) -> Result<proto::HelloData, CliError> {
     let reply = exchange(
         conn,
-        &proto::Request { id: "hello".into(), token: None, cmd: proto::Command::Hello },
+        &proto::Request { id: "hello".into(), token: None, profile: None, cmd: proto::Command::Hello },
     )?;
     match reply.data {
         Some(proto::ReplyData::Hello(h)) => {
@@ -247,6 +247,24 @@ pub fn read_token(paths: &SocketPaths) -> Result<String, CliError> {
     Ok(token)
 }
 
+
+/// The `--profile` value for this process (GH #280).
+///
+/// A process-global rather than a threaded parameter, and legitimately so: the
+/// CLI is a single-shot process that parses one `--profile` and sends one
+/// command with it. Threading it through every `Request` constructor would
+/// buy nothing over a value that genuinely cannot vary within a run.
+static PROFILE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Called once from `run()`, before any request is built.
+pub fn set_profile(p: Option<String>) {
+    let _ = PROFILE.set(p);
+}
+
+fn profile() -> Option<String> {
+    PROFILE.get().cloned().flatten()
+}
+
 /// Send one authenticated verb and unwrap the reply.
 pub fn request(
     conn: &mut Conn,
@@ -255,7 +273,7 @@ pub fn request(
 ) -> Result<proto::ReplyData, CliError> {
     let reply = exchange(
         conn,
-        &proto::Request { id: "1".into(), token: Some(token.to_string()), cmd },
+        &proto::Request { id: "1".into(), token: Some(token.to_string()), profile: profile(), cmd },
     )?;
     reply_to_result(reply)
 }
@@ -272,7 +290,7 @@ pub fn exchange_streamed(
     token: &str,
     on_event: &mut dyn FnMut(&proto::StreamEvent),
 ) -> Result<proto::Reply, CliError> {
-    let req = proto::Request { id: "1".into(), token: Some(token.to_string()), cmd };
+    let req = proto::Request { id: "1".into(), token: Some(token.to_string()), profile: profile(), cmd };
     proto::write_msg(&mut conn.writer, &req).map_err(lost)?;
     loop {
         let line = match proto::read_line(&mut conn.reader) {

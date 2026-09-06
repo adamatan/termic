@@ -9,7 +9,7 @@ import { usePrefs } from "@/store/prefs";
 import { Button } from "@/components/ui/Button";
 import { Tip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
-import { LayoutGrid, History, FolderPlus, Settings, Plus, Archive, Layers, Moon, Cog, MoreVertical, GitBranch, GitBranchPlus, FolderGit2, ChevronRight, ChevronDown, Bell, Bug, Mail, Zap, X, Pencil, Copy, ChevronsDownUp, ChevronsUpDown, Check, AudioWaveform, Radio, SquareChevronRight, CircleStop, Trash2, Folder, FolderMinus, FolderOpen, Megaphone, Keyboard, GitPullRequest, GitPullRequestDraft, GitPullRequestClosed, GitMerge, Activity, Waypoints, Square, Play } from "lucide-react";
+import { LayoutGrid, History, FolderPlus, Settings, Plus, Archive, Layers, Moon, Cog, MoreVertical, GitBranch, GitBranchPlus, FolderGit2, ChevronRight, ChevronDown, Bell, Bug, Mail, Zap, X, Pencil, Copy, ChevronsDownUp, ChevronsUpDown, Check, AudioWaveform, Radio, SquareChevronRight, CircleStop, Trash2, Folder, FolderMinus, FolderOpen, Megaphone, Keyboard, GitPullRequest, GitPullRequestDraft, GitPullRequestClosed, GitMerge, Activity, Waypoints, Square, Play, UsersRound } from "lucide-react";
 import { DropdownRoot, DropdownTrigger, DropdownMenu, DropdownItem, DropdownSeparator, DropdownLabel, DropdownSub, DropdownSubTrigger, DropdownSubContent } from "@/components/ui/Dropdown";
 import { ContextMenuRoot, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuLabel, ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent } from "@/components/ui/ContextMenu";
 import { ProjectActionsMenuItems } from "./ProjectActionsMenuItems";
@@ -39,6 +39,9 @@ import { effectiveSandboxMode, isSandboxEnforced, isTaskCaged } from "@/lib/type
 import { SandboxIcon, SANDBOX_VISUALS, DockerSandboxIcon } from "@/components/SandboxIcon";
 import { TaskLocationIcon } from "@/components/TaskLocationIcon";
 import { useTaskLabel } from "@/lib/taskLabel";
+import { ProfileStrip, useProfilesSync } from "@/components/sidebar/ProfileStrip";
+import { useProfiles } from "@/store/profiles";
+import { ACCENTS, accentCss } from "@/lib/accents";
 
 /** Pick a default name for a freshly-created task (repo-root OR worktree).
  *  Format: "<agent>-N" where N is the next unused index for that CLI among
@@ -65,23 +68,11 @@ function defaultTaskName(cli: string, taskList: Task[]): string {
   return `${slug}-${n}`;
 }
 
-// Group folder accent palette. Keys persist in localStorage (via
-// useApp.groupColors); css points at the --color-palette-* tokens in index.css
-// @theme; label is for screen readers only (the picker renders bare
-// swatches). An unknown stored key (hand-edited storage, palette entry
-// removed in a future version) resolves to undefined = default styling.
-const GROUP_COLORS: { key: string; label: string; css: string }[] = [
-  { key: "red",    label: "Red",    css: "var(--color-palette-red)" },
-  { key: "orange", label: "Orange", css: "var(--color-palette-orange)" },
-  { key: "yellow", label: "Yellow", css: "var(--color-palette-yellow)" },
-  { key: "green",  label: "Green",  css: "var(--color-palette-green)" },
-  { key: "teal",   label: "Teal",   css: "var(--color-palette-teal)" },
-  { key: "blue",   label: "Blue",   css: "var(--color-palette-blue)" },
-  { key: "purple", label: "Purple", css: "var(--color-palette-purple)" },
-  { key: "pink",   label: "Pink",   css: "var(--color-palette-pink)" },
-];
-const groupColorCss = (key: string | undefined): string | undefined =>
-  GROUP_COLORS.find(c => c.key === key)?.css;
+// Group folder accent palette. Shared with profiles (GH #280) and therefore
+// lifted into @/lib/accents; the aliases below keep this file's call sites
+// reading the way they always did.
+const GROUP_COLORS = ACCENTS;
+const groupColorCss = accentCss;
 
 // `compact` is normally read from the store, but the Arc-style hover reveal
 // (App.tsx) renders TWO instances at once: the 56px icon rail (`compact`)
@@ -91,6 +82,10 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
   const compactStore = useApp(s => s.compactSidebar);
   const compact = compactProp ?? compactStore;
   const openSettings = useApp(s => s.openSettings);
+  // GH #280: keeps this window's registry view fresh, and decides whether the
+  // strip exists at all.
+  useProfilesSync();
+  const hasProfiles = useProfiles(s => s.profiles.length > 0);
   const projects = useApp(s => s.projects);
   const sidebarWidth = useApp(s => s.sidebarWidth);
   const setSidebarWidth = useApp(s => s.setSidebarWidth);
@@ -990,7 +985,9 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
               </DropdownMenu>
             </DropdownRoot>
             )}
-            <Tip content="Add project (repo)"><Button size="icon" variant="icon" onClick={openNewProject}>
+            {/* The ONE Add project button (GH #280 removed the footer copy):
+                it belongs next to the list it acts on. */}
+            <Tip content="Add project (repo)"><Button size="icon" variant="icon" data-testid="sidebar-add-project" onClick={openNewProject}>
               <FolderPlus className={iconSize(compact)} /></Button></Tip>
           </div>
         </div>
@@ -1821,17 +1818,26 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
         </div>
       </div>
 
-      {/* UpdateCard floats absolutely at the bottom-left of the sidebar,
-          stacked above project rows and the footer so it remains visible
-          regardless of scroll position. Renders nothing in compact mode
-          or when there's no pending update / unseen release. */}
-      <div className="pointer-events-none absolute inset-x-0 bottom-[var(--bottom-bar-h)] z-20">
-        <div className="pointer-events-auto">
-          <UpdateCard />
+      {/* The bottom stack: profile strip (conditional) + footer, in ONE
+          positioned container so UpdateCard can anchor to its top edge.
+          Deliberately NOT `bottom-[calc(var(--bottom-bar-h)*2)]` or similar:
+          the strip is conditional, so any arithmetic offset is wrong half the
+          time, and it would silently drift the moment either bar changed
+          height. `bottom-full` is the same answer in both states. */}
+      <div className="relative">
+        {/* UpdateCard floats above the bottom stack so it stays visible
+            regardless of scroll position. Renders nothing in compact mode or
+            when there's no pending update / unseen release. */}
+        <div className="pointer-events-none absolute inset-x-0 bottom-full z-20">
+          <div className="pointer-events-auto">
+            <UpdateCard />
+          </div>
         </div>
-      </div>
 
-      <div>
+        {/* The profile indicator, above the footer and below the project
+            list. Renders nothing until a profile exists. */}
+        <ProfileStrip compact={compact} />
+
         {/* Footer */}
         <div className={cn(
           "flex border-t border-[var(--color-border-soft)] gap-1",
@@ -1878,14 +1884,29 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
               <Activity className={iconSize(compact)} />
             </Button>
           </Tip>
-          {/* Right cluster: Add project, then Settings rightmost.
-              Settings sits at the absolute edge so the gear is exactly
-              where users reflexively reach for it (same position as
-              macOS preferences in most apps). +project sits just inside
-              it. ml-auto on the first right-cluster item pushes both. */}
-          <Tip content="Add project"><Button size="icon" variant="icon" className={compact ? undefined : "ml-auto"} onClick={openNewProject}>
-            <FolderPlus className={iconSize(compact)} />
-          </Button></Tip>
+          {/* Right cluster: profiles, then Settings rightmost. Settings sits
+              at the absolute edge so the gear is exactly where users
+              reflexively reach for it (same position as macOS preferences in
+              most apps). ml-auto on the first right-cluster item pushes both.
+
+              "Add project" USED to sit here and was removed with profiles
+              (GH #280): it duplicated the button in the PROJECTS header,
+              which is where the action belongs, next to the list it acts on.
+
+              The profile button is the whole surface while the feature is
+              dormant. Once a profile exists the strip above carries the
+              identity, so this stays as the way into managing them. */}
+          <Tip content={hasProfiles ? "Manage profiles" : "Profiles"}>
+            <Button
+              size="icon"
+              variant="icon"
+              data-testid="footer-profiles"
+              className={compact ? undefined : "ml-auto"}
+              onClick={() => openSettings("profiles")}
+            >
+              <UsersRound className={iconSize(compact)} />
+            </Button>
+          </Tip>
           <Tip content="Settings (⌘,)"><Button size="icon" variant="icon" onClick={() => openSettings()}>
             <Settings className={iconSize(compact)} />
           </Button></Tip>

@@ -20,6 +20,8 @@ import { RaceCompare } from "@/components/task/RaceCompare";
 import { TaskSandboxDialog } from "./TaskSandboxDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { CloseDialog } from "./CloseDialog";
+import { NewProfileDialog } from "./NewProfileDialog";
+import { DeleteProfileDialog } from "./DeleteProfileDialog";
 import { TerminalDropDialog } from "./TerminalDropDialog";
 import { DockerRebuildPromptDialog } from "./DockerRebuildPromptDialog";
 import { FileFinderDialog } from "./FileFinderDialog";
@@ -61,6 +63,8 @@ export function Dialogs() {
       <TaskSandboxDialog />
       <ConfirmDialog />
       <CloseDialog />
+      <NewProfileDialog />
+      <DeleteProfileDialog />
       <TerminalDropDialog />
       <DockerRebuildPromptDialog />
       <FileFinderDialog />

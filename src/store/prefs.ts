@@ -32,6 +32,7 @@ import {
   readCompletionSoundId,
   type CompletionSoundId,
 } from "@/lib/notificationSounds";
+import { scoped } from "@/lib/profileScope";
 
 const LS_EDITOR_FONT   = "editorFont";
 const LS_EDITOR_THEME  = "editorThemeId";
@@ -63,8 +64,8 @@ const LS_TERMINAL_OPTION_AS_META = "terminalOptionAsMeta";
 const LS_TERMINAL_GPU            = "terminalGpuEnabled";
 const LS_TERMINAL_RENDERER       = "terminalRenderer";
 const LS_TERMINAL_COPY_ON_SELECT = "terminalCopyOnSelect";
-const LS_TASK_EXPAND_MODE = "taskExpandMode";
-const LS_HIDE_INACTIVE_PROJECTS = "hideInactiveProjects";
+const LS_TASK_EXPAND_MODE = scoped("taskExpandMode");
+const LS_HIDE_INACTIVE_PROJECTS = scoped("hideInactiveProjects");
 const LS_BRANCH_AS_TASK_NAME = "useBranchAsTaskName";
 const LS_DOUBLE_SHIFT_MODE = "doubleShiftMode";
 const LS_MD_VIEW       = "markdownDefaultView";

@@ -10,6 +10,7 @@ import type {
   ImportableWorktree, CliInfo, ChangeFile, Changes, GitStatus, CheckoutResult, UpdateMode, UpdateResult, UpdateInfo, FileEntry, Agent, RepoConfig,
   SandboxMode, TaskDiffSummary, CliInstallStatus, McpStatus, BranchContext, BlameFile, GitCommit, GitCompare, GitFile, GitLogPage, GitRef,
   ForgeCliStatus, PrLookup, PrComment, IssueLookup, AgentHookStatus, HookPlan,
+  ProfileView, ProfilesView, ProfileDeletePreview,
 } from "./types";
 import type { CustomThemeFile } from "./customTheme";
 import {
@@ -21,6 +22,40 @@ import {
   readCompletionSoundId,
   type CompletionSoundId,
 } from "./notificationSounds";
+
+// ───────────────────────────── profiles ─────────────────────────────
+// GH #280. `profilesList` returns the calling WINDOW's view: `current` is
+// this window's slug, and `null` means no profiles exist yet (the dormant
+// state, in which the sidebar shows no strip at all).
+
+export const profilesList = () => invoke<ProfilesView>("profiles_list");
+export const profileCreate = (args: {
+  name: string;
+  accent: string;
+  tasksPath?: string;
+  /** Required on the FIRST create: naming the install that already exists,
+   *  which becomes a profile in the same operation. */
+  existingName?: string;
+  existingAccent?: string;
+}) => invoke<ProfileView>("profile_create", { args });
+export const profileUpdate = (slug: string, name?: string, accent?: string) =>
+  invoke<void>("profile_update", { slug, name, accent });
+/** Focus the profile's window, or launch it if it is closed. One action from
+ *  the user's side, which is why the popover does not distinguish them. */
+export const profileOpen = (slug: string) => invoke<void>("profile_open", { slug });
+/** Close a profile's window. Deleting is refused while it is open, and "go
+ *  find that window" is a poor instruction when it may be on another Space. */
+export const profileClose = (slug: string) => invoke<void>("profile_close", { slug });
+export const profileDeletePreview = (slug: string) =>
+  invoke<ProfileDeletePreview>("profile_delete_preview", { slug });
+export const profileDelete = (slug: string, deleteWorktrees: boolean) =>
+  invoke<void>("profile_delete", { slug, deleteWorktrees });
+/** Stop using profiles, keeping every byte of data. NOT a delete: it unlinks
+ *  the registry and nothing else. It exists because a delete is refused while
+ *  the profile's window is open, and the last remaining profile is always the
+ *  one whose window you are in, so backing out of the feature needs its own
+ *  door. Refused while more than one profile exists. */
+export const profilesDisable = () => invoke<void>("profiles_disable");
 
 // ───────────────────────────── projects ─────────────────────────────
 
@@ -234,6 +269,7 @@ export const sandboxAvailable = () => invoke<boolean>("sandbox_available");
  *  be put on a short timer: see docs/ideas/usage-footer.md.
  *
  *  Keyed by agent ENTRY id so a clone is asked about its own login. */
+
 /** Who owns claude's statusLine slot for a task, and therefore whether
  *  Termic's usage feed can run at all. A project that ships its own status
  *  line wins, and we report that rather than fighting it. */

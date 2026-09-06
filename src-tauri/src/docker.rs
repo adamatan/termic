@@ -14,7 +14,7 @@
 // Design: docs/plans/docker-sandbox/design.md
 
 use crate::sandbox::{canonicalize_or_keep, parent_git_dir_for_worktree, subst_path};
-use crate::{data_dir, Task};
+use crate::{global_dir, Task};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -357,9 +357,9 @@ fn sanitize_extra_mount(raw: &str, home: &str, task_path: &str) -> Option<(Strin
 /// IS the cross-task sharing. termic-owned, never the host's real
 /// `~/.claude` (full isolation from the OS agent).
 pub fn agent_config_host_dir(agent_id: &str) -> PathBuf {
-    // `data_dir()` already respects the dev/prod (`termic_dev`/`termic`)
+    // `global_dir()` already respects the dev/prod (`termic_dev`/`termic`)
     // split, so dev and release don't share login state.
-    let base = data_dir()
+    let base = global_dir()
         .map(|d| d.join("docker-agents"))
         .unwrap_or_else(|_| PathBuf::from("/tmp/termic-docker-agents"));
     base.join(agent_id)
@@ -376,7 +376,7 @@ pub fn agent_config_host_dir(agent_id: &str) -> PathBuf {
 pub fn forge_config_host_dir() -> PathBuf {
     // Same dev/prod split as `agent_config_host_dir` - a dev build must not
     // pick up (or clobber) the release build's forge login.
-    data_dir()
+    global_dir()
         .map(|d| d.join("docker-forge"))
         .unwrap_or_else(|_| PathBuf::from("/tmp/termic-docker-forge"))
 }
@@ -1169,7 +1169,7 @@ pub fn render_argv(spec: &DockerSpec, cmd: &str, args: &[String]) -> Vec<String>
 
 /// Directory holding the editable Dockerfile + build metadata.
 fn docker_dir() -> PathBuf {
-    data_dir()
+    global_dir()
         .map(|d| d.join("docker"))
         .unwrap_or_else(|_| PathBuf::from("/tmp/termic-docker"))
 }
@@ -1918,34 +1918,19 @@ mod tests {
         assert!(cfg_mount.host.ends_with("docker-agents/next-claude"), "{}", cfg_mount.host);
     }
 
-    /// Point `data_dir()` at a scratch profile for the duration of a test.
-    /// `build_spec` CREATES the agent config dir now, and `data_dir()` in a
+    /// Point `global_dir()` at a scratch profile for the duration of a test.
+    /// `build_spec` CREATES the agent config dir now, and `global_dir()` in a
     /// test otherwise resolves to the developer's REAL profile - so without
     /// this the suite silently made folders in
     /// `~/Library/Application Support/termic/docker-agents`. Debug-only seam,
     /// same one automation.rs uses.
-    /// Serializes every test that either REDIRECTS `TERMIC_DATA_DIR` or reads
-    /// something derived from it. Both halves matter: the var is process-wide,
-    /// so a test writing the Dockerfile into `docker_dir()` while another test
-    /// has the data dir pointed at a tempdir (about to be deleted) fails on a
-    /// path that has nothing to do with what it is testing. That is exactly
-    /// how `updating_agents_busts_only_the_agent_layers` started failing only
-    /// when run alongside the rest of the module.
-    static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Delegates to the ONE process-wide lock in `crate::test_support`.
+    /// This module used to hold its own, which serialized it against itself
+    /// and raced every other module touching the same env var.
+    use crate::test_support::DATA_DIR_LOCK;
 
     fn with_scratch_data_dir<T>(f: impl FnOnce() -> T) -> T {
-        let dir = tempfile::tempdir().unwrap();
-        let prev = std::env::var("TERMIC_DATA_DIR").ok();
-        // SAFETY: cargo runs tests in threads, and every test that touches
-        // this var (or reads a path derived from it) takes DATA_DIR_LOCK.
-        let _g = DATA_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TERMIC_DATA_DIR", dir.path()) };
-        let out = f();
-        match prev {
-            Some(v) => unsafe { std::env::set_var("TERMIC_DATA_DIR", v) },
-            None => unsafe { std::env::remove_var("TERMIC_DATA_DIR") },
-        }
-        out
+        crate::test_support::with_scratch_data_dir(|_| f())
     }
 
     #[test]
@@ -2731,7 +2716,7 @@ mod tests {
 
     /// Dockerfile provenance, all four scenarios in ONE test on purpose.
     ///
-    /// `data_dir()` is chosen by `TERMIC_DATA_DIR`, which is process-wide, and
+    /// `global_dir()` is chosen by `TERMIC_DATA_DIR`, which is process-wide, and
     /// cargo runs tests in parallel threads: four separate tests each setting
     /// it raced and read each other's Dockerfile. One sequential test is the
     /// honest fix; a mutex would only hide the sharing from the reader.

@@ -167,7 +167,7 @@ pub fn another_instance_running(deep_link: Option<&str>) -> bool {
 /// `another_instance_running` this is NOT debug-gated: it is a plain
 /// "forward to the owner", not a policy about whether we should exist.
 pub fn raise_owner(deep_link: Option<&str>) -> bool {
-    let Ok(dir) = crate::data_dir() else { return false };
+    let Ok(dir) = crate::global_dir() else { return false };
     raise_existing(&dir.join(proto::SOCKET_FILE), deep_link)
 }
 
@@ -182,7 +182,7 @@ fn raise_existing(sock: &Path, deep_link: Option<&str>) -> bool {
     let mut reader = BufReader::new(stream);
     // Confirm a live instance via hello. A parseable hello reply (any
     // protocol) means a sibling is running and owns this data dir.
-    let hello = Request { id: "preflight".into(), token: None, cmd: Command::Hello };
+    let hello = Request { id: "preflight".into(), token: None, profile: None, cmd: Command::Hello };
     if proto::write_msg(&mut writer, &hello).is_err() {
         return false;
     }
@@ -202,13 +202,13 @@ fn raise_existing(sock: &Path, deep_link: Option<&str>) -> bool {
         Some(url) => Command::OpenUrl { url: url.to_string() },
         None => Command::Raise,
     };
-    let _ = proto::write_msg(&mut writer, &Request { id: "preflight".into(), token: None, cmd });
+    let _ = proto::write_msg(&mut writer, &Request { id: "preflight".into(), token: None, profile: None, cmd });
     let _ = proto::read_msg::<_, Reply>(&mut reader);
     true
 }
 
 fn server_main(app: tauri::AppHandle) {
-    let dir = match crate::data_dir() {
+    let dir = match crate::global_dir() {
         Ok(d) => d,
         Err(e) => {
             dlog(&format!("[cli] no data dir, control socket disabled: {e}"));
@@ -662,6 +662,44 @@ fn auth_gate(req: &Request, host: &dyn CliHost) -> Option<Reply> {
     None
 }
 
+thread_local! {
+    /// The `--profile` this request named, for the duration of handling it.
+    ///
+    /// A thread-local is correct HERE and nowhere else in this codebase: one
+    /// connection is served start to finish on its own thread
+    /// (`serve_conn`), so the value cannot leak across requests. It exists
+    /// because the target has to reach `rpc_target_label`, several frames
+    /// down inside `webview_rpc_stream`, and threading an Option<String>
+    /// through every verb handler to serve a flag almost nobody passes would
+    /// be a poor trade.
+    static REQUESTED_PROFILE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The window label `--profile <name>` names, or an error naming the profile
+/// that does not exist.
+///
+/// Matching by slug OR display name, case-insensitively, because the user sees
+/// the name in the strip and the slug on disk and should not have to know
+/// which one the flag wants.
+pub(crate) fn resolve_requested_profile(name: &str) -> Result<String, String> {
+    let reg = crate::profiles_registry();
+    let hit = reg
+        .profiles
+        .iter()
+        .find(|p| p.slug.eq_ignore_ascii_case(name) || p.name.eq_ignore_ascii_case(name));
+    match hit {
+        Some(p) => Ok(reg.id_for(&p.slug).window_label()),
+        None if reg.profiles.is_empty() => Err(format!(
+            "no profile named {name:?}: this install has no profiles"
+        )),
+        None => {
+            let known: Vec<&str> = reg.profiles.iter().map(|p| p.name.as_str()).collect();
+            Err(format!("no profile named {name:?} (have: {})", known.join(", ")))
+        }
+    }
+}
+
 pub(crate) fn handle_request(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Reply {
     // Hello is the whole unauthenticated surface: app-running + protocol
     // version. Nothing else leaks before the token check.
@@ -674,6 +712,17 @@ pub(crate) fn handle_request(req: &Request, host: &dyn CliHost, sink: &mut dyn E
                 protocol: proto::PROTOCOL_VERSION,
             }),
         );
+    }
+    // `--profile` (GH #280). Resolved ONCE, here, so an unknown name fails as
+    // a usage error before any verb acts. Never a fallback to another
+    // profile: this server already refuses to guess for an unknown project
+    // (`find_project`), and guessing here would act on the wrong data.
+    REQUESTED_PROFILE.with(|c| *c.borrow_mut() = None);
+    if let Some(name) = req.profile.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match resolve_requested_profile(name) {
+            Ok(label) => REQUESTED_PROFILE.with(|c| *c.borrow_mut() = Some(label)),
+            Err(msg) => return Reply::err(&req.id, ErrorCode::BadRequest, msg),
+        }
     }
     // Raise is the other unauthenticated verb: a second instance launching
     // on this data dir asks the running one to come to front, then exits
@@ -3469,7 +3518,7 @@ impl CliHost for TauriHost {
         env!("CARGO_PKG_VERSION").into()
     }
     fn projects_tasks(&self) -> (Vec<Project>, Vec<Task>) {
-        (crate::load_projects(), crate::load_tasks())
+        (crate::load_projects_all(), crate::load_tasks_all())
     }
     fn work_states(&self, ids: &[String]) -> Option<HashMap<String, WorkStateInfo>> {
         cached_work_states(&global_agent_cache().snapshot(), ids)
@@ -4237,6 +4286,31 @@ fn webview_rpc(
 
 /// Emit a typed request into the webview and block for the final
 /// result, forwarding progress payloads (and idle ticks) to
+/// Which profile window should serve this RPC.
+///
+/// Every request that names a subject carries it as `taskId` or `projectId`,
+/// and both resolve to a profile through the record. A request that names
+/// nothing (`list_agents`, `list_prompts`) goes to the most recently focused
+/// open window, which is decision 4's rule and the only answer available when
+/// there is no subject to derive one from.
+fn rpc_target_label(app: &tauri::AppHandle, params: &serde_json::Value) -> String {
+    // An explicit --profile wins over everything: the user named the window.
+    if let Some(label) = REQUESTED_PROFILE.with(|c| c.borrow().clone()) {
+        return label;
+    }
+    if let Some(id) = params.get("taskId").and_then(|v| v.as_str()) {
+        if let Some(label) = crate::window_for_task(id) {
+            return label;
+        }
+    }
+    if let Some(id) = params.get("projectId").and_then(|v| v.as_str()) {
+        if let Some(label) = crate::window_for_project(id) {
+            return label;
+        }
+    }
+    crate::most_recent_profile_label(app)
+}
+
 /// `on_progress`.
 fn webview_rpc_stream(
     app: &tauri::AppHandle,
@@ -4262,8 +4336,12 @@ fn webview_rpc_stream(
     let id = uuid::Uuid::new_v4().simple().to_string();
     let (tx, rx) = mpsc::channel::<RpcMsg>();
     pending().lock().unwrap().insert(id.clone(), tx);
+    let target = rpc_target_label(app, &params);
     let payload = serde_json::json!({ "id": id, "method": method, "params": params });
-    if let Err(e) = app.emit("cli-rpc://request", payload) {
+    // emit_to, not emit: with one window per profile a broadcast means EVERY
+    // profile's webview handles the request and answers it, so the client gets
+    // N replies to a request only one of them could serve.
+    if let Err(e) = app.emit_to(&target, "cli-rpc://request", payload) {
         pending().lock().unwrap().remove(&id);
         return Err(format!("emit failed: {e}"));
     }
@@ -5242,7 +5320,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn req(cmd: Command, token: Option<&str>) -> Request {
-        Request { id: "r".into(), token: token.map(str::to_string), cmd }
+        Request { id: "r".into(), token: token.map(str::to_string), profile: None, cmd }
     }
 
     /// Sink that records events; can simulate a hung-up client.

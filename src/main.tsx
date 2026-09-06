@@ -40,7 +40,7 @@ logLine("[termic] boot build=resume-fix-v3-sidebar-bypass").catch(() => {});
 // release bundles: both flags are statically false there.
 if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
   void (async () => {
-    const [app, ui, prefs, race, pr, ipc, core, runTabs, scriptRuns, prompts, agentRace, issuePrompt, seedPrompt, signalLog, reviewComments, deepLink, previewBrowser, pendingTasks, archivingTasks, cmLanguage, cmAutocomplete, codeIntel, lspStatus, navHistory, pageSession] =
+    const [app, ui, prefs, race, pr, ipc, core, runTabs, scriptRuns, prompts, agentRace, issuePrompt, seedPrompt, signalLog, reviewComments, deepLink, previewBrowser, pendingTasks, archivingTasks, cmLanguage, cmAutocomplete, codeIntel, lspStatus, navHistory, pageSession, profiles] =
       await Promise.all([
         import("@/store/app"),
         import("@/store/ui"),
@@ -67,6 +67,7 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
         import("@/store/lspStatus"),
         import("@/store/navHistory"),
         import("@/lib/lsp/pageSession"),
+        import("@/store/profiles"),
       ]);
     (window as unknown as Record<string, unknown>).__termic = {
       useApp: app.useApp,
@@ -74,6 +75,10 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
       usePrefs: prefs.usePrefs,
       useRace: race.useRace,
       usePr: pr.usePr,
+      // Profiles (GH #280). Exposed so a spec can read the registry as this
+      // window sees it without scraping the strip, and can restore the
+      // dormant state in teardown even when the body threw half way.
+      useProfiles: profiles.useProfiles,
       ipc,
       invoke: core.invoke,
       runTabs,

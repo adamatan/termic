@@ -178,6 +178,11 @@ describe("settings rail", () => {
     ["notifications", "Notifications", "Desktop notifications"],
     ["prompts", "Prompts", "Prompts"],
     ["shortcuts", "Shortcuts", "Shortcuts"],
+    // GH #280. Sits in the same band as Shortcuts, and its marker is the
+    // DORMANT copy: the fixture profile has no profiles, which is the state
+    // this page has to be reachable in (the sidebar footer lands here, and it
+    // is where the first profile is made).
+    ["profiles", "Profiles", "You have one setup, and no profiles yet."],
     ["sandbox", "Sandbox", "Global sandbox defaults"],
     // Marker has to be above the master toggle: everything else on this
     // page renders only once Docker sandboxing is enabled, and the fixture

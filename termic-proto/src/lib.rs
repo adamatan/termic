@@ -165,6 +165,14 @@ pub struct Request {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// `--profile <name>`: which profile's window should serve this request
+    /// (GH #280). Absent means "derive it", which is what every pre-profiles
+    /// client sends and what the overwhelmingly common single-profile case
+    /// wants. An UNKNOWN name is an error rather than a fallback: the server
+    /// already refuses to guess for an unknown project, and guessing here
+    /// would silently act on the wrong profile's data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     #[serde(flatten)]
     pub cmd: Command,
 }

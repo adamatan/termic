@@ -186,7 +186,7 @@ fn handle(stream: TcpStream, app: tauri::AppHandle) -> std::io::Result<()> {
                 "app": "termic",
                 "version": env!("CARGO_PKG_VERSION"),
                 "pid": std::process::id(),
-                "data_dir": crate::data_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+                "data_dir": crate::global_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
                 "window": rect,
             });
             respond(stream, 200, "application/json", info.to_string().as_bytes())

@@ -426,7 +426,7 @@ specs and get an issue at the same time. That is the whole promotion path:
 - **Profiles.** ([#280](https://github.com/simion/termic/issues/280)) A fully
   isolated instance with its own window, projects, tasks and settings, so work
   and personal stay in separate windows on separate monitors.
-  [docs/plans/profiles.md](docs/plans/profiles.md).
+  [docs/profiles.md](docs/profiles.md).
 - **Several accounts per agent.**
   ([#278](https://github.com/simion/termic/issues/278)) Add both subscriptions
   once, pick which one a profile uses, and switch a running task to the other

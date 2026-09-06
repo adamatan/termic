@@ -147,6 +147,14 @@ interface UIState {
    *  `close_action` setting is unset or "ask". */
   closePromptOpen: boolean;
   setClosePromptOpen: (v: boolean) => void;
+  /** The New Profile wizard (GH #280). A profile opens in its own window, so
+   *  this is a create flow, never a switcher. */
+  newProfileOpen: boolean;
+  openNewProfile: () => void;
+  setNewProfileOpen: (v: boolean) => void;
+  /** The profile the delete dialog is confirming, by slug. `null` = closed. */
+  deleteProfileSlug: string | null;
+  setDeleteProfileSlug: (slug: string | null) => void;
   /** Bumped on every close REQUEST. Opening alone is not enough to reset the
    *  dialog's "Don't ask again" tick: a second request while the prompt is
    *  already open leaves `closePromptOpen` true->true, which React sees as no
@@ -429,6 +437,8 @@ export const useUI = create<UIState>(set => ({
   // would badge a turn the user watched finish.
   windowFocused: true,
   closePromptOpen: false,
+  newProfileOpen: false,
+  deleteProfileSlug: null,
   closePromptNonce: 0,
   shortcutsHelpOpen: false,
   welcomeOpen: false,
@@ -480,6 +490,9 @@ export const useUI = create<UIState>(set => ({
   setWindowless: (v) => set({ windowless: v }),
   setWindowFocused: (v) => set(s => (s.windowFocused === v ? s : { windowFocused: v })),
   setClosePromptOpen: (v) => set({ closePromptOpen: v }),
+  openNewProfile: () => set({ newProfileOpen: true }),
+  setNewProfileOpen: (v) => set({ newProfileOpen: v }),
+  setDeleteProfileSlug: (slug) => set({ deleteProfileSlug: slug }),
   requestClosePrompt: () =>
     set(s => ({ closePromptOpen: true, closePromptNonce: s.closePromptNonce + 1 })),
   openShortcutsHelp:  () => set({ shortcutsHelpOpen: true }),

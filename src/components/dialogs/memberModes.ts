@@ -1,4 +1,5 @@
 // Last-used per-member task mode for the multi-repo New Task dialog.
+import { scoped } from "@/lib/profileScope";
 //
 // The single-repo dialog remembers one global mode (`newTaskLastMode`) because
 // that choice is about how the user works. Member modes are different: they are
@@ -10,7 +11,7 @@
 
 export type MemberTaskMode = "worktree" | "repo_root";
 
-export const LS_MEMBER_MODES = "newTaskMemberModes";
+export const LS_MEMBER_MODES = scoped("newTaskMemberModes");
 
 /** The remembered map, `{ [root_path]: mode }`. Unknown values and a corrupt
  *  blob both come back as "nothing remembered" — a bad entry must never wedge

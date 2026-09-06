@@ -216,7 +216,7 @@ fn clear_after_listener_death(port: u16, shutdown: &Arc<AtomicBool>) {
     }
     st.handle = None;
     st.last_port = Some(port);
-    if let Ok(dir) = crate::data_dir() {
+    if let Ok(dir) = crate::global_dir() {
         revoke_advertisement(&dir);
     }
 }
@@ -1403,6 +1403,9 @@ fn tools_call(server: &McpServer, id: serde_json::Value, params: &serde_json::Va
             other => format!("mcp-{other}"),
         },
         token: None,
+        // MCP has no --profile flag of its own; a tool call routes the same
+        // way an unflagged CLI request does (by the task or project it names).
+        profile: None,
         cmd,
     };
     let reply = cli_server::dispatch_authenticated(&req, server.host.as_ref(), &mut NoopSink);
@@ -1531,7 +1534,7 @@ pub(crate) fn apply_enabled(app: tauri::AppHandle, on: bool) {
     let mut st = state().lock().unwrap();
     match (on, st.handle.is_some()) {
         (true, false) => {
-            let Ok(dir) = crate::data_dir() else {
+            let Ok(dir) = crate::global_dir() else {
                 dlog("[mcp] no data dir; not binding");
                 return;
             };
@@ -1644,7 +1647,7 @@ pub(crate) fn apply_enabled(app: tauri::AppHandle, on: bool) {
             st.stopped = h.stopped.take();
             // Disable is an explicit revocation: both files go, unlike
             // the harmless lingering cli-token. Re-enable mints fresh.
-            if let Ok(dir) = crate::data_dir() {
+            if let Ok(dir) = crate::global_dir() {
                 revoke_advertisement(&dir);
             }
             st.last_port = Some(h.port);
@@ -1655,7 +1658,7 @@ pub(crate) fn apply_enabled(app: tauri::AppHandle, on: bool) {
         // memo, leaves files behind, and "off" has to mean nothing is
         // advertised.
         (false, false) => {
-            if let Ok(dir) = crate::data_dir() {
+            if let Ok(dir) = crate::global_dir() {
                 revoke_advertisement(&dir);
             }
         }
@@ -1687,7 +1690,7 @@ pub(crate) struct McpStatus {
 pub(crate) fn mcp_status() -> McpStatus {
     let url = state().lock().unwrap().handle.as_ref().map(|h| url_for(h.port));
     let rendered = url.as_ref().and_then(|u| {
-        let dir = crate::data_dir().ok()?;
+        let dir = crate::global_dir().ok()?;
         let helper = helper_command(&dir.join(MCP_TOKEN_FILE));
         Some((codex_block(u, &helper), claude_command(u, &helper)))
     });
@@ -1696,7 +1699,7 @@ pub(crate) fn mcp_status() -> McpStatus {
         claude_command: rendered.as_ref().map(|(_, c)| c.clone()),
         token_path: url
             .is_some()
-            .then(|| crate::data_dir().ok().map(|d| d.join(MCP_TOKEN_FILE).to_string_lossy().into_owned()))
+            .then(|| crate::global_dir().ok().map(|d| d.join(MCP_TOKEN_FILE).to_string_lossy().into_owned()))
             .flatten(),
         url,
     }
@@ -1715,7 +1718,7 @@ pub(crate) fn mcp_status() -> McpStatus {
 /// revokes it.
 #[tauri::command]
 pub(crate) fn mcp_token() -> Option<String> {
-    token_from_file(&crate::data_dir().ok()?)
+    token_from_file(&crate::global_dir().ok()?)
 }
 
 // ─────────────────────── one-click client setup ──────────────────────
@@ -1849,7 +1852,7 @@ fn install_client_inner(client: &str) -> Result<String, String> {
     let agents = crate::load_settings_inner().agents;
     let client = crate::docker::base_agent_id(&agents, client).to_string();
     let client = client.as_str();
-    let dir = crate::data_dir().map_err(|e| e.to_string())?;
+    let dir = crate::global_dir().map_err(|e| e.to_string())?;
     let url = state()
         .lock()
         .unwrap()

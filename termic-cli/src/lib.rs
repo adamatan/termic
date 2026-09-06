@@ -117,6 +117,16 @@ pub struct Cli {
     /// Fail (exit 4) instead of auto-launching Termic when it is not running.
     #[arg(long, global = true)]
     pub no_launch: bool,
+
+    /// Address a specific profile by name or slug (GH #280).
+    ///
+    /// A profile is a fully separate Termic in its own window. Omitted, a
+    /// command addresses the profile that owns the project it names, and
+    /// falls back to the most recently focused window when it names none.
+    /// An unknown profile is an error, never a silent fallback to another
+    /// one, matching how an unknown project is already treated.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub profile: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1069,6 +1079,8 @@ pub fn run() -> i32 {
         Ok(c) => c,
         Err(e) => e.exit(),
     };
+    // Before any request is built: every Request carries it (GH #280).
+    client::set_profile(cli.profile.clone());
     match execute(&cli) {
         Ok(out) => {
             if !out.stdout.is_empty() {

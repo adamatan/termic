@@ -1546,3 +1546,40 @@ export interface HookPlan {
   entries: HookPlanEntry[];
   notes: string[];
 }
+
+// ─────────────────────────── profiles (GH #280) ───────────────────────────
+
+/** One profile as every window needs to see it. The DATA lives in the
+ *  profile's own directory; this is only the registry entry. */
+export interface ProfileView {
+  /** Frozen at creation. Keys both the data dir and the worktrees base, and
+   *  is the window label, so a rename never touches it. */
+  slug: string;
+  name: string;
+  /** `#rrggbb`. Tints the sidebar strip, the largest surface it gets. */
+  accent: string;
+  order: number;
+  /** True when this profile's window exists right now. */
+  open: boolean;
+  /** The profile whose data is the app data dir itself. At most one. */
+  is_root: boolean;
+}
+
+export interface ProfilesView {
+  profiles: ProfileView[];
+  /** The calling window's slug. `null` in the dormant state (no profiles
+   *  created), which is what the sidebar keys "show no strip" off. */
+  current: string | null;
+}
+
+/** The counts that make deleting a profile a decision rather than a leap. */
+export interface ProfileDeletePreview {
+  slug: string;
+  name: string;
+  tasks: number;
+  dirty: number;
+  unpushed: number;
+  mainCheckouts: number;
+  worktreesHint: string;
+  windowOpen: boolean;
+}

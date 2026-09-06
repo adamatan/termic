@@ -9,8 +9,7 @@ maintainer has one place to look for "what can I rip out yet."
 Related: [docs/data-model.md](data-model.md) (data dirs). The original
 workspace→task rename design lived in `docs/plans/workspace-to-task-rename.md`
 (deleted once shipped; see git history if you need the decision log). The
-still-relevant future layer above Project is
-[docs/plans/profiles.md](plans/profiles.md).
+layer above Project shipped as [docs/profiles.md](profiles.md).
 
 | # | Item | Introduced | Safe to remove | Status |
 |---|---|---|---|---|

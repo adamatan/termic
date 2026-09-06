@@ -20,6 +20,7 @@ import {
   UPDATE_DOCS_PROMPT, RESEARCH_PROMPT, CONTINUE_PROMPT, SIMPLIFY_PROMPT,
   WORK_ISSUE_PROMPT, HANDOFF_PROMPT, FIX_MERGE_CONFLICT_PROMPT,
 } from "@/lib/builtinPrompts";
+import { scoped } from "@/lib/profileScope";
 
 export interface Prompt {
   id: string;
@@ -57,7 +58,7 @@ export const DEFAULT_PROMPTS: readonly BuiltinDef[] = [
   { id: "builtin:research",        title: "Research first",       body: RESEARCH_PROMPT },
 ];
 
-const LS_KEY = "promptLibrary";
+const LS_KEY = scoped("promptLibrary");
 
 interface StoredCustom { id: string; title: string; body: string }
 

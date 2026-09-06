@@ -948,7 +948,7 @@ pub struct ControlPlanePaths {
 /// Resolve the REAL control-plane paths. Canonicalized because seatbelt
 /// evaluates canonical paths.
 pub fn control_plane_paths() -> ControlPlanePaths {
-    match crate::data_dir() {
+    match crate::global_dir() {
         Ok(d) => {
             let dd = canonicalize_or_keep(&d.to_string_lossy());
             ControlPlanePaths {

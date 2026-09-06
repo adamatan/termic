@@ -59,6 +59,9 @@ export interface TermicApi {
   /** PR/MR store (src/store/pr.ts). Specs seed `byTask` directly to render
    *  card states without a real forge/network. */
   usePr: { getState: () => any; setState: (p: any) => void };
+  /** Profiles registry as this window sees it (src/store/profiles.ts, GH
+   *  #280). Read for setup/teardown; the strip is what the spec asserts on. */
+  useProfiles: { getState: () => any; setState: (p: any) => void };
   ipc: any;
   invoke: (cmd: string, args?: Record<string, unknown>) => Promise<any>;
   runTabs: any;

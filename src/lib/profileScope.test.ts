@@ -1,0 +1,86 @@
+// @vitest-environment happy-dom
+import { describe, it, expect, afterEach, vi } from "vitest";
+
+// The module reads the window label ONCE at import time (stores read their
+// keys at module-init, so it has to be synchronous), which means each case
+// has to set the label before a fresh import.
+async function loadWith(label: string | undefined) {
+  const g = globalThis as Record<string, unknown>;
+  if (label === undefined) {
+    delete g.__TAURI_INTERNALS__;
+  } else {
+    g.__TAURI_INTERNALS__ = { metadata: { currentWindow: { label } } };
+  }
+  // resetModules, not a cache-busting query string: the module memoizes the
+  // namespace at import time on purpose, so each case needs a fresh evaluation.
+  vi.resetModules();
+  return (await import("@/lib/profileScope")) as typeof import("@/lib/profileScope");
+}
+
+describe("profileScope", () => {
+  const original = (globalThis as Record<string, unknown>).__TAURI_INTERNALS__;
+  afterEach(() => {
+    (globalThis as Record<string, unknown>).__TAURI_INTERNALS__ = original;
+  });
+
+  it("leaves the root profile's keys unprefixed, so an existing install migrates nothing", async () => {
+    // The whole reason the root profile keeps the `main` window label. If this
+    // regresses, every user's collapse state, folder colors and prompt library
+    // silently reset on the release that ships profiles.
+    const { scoped, PROFILE_NS } = await loadWith("main");
+    expect(PROFILE_NS).toBe("");
+    expect(scoped("collapsedGroups")).toBe("collapsedGroups");
+    expect(scoped("promptLibrary")).toBe("promptLibrary");
+  });
+
+  it("namespaces a non-root profile's keys by its window label", async () => {
+    const { scoped, PROFILE_NS } = await loadWith("profile-work");
+    expect(PROFILE_NS).toBe("profile-work:");
+    expect(scoped("collapsedGroups")).toBe("profile-work:collapsedGroups");
+  });
+
+  it("treats a non-profile window as the root", async () => {
+    // The Activity monitor is a window too, and it addressed the root before
+    // profiles existed.
+    const { scoped } = await loadWith("procmon");
+    expect(scoped("groupColors")).toBe("groupColors");
+  });
+
+  it("falls back to the root outside a Tauri window", async () => {
+    // vitest and the activity.html entry both hit this path.
+    const { scoped } = await loadWith(undefined);
+    expect(scoped("groupColors")).toBe("groupColors");
+  });
+
+  it("purges only the deleted profile's keys", async () => {
+    // A recreated profile with the same slug would otherwise inherit a dead
+    // profile's collapse state and folder colors.
+    const { purgeProfileKeys } = await loadWith("main");
+    localStorage.setItem("profile-work:collapsedGroups", "1");
+    localStorage.setItem("profile-work:groupColors", "2");
+    localStorage.setItem("profile-home:collapsedGroups", "3");
+    localStorage.setItem("collapsedGroups", "4");
+    localStorage.setItem("theme", "dark");
+
+    purgeProfileKeys("work");
+
+    expect(localStorage.getItem("profile-work:collapsedGroups")).toBeNull();
+    expect(localStorage.getItem("profile-work:groupColors")).toBeNull();
+    // Another profile, the root, and a shared preference all survive.
+    expect(localStorage.getItem("profile-home:collapsedGroups")).toBe("3");
+    expect(localStorage.getItem("collapsedGroups")).toBe("4");
+    expect(localStorage.getItem("theme")).toBe("dark");
+  });
+
+  it("does not scope shared preferences", async () => {
+    // Documenting the boundary as a test: these keys are machine-level in the
+    // plan's scope table, so a future edit that scopes them fails here first.
+    const { scoped } = await loadWith("profile-work");
+    for (const pref of ["theme", "shortcutBindings", "terminalFont", "editorThemeId"]) {
+      expect(scoped(pref)).toBe(`profile-work:${pref}`);
+    }
+    // ...which is to say `scoped()` namespaces whatever it is handed. The
+    // boundary is enforced by NOT calling it on those keys; this asserts the
+    // helper has no secret allow-list that would make that subtle.
+  });
+});

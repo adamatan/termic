@@ -210,3 +210,52 @@ Two things about it are load-bearing and easy to undo by accident. **The flag mu
 A general idle pattern needs the same submit gate the busy branch has. Codex paints its spinner during startup, so an ungated busy→idle transition arms a settle on a tab nobody has typed into and badges a "done" for a turn that never happened. `lastTitleState` is recorded even when the busy branch is suppressed, so gating only the busy side is not enough.
 
 Neither Claude nor Codex emits `OSC 9;4` any more (checked across ten PTY captures on Claude Code 2.1.250 and Codex 0.142.5, including a 150s run). Tier 1 above still describes the protocol correctly and the handler stays for agents that do emit it, but for these two the title is the only busy/idle source in practice.
+
+## A broadcast `emit` is a bug once there is more than one window (GH #280)
+
+`app.emit(topic, payload)` reaches EVERY webview. With one window that was
+correct and free; with one window per profile it hands every profile's webview
+every other profile's PTY bytes, setup logs and grep hits, and makes every
+window answer a CLI request only one of them can serve.
+
+Task-keyed events must go through `emit_scoped` (which parses the id out of the
+topic and memoizes the owning window) or `emit_scoped_by_id`. `pty://` resolves
+its label at SPAWN instead, because it is the hottest path in the app and a
+lookup per chunk is not free. An unresolvable id falls back to a broadcast
+deliberately: that is the pre-profiles behaviour, and far better than an event
+reaching no window at all.
+
+Genuinely global topics (`docker-build://`, `termic://windowless`,
+`termic://profiles-changed`) stay broadcasts. Ask "is this true of the machine
+or of one profile" before adding an emit.
+
+## `std::mem::take` on a shared queue swallows another window's work (GH #280)
+
+`deep_link_take_pending` drained the whole pending-URL queue for whichever
+webview asked first. With one window that was the single-reader property that
+made double-handling impossible; with N windows it means one profile eats
+links meant for another. The queue is now keyed by target label and each window
+drains only its own.
+
+Any "the webview drains everything" design needs re-reading with N windows in
+mind. Same for "the last writer wins": `tray_set_attention` had to become a
+merge across windows for exactly this reason.
+
+## localStorage is shared by every profile window, and always will be
+
+They are webviews on the same origin. Anything keyed by task UUID is safe
+(UUIDs are disjoint); anything keyed by a name, a project id, or nothing is
+silently global. `src/lib/profileScope.ts#scoped()` namespaces the keys a
+profile owns.
+
+Two things about it are load-bearing. It reads the window label
+SYNCHRONOUSLY, because stores read their keys at module-init and an async
+`profiles_list` would be a frame too late. And the root profile's namespace is
+EMPTY (its label is `main`), so an existing install reads its collapse state,
+folder colors and prompt library from the keys they are already in: if that
+regresses, every user's sidebar state resets on the release that ships
+profiles.
+
+Preferences (theme, fonts, terminal/editor settings, shortcut bindings) are
+deliberately NOT scoped: they are machine-level, and muscle memory does not
+change per identity.

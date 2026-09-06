@@ -21,6 +21,7 @@ import { takeUnattendedSpawn } from "@/lib/unattendedSpawns";
 import { failCliQueuedPromptsInTabs } from "@/lib/cliPromptReports";
 import { focusTerminalTab, focusMainTab, focusPaneTab } from "@/lib/tabFocus";
 import { agentDisplayName, STICKY_DONE_MS } from "@/lib/agents";
+import { scoped } from "@/lib/profileScope";
 
 /** A secondary agent tab closed via the "X", snapshotted just before it's
  *  dropped from `persisted_tabs` (see `syncDurableTabs`'s forget rule).
@@ -50,7 +51,7 @@ interface View {
    *  and panel state all stay intact while it's open. */
   settingsOpen?: boolean;
   /** When the Settings overlay is open, which section is selected. */
-  settingsTab?: "general" | "tasks" | "notifications" | "sandbox" | "docker" | "cli" | "appearance" | "agents" | "prompts" | "repositories" | "shortcuts";
+  settingsTab?: "general" | "tasks" | "notifications" | "sandbox" | "docker" | "cli" | "appearance" | "agents" | "prompts" | "repositories" | "shortcuts" | "profiles";
   /** When viewing a repository's settings, which project id is active. */
   settingsRepoId?: string;
   /** DOM id to scroll into view + briefly highlight once the settings
@@ -391,10 +392,10 @@ const LS_SPLITC  = "terminalSplitCollapsed"; // Record<taskId, boolean>
 const LS_SBW     = "sidebarWidth";
 const LS_RPW     = "rightPanelWidth";
 const LS_RFH     = "rightFooterHeight";
-const LS_COLLAPSED_PROJ = "collapsedProjects"; // Record<projId, true>
-const LS_COLLAPSED_TASK   = "collapsedTasks"; // Record<taskId, bool>
-const LS_COLLAPSED_GRP  = "collapsedGroups"; // Record<groupName, bool>
-const LS_GROUP_COLORS   = "groupColors"; // Record<groupName, paletteKey>
+const LS_COLLAPSED_PROJ = scoped("collapsedProjects"); // Record<projId, true>
+const LS_COLLAPSED_TASK   = scoped("collapsedTasks"); // Record<taskId, bool>
+const LS_COLLAPSED_GRP  = scoped("collapsedGroups"); // Record<groupName, bool>
+const LS_GROUP_COLORS   = scoped("groupColors"); // Record<groupName, paletteKey>
 const initialCollapsed   = (() => { try { return JSON.parse(localStorage.getItem(LS_COLLAPSED_PROJ) || "{}"); } catch { return {}; } })();
 const initialCollapsedTask = (() => { try { return JSON.parse(localStorage.getItem(LS_COLLAPSED_TASK)   || "{}"); } catch { return {}; } })();
 const initialCollapsedGrp = (() => { try { return JSON.parse(localStorage.getItem(LS_COLLAPSED_GRP) || "{}"); } catch { return {}; } })();

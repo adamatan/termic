@@ -60,6 +60,9 @@ mod procmon;
 mod procmon;
 mod docker;
 mod agent_dirs;
+mod profiles;
+#[cfg(test)]
+mod test_support;
 use sandbox::SandboxBundle;
 
 // ───────────────────────────── data model ─────────────────────────────
@@ -278,6 +281,14 @@ pub struct Project {
     /// new task freezes. Serde-default so existing rows load empty.
     #[serde(default)]
     pub extra_named_ports: Vec<String>,
+    /// Which profile this record was loaded from. IN-MEMORY ONLY
+    /// (`serde(skip)`): nothing is written into the JSON on disk, so there is
+    /// no schema bump and an existing install's files stay byte-identical.
+    /// It is derived from the directory the record was read from, and it is
+    /// how a write knows where to go without the caller naming a profile.
+    /// See docs/plans/profiles.md, "the profile rides the data, not the call".
+    #[serde(skip)]
+    pub profile: ProfileId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -608,6 +619,14 @@ pub struct Task {
     /// appends at the bottom instead of jumping to the top.
     #[serde(default)]
     pub order: Option<u32>,
+    /// Which profile this record was loaded from. IN-MEMORY ONLY
+    /// (`serde(skip)`): nothing is written into the JSON on disk, so there is
+    /// no schema bump and an existing install's files stay byte-identical.
+    /// It is derived from the directory the record was read from, and it is
+    /// how a write knows where to go without the caller naming a profile.
+    /// See docs/plans/profiles.md, "the profile rides the data, not the call".
+    #[serde(skip)]
+    pub profile: ProfileId,
 }
 
 /// One durable agent tab. `session_id` is termic's own per-tab session
@@ -831,7 +850,16 @@ pub struct CreateTaskArgs {
 /// their own (different webview origin: localhost vs asset protocol).
 const APP_DIR: &str = if cfg!(debug_assertions) { "termic_dev" } else { "termic" };
 
-fn data_dir() -> Result<PathBuf> {
+/// The GLOBAL data dir: state that is machine-wide rather than per profile.
+///
+/// The CLI socket and its token, the MCP token, the docker image and agent
+/// dirs, the downloaded LSP `servers/` cache, `backups/`, and the sandbox's
+/// own deny rule (which must cover EVERY profile, so it is anchored here and
+/// never at a profile dir). Renamed from `data_dir()` when profiles landed,
+/// deliberately: a caller that wants per-profile data must now type
+/// [`profile_dir`], and one that types this is stating that the thing is
+/// machine-wide. See docs/plans/profiles.md.
+fn global_dir() -> Result<PathBuf> {
     // Test/automation seam (DEBUG BUILDS ONLY): an explicit
     // TERMIC_DATA_DIR wins over the platform default, so a driven
     // instance (see automation.rs) runs against a scratch profile and
@@ -848,11 +876,54 @@ fn data_dir() -> Result<PathBuf> {
     Ok(p)
 }
 
-fn projects_file() -> Result<PathBuf> {
-    Ok(data_dir()?.join("projects.json"))
+use profiles::ProfileId;
+
+/// The registry, re-read on each call.
+///
+/// No cache, matching `load_projects` / `load_tasks` next door, which also
+/// read from disk on every IPC. It is a few hundred bytes and the consistency
+/// is worth more than the read: a cached registry would need invalidating from
+/// every window, and a window acting on a stale one would write into a deleted
+/// profile's directory.
+pub(crate) fn profiles_registry() -> profiles::Registry {
+    match global_dir() {
+        Ok(g) => profiles::load_registry(&g),
+        Err(_) => profiles::Registry::default(),
+    }
 }
-fn tasks_dir() -> Result<PathBuf> {
-    let p = data_dir()?.join("tasks");
+
+/// One profile's data directory, created on demand.
+///
+/// The root profile's is the app data dir itself, which is what keeps an
+/// install that never made a second profile byte-identical to a pre-profiles
+/// one (docs/plans/profiles.md, "the default profile stays exactly where it
+/// is").
+fn profile_dir(id: &ProfileId) -> Result<PathBuf> {
+    let p = profiles::profile_dir(&global_dir()?, id);
+    fs::create_dir_all(&p)?;
+    Ok(p)
+}
+
+/// The profile whose window issued a command.
+///
+/// The ONE place a window is consulted, and it is used only where the answer
+/// genuinely cannot come from a record: LISTING (which profile's projects does
+/// this sidebar show) and CREATING a project (which profile does this new one
+/// join). Everything else resolves from the data. Taking `window:
+/// tauri::Window` costs the frontend nothing, since Tauri injects it.
+///
+/// A window that is not a profile window at all (the Activity monitor) falls
+/// back to the root profile, which is what it addressed before profiles
+/// existed.
+fn window_profile(window: &tauri::Window) -> ProfileId {
+    ProfileId::from_window_label(window.label()).unwrap_or_default()
+}
+
+fn projects_file_in(id: &ProfileId) -> Result<PathBuf> {
+    Ok(profile_dir(id)?.join("projects.json"))
+}
+fn tasks_dir_in(id: &ProfileId) -> Result<PathBuf> {
+    let p = profile_dir(id)?.join("tasks");
     fs::create_dir_all(&p)?;
     Ok(p)
 }
@@ -1013,7 +1084,7 @@ fn project_tasks_root_with(default_path: &str, p: &Project) -> PathBuf {
 /// the stored global setting. This is the value Settings → Repository shows as
 /// the "Tasks path" placeholder.
 fn project_tasks_root_default(p: &Project) -> PathBuf {
-    tasks_root_from_default(&load_settings_inner().default_tasks_path, p)
+    tasks_root_from_default(&load_settings_in(&p.profile).default_tasks_path, p)
 }
 
 /// THE answer to "where do this project's worktree tasks go". Every
@@ -1082,8 +1153,20 @@ pub(crate) fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 // ───────────────────────────── projects IO ─────────────────────────────
 
-fn load_projects() -> Vec<Project> {
-    let f = match projects_file() {
+/// Every profile's projects, each tagged with the profile it came from.
+///
+/// The DEFAULT loader, and the one a by-id lookup wants: project ids are
+/// unique across profiles, so `load_projects_all().find(|p| p.id == id)` is
+/// correct without anyone naming a profile. Use [`load_projects_in`] when the
+/// answer is a LIST shown in one window, which is the only case that must not
+/// see across profiles.
+fn load_projects_all() -> Vec<Project> {
+    profiles_registry().ids().iter().flat_map(|id| load_projects_in(id)).collect()
+}
+
+/// One profile's projects. For listing, and for anything scoped to a window.
+fn load_projects_in(id: &ProfileId) -> Vec<Project> {
+    let f = match projects_file_in(id) {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
@@ -1100,8 +1183,13 @@ fn load_projects() -> Vec<Project> {
     // Normalization, not a migration: never dirties the list on its own, but
     // runs BEFORE the save so a write triggered above carries it for free.
     normalize_default_task_paths(&mut list);
+    // Tag BEFORE the save-back: the write has to land in the profile the
+    // records came from, not wherever the caller happens to be.
+    for p in list.iter_mut() {
+        p.profile = id.clone();
+    }
     if dirty {
-        let _ = save_projects(&list);
+        let _ = save_projects_in(id, &list);
     }
     list
 }
@@ -1274,14 +1362,58 @@ fn normalize_member(mut m: ProjectMember) -> Result<ProjectMember, String> {
         .collect();
     Ok(m)
 }
-fn save_projects(list: &[Project]) -> Result<()> {
+fn save_projects_in(id: &ProfileId, list: &[Project]) -> Result<()> {
     let json = serde_json::to_string_pretty(list)?;
-    write_atomic(&projects_file()?, json.as_bytes())?;
+    write_atomic(&projects_file_in(id)?, json.as_bytes())?;
     Ok(())
 }
 
-fn load_tasks() -> Vec<Task> {
-    let dir = match tasks_dir() {
+/// Persist a set of projects that may span profiles, each back where it came
+/// from.
+///
+/// A caller that mutated `load_projects_all()` holds a mixed list, and writing
+/// it to one profile would MOVE every other profile's projects into that one.
+/// Grouping by tag is what makes "load all, edit one, save" safe, which is the
+/// shape most of the existing call sites already have.
+fn save_projects(list: &[Project]) -> Result<()> {
+    let mut by_profile: std::collections::HashMap<ProfileId, Vec<Project>> =
+        std::collections::HashMap::new();
+    for id in profiles_registry().ids() {
+        by_profile.entry(id).or_default();
+    }
+    for p in list {
+        by_profile.entry(p.profile.clone()).or_default().push(p.clone());
+    }
+    let mut err = None;
+    for (id, group) in by_profile {
+        if let Err(e) = save_projects_in(&id, &group) {
+            err = Some(e);
+        }
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Every profile's tasks, each tagged with the profile it came from.
+///
+/// The DEFAULT loader. A task id is a UUID, so it is already unique across
+/// profiles and a by-id lookup does not care which one a record came from:
+/// that is what lets the ~90 lookup sites stay as they were. It is also what
+/// the PORT ALLOCATOR needs, since there is one process drawing from one port
+/// space and a per-profile view would hand out colliding blocks.
+///
+/// Use [`load_tasks_in`] for anything that becomes a LIST in one window.
+fn load_tasks_all() -> Vec<Task> {
+    let mut out: Vec<Task> = profiles_registry().ids().iter().flat_map(|id| load_tasks_in(id)).collect();
+    sort_tasks(&mut out);
+    out
+}
+
+/// One profile's tasks. For listing, and for anything scoped to a window.
+fn load_tasks_in(id: &ProfileId) -> Vec<Task> {
+    let dir = match tasks_dir_in(id) {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
@@ -1292,7 +1424,8 @@ fn load_tasks() -> Vec<Task> {
             // Only real task records: skip write_atomic staging files, .DS_Store, etc.
             if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
             if let Ok(s) = fs::read_to_string(&path) {
-                if let Ok(w) = serde_json::from_str::<Task>(&s) {
+                if let Ok(mut w) = serde_json::from_str::<Task>(&s) {
+                    w.profile = id.clone();
                     out.push(w);
                 }
             }
@@ -1308,7 +1441,7 @@ fn load_tasks() -> Vec<Task> {
 //   + PORT_BLOCK_BUFFER (room for a future "add port to live task").
 // New tasks first-fit into the gaps left by non-archived tasks, so
 // archived blocks get reused. Replaces the old
-// `18100 + load_tasks().len()` formula, which could collide once a
+// `18100 + load_tasks_all().len()` formula, which could collide once a
 // multi-repo task's member ports (base+i+1) overlapped the next
 // count-derived base.
 //
@@ -1384,7 +1517,7 @@ fn block_len(member_count: u16, extra_count: u16) -> u16 {
 /// Port allocation is a read-scan over the task files with no other
 /// synchronization, so two concurrent allocations against the same
 /// snapshot can pick the same block or stray. Hold this from the
-/// `load_tasks()` that feeds the scan until `save_task` has persisted
+/// `load_tasks_all()` that feeds the scan until `save_task` has persisted
 /// the claimed ports.
 static PORT_ALLOC_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
@@ -1494,7 +1627,7 @@ fn rehome_ports_if_stolen(task: &mut Task, others: &[Task], range: PortRange) ->
 /// set, same slots), but that is not a concurrency guarantee: a stray
 /// allocated against a stale `others` snapshot can collide with a
 /// concurrent allocation, so callers hold PORT_ALLOC_LOCK from the
-/// `load_tasks()` that produced `others` until the task is persisted.
+/// `load_tasks_all()` that produced `others` until the task is persisted.
 /// Returns true when pairs were added (caller persists).
 fn top_up_extra_ports(task: &mut Task, proj: &Project, others: &[Task], range: PortRange) -> bool {
     if task.port < PORT_ALLOC_MIN { return false; } // legacy record, no block
@@ -1573,15 +1706,26 @@ fn sort_tasks(list: &mut [Task]) {
             .then_with(|| a.created.cmp(&b.created))
     });
 }
+/// Write a task back to the profile it belongs to.
+///
+/// `w.profile` is the whole mechanism: a record loaded by id carries its
+/// profile, so a mutate-and-save round trip lands where it started without the
+/// caller having to know which window it is serving.
 fn save_task(w: &Task) -> Result<()> {
-    let f = tasks_dir()?.join(format!("{}.json", w.id));
+    let f = tasks_dir_in(&w.profile)?.join(format!("{}.json", w.id));
     let json = serde_json::to_string_pretty(w)?;
     write_atomic(&f, json.as_bytes())?;
     Ok(())
 }
 fn delete_task_file(id: &str) -> Result<()> {
-    let f = tasks_dir()?.join(format!("{id}.json"));
-    let _ = fs::remove_file(f);
+    forget_task_window(Some(id));
+    // Sweep every profile rather than guessing: the caller has only an id, and
+    // an unlink of a path that does not exist is free.
+    for pid in profiles_registry().ids() {
+        if let Ok(dir) = tasks_dir_in(&pid) {
+            let _ = fs::remove_file(dir.join(format!("{id}.json")));
+        }
+    }
     // The task record is gone for good (History's "Empty archive", or its
     // project being removed), so its scratchpads have nowhere left to appear.
     // ARCHIVING deliberately does not come through here: it is recoverable,
@@ -1615,7 +1759,7 @@ fn delete_task_file(id: &str) -> Result<()> {
 //      committed set has zero corrupt entries (prune-on-corruption).
 
 fn migration_log_file() -> Option<PathBuf> {
-    data_dir().ok().map(|d| d.join("tasks-migration.log"))
+    global_dir().ok().map(|d| d.join("tasks-migration.log"))
 }
 
 fn log_migration(msg: &str) {
@@ -1733,7 +1877,7 @@ fn ensure_git_excluded(repo: &Path, name: &str) {
 /// (the migration's commit marker). Written LAST so a crash before this leaves
 /// the guard un-bumped and the migration re-runs cleanly.
 fn stamp_schema_version() {
-    let mut s = settings_load();
+    let mut s = load_settings_inner();
     s.schema_version = TASKS_SCHEMA_VERSION;
     let _ = save_settings_inner(&s);
 }
@@ -1752,7 +1896,7 @@ fn stamp_schema_version() {
 /// migration simply retries next launch. Nothing here can fail in a way that
 /// should block startup.
 fn migrate_cli_enabled_default() {
-    let mut s = settings_load();
+    let mut s = load_settings_inner();
     if apply_cli_default_migration(&mut s) {
         let _ = save_settings_inner(&s);
     }
@@ -1808,10 +1952,10 @@ fn migrate_workspaces_to_tasks() {
     // Best-effort throughout: a migration failure must NEVER stop the app from
     // starting. Worst case the old layout stays in place and we retry next
     // launch (the guard is the committed schema_version, written last).
-    let data = match data_dir() { Ok(p) => p, Err(_) => return };
+    let data = match global_dir() { Ok(p) => p, Err(_) => return };
 
     // GUARD: already migrated?
-    if settings_load().schema_version >= TASKS_SCHEMA_VERSION {
+    if load_settings_inner().schema_version >= TASKS_SCHEMA_VERSION {
         return;
     }
 
@@ -1826,7 +1970,7 @@ fn migrate_workspaces_to_tasks() {
     };
     // Re-check the guard now that we hold the lock: the process that held it may
     // have just committed the migration while we waited to acquire.
-    if settings_load().schema_version >= TASKS_SCHEMA_VERSION {
+    if load_settings_inner().schema_version >= TASKS_SCHEMA_VERSION {
         return;
     }
 
@@ -1845,7 +1989,7 @@ fn migrate_workspaces_to_tasks() {
 
     log_migration(&format!(
         "starting workspaces->tasks migration (schema {} -> {})",
-        settings_load().schema_version, TASKS_SCHEMA_VERSION
+        load_settings_inner().schema_version, TASKS_SCHEMA_VERSION
     ));
 
     // 1. BACKUP metadata + settings + projects (cheap safety net).
@@ -2755,8 +2899,11 @@ fn repo_config_for(proj: &Project) -> repo_config::RepoConfig {
 ///   4. each contributing project's committed `.termic.yaml` sandbox
 ///      block — re-read fresh on every spawn.
 fn live_sandbox_lists(task: &Task) -> (Vec<String>, Vec<String>) {
-    let globals = load_settings_inner();
-    let projects = load_projects();
+    // The TASK'S profile, not the root's: settings are profile-scoped in full
+    // (docs/profiles.md), so a second profile's sandbox defaults have to be
+    // the ones a spawn under it actually gets.
+    let globals = load_settings_in(&task.profile);
+    let projects = load_projects_all();
     let mut rw = globals.sandbox_default_rw_paths.clone();
     let mut hosts = globals.sandbox_default_allowed_hosts.clone();
     // The task's own pinned arrays — the Sandbox dialog's
@@ -3013,8 +3160,11 @@ fn pty_spawn(
     let spawn_task = args
         .task_id
         .as_deref()
-        .and_then(|tid| load_tasks().into_iter().find(|t| t.id == tid));
-    let docker_globally_enabled = load_settings_inner().docker_sandbox_enabled;
+        .and_then(|tid| load_tasks_all().into_iter().find(|t| t.id == tid));
+    // Read from the SPAWNING task's profile. `spawn_task` is already
+    // resolved just above, so this costs nothing.
+    let spawn_profile = spawn_task.as_ref().map(|t| t.profile.clone()).unwrap_or_default();
+    let docker_globally_enabled = load_settings_in(&spawn_profile).docker_sandbox_enabled;
     // Fail closed, not open: a task that opted into Docker isolation must
     // never silently fall through to an unsandboxed spawn just because an
     // admin flipped the global switch off later (or Seatbelt's own
@@ -3057,7 +3207,7 @@ fn pty_spawn(
         // termic-labeled container alive then is provably orphaned) and
         // again at quit. Dropping it also takes daemon round trips off the
         // spawn path, which is a sync command.
-        let docker_settings = load_settings_inner();
+        let docker_settings = load_settings_in(&spawn_profile);
         let agent_extra_dirs = docker_settings.docker_agent_extra_dirs.get(&agent).cloned().unwrap_or_default();
         let agent_persist_enabled = docker_settings.docker_agent_persist_enabled.get(&agent).copied().unwrap_or(false);
         // Same live-rendered allow-list Seatbelt uses just below (re-read
@@ -3092,7 +3242,7 @@ fn pty_spawn(
     } else { match args
         .task_id
         .as_deref()
-        .and_then(|wid| load_tasks().into_iter().find(|w| w.id == wid))
+        .and_then(|wid| load_tasks_all().into_iter().find(|w| w.id == wid))
         .filter(|w| w.effective_sandbox_mode() != SandboxMode::Off)
         // Re-render the allow-lists each spawn so committed
         // `.termic.yaml` edits are picked up live, unioned with the
@@ -3205,7 +3355,7 @@ fn pty_spawn(
     // without hardcoding. Same scheme as the script-stream spawn.
     let mut task_name: Option<String> = None;
     if let Some(wid) = args.task_id.as_deref() {
-        if let Some(task) = load_tasks().into_iter().find(|w| w.id == wid) {
+        if let Some(task) = load_tasks_all().into_iter().find(|w| w.id == wid) {
             for (i, m) in task.composition.iter().enumerate() {
                 let p = if m.port == 0 { task.port.saturating_add(i as u16 + 1) } else { m.port };
                 let sanitized: String = m.dir_name.chars()
@@ -3395,7 +3545,7 @@ fn pty_spawn(
             // have its ENTIRE output emitted to nobody. `done` is still false
             // here, so this waits on the ack, not on itself.
             wait_for_attach(&buf_r, &attached_r, &done_r, PTY_ATTACH_GRACE);
-            let _ = app_final.emit(&format!("pty://{}", id_final), PtyChunk { data: remaining });
+            emit_scoped(&app_final, &format!("pty://{}", id_final), PtyChunk { data: remaining });
         }
         // Set `done` and notify UNDER the buffer mutex. The flusher and the
         // waiter both check `done` while holding it, then park; a store
@@ -3440,7 +3590,7 @@ fn pty_spawn(
             thread::sleep(interval);
             let data = std::mem::take(&mut *buf_f.0.lock());
             if !data.is_empty() {
-                let _ = app_f.emit(&format!("pty://{}", id_r), PtyChunk { data });
+                emit_scoped(&app_f, &format!("pty://{}", id_r), PtyChunk { data });
             }
             if done_f.load(Ordering::Acquire) {
                 break;
@@ -3475,7 +3625,7 @@ fn pty_spawn(
                 buf_w.1.wait(&mut b);
             }
         }
-        let _ = app_w.emit(&format!("pty-exit://{}", id_w), PtyExit { code });
+        emit_scoped(&app_w, &format!("pty-exit://{}", id_w), PtyExit { code });
         // Drop this PID from the sandbox's PID set so the path watcher
         // stops counting denies from anything that happened to inherit
         // this PID after exit (rare but possible on macOS).
@@ -3584,11 +3734,519 @@ fn pty_kill(state: State<'_, PtyManager>, pty_id: String) -> Result<(), String> 
 
 // ───────────────────────────── project commands ─────────────────────────────
 
-#[tauri::command]
-fn projects_list() -> Vec<Project> { load_projects() }
+
+// ─────────────────────────── profiles (GH #280) ───────────────────────────
+//
+// The registry and window lifecycle. The DATA layer lives up by `global_dir`
+// (`load_tasks_in`, `save_projects`, the profile tag on each record); this is
+// the part a user drives. See docs/plans/profiles.md.
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProfileView {
+    pub slug: String,
+    pub name: String,
+    pub accent: String,
+    pub order: u32,
+    /// True when this profile's window exists right now. Drives the popover's
+    /// "focus it" vs "launch it" wording, though both are one click.
+    pub open: bool,
+    /// True for the profile whose data is the app data dir itself.
+    pub is_root: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProfilesView {
+    pub profiles: Vec<ProfileView>,
+    /// The slug of the profile whose window asked. `None` in the dormant
+    /// state, which is what the sidebar keys "show no strip at all" off.
+    pub current: Option<String>,
+}
+
+fn profile_views(app: &AppHandle, reg: &profiles::Registry) -> Vec<ProfileView> {
+    use tauri::Manager;
+    let mut out: Vec<ProfileView> = reg
+        .profiles
+        .iter()
+        .map(|p| {
+            let id = reg.id_for(&p.slug);
+            ProfileView {
+                slug: p.slug.clone(),
+                name: p.name.clone(),
+                accent: p.accent.clone(),
+                order: p.order,
+                open: app.get_webview_window(&id.window_label()).is_some(),
+                is_root: id.is_root(),
+            }
+        })
+        .collect();
+    out.sort_by_key(|p| p.order);
+    out
+}
+
+/// Which slug the calling window is, if any.
+///
+/// Resolved through the REGISTRY rather than straight off the label, because
+/// the root window is labelled `main` and its slug is whatever `root_slug`
+/// says.
+fn slug_of_window(reg: &profiles::Registry, window: &tauri::Window) -> Option<String> {
+    match ProfileId::from_window_label(window.label())? {
+        ProfileId::Root => reg.root_slug.clone(),
+        ProfileId::Slug(s) => reg.get(&s).map(|p| p.slug.clone()),
+    }
+}
 
 #[tauri::command]
-fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, String> {
+fn profiles_list(app: AppHandle, window: tauri::Window) -> ProfilesView {
+    let reg = profiles_registry();
+    ProfilesView {
+        profiles: profile_views(&app, &reg),
+        current: slug_of_window(&reg, &window),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProfileArgs {
+    pub name: String,
+    pub accent: String,
+    /// Worktrees base for the new profile. Empty seeds
+    /// `~/<APP_DIR>/profiles/<slug>/tasks`.
+    #[serde(default)]
+    pub tasks_path: String,
+    /// Naming the profile that ALREADY exists. Required on the FIRST create
+    /// and ignored afterwards: creating the first new profile is the moment
+    /// the current install becomes "a profile", and it needs a name then or
+    /// the strip reads "Default" forever.
+    #[serde(default)]
+    pub existing_name: Option<String>,
+    #[serde(default)]
+    pub existing_accent: Option<String>,
+}
+
+/// The worktrees base a new profile is SEEDED with.
+///
+/// The `profiles/` level namespaces slugs: a profile called "tasks" or
+/// "workspaces" would otherwise land on the two directories that already mean
+/// something under `~/<APP_DIR>/`. Tilde-form, matching `builtin_tasks_path`,
+/// because it is what the user sees in Settings.
+fn builtin_profile_tasks_path(slug: &str) -> String {
+    format!("~/{APP_DIR}/profiles/{slug}/tasks")
+}
+
+/// The pure registry half of creating a profile: no filesystem, no windows.
+///
+/// Extracted so the one rule with a real edge case is testable: creating the
+/// FIRST profile also has to adopt the install that already exists, and both
+/// entries must appear in the same write or the registry briefly names one of
+/// two profiles.
+fn registry_add_profile(
+    reg: &mut profiles::Registry,
+    name: &str,
+    accent: &str,
+    existing_name: Option<&str>,
+    existing_accent: Option<&str>,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("profile name is required".into());
+    }
+    if reg.profiles.is_empty() {
+        let existing_name = existing_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("naming the existing profile is required when creating the first one")?;
+        let existing_slug = profiles::slugify(existing_name, &std::collections::HashSet::new());
+        reg.profiles.push(profiles::Profile {
+            slug: existing_slug.clone(),
+            name: existing_name.to_string(),
+            accent: existing_accent.unwrap_or("blue").to_string(),
+            order: 0,
+            last_focused_at: None,
+            open_at_quit: false,
+        });
+        reg.root_slug = Some(existing_slug);
+    }
+    // Dedupe against the adopted root too: "Work" twice must not collide.
+    let taken: std::collections::HashSet<String> =
+        reg.profiles.iter().map(|p| p.slug.clone()).collect();
+    let slug = profiles::slugify(name, &taken);
+    let order = reg.profiles.iter().map(|p| p.order).max().map(|m| m + 1).unwrap_or(0);
+    reg.profiles.push(profiles::Profile {
+        slug: slug.clone(),
+        name: name.to_string(),
+        accent: accent.to_string(),
+        order,
+        last_focused_at: None,
+        open_at_quit: false,
+    });
+    Ok(slug)
+}
+
+#[tauri::command]
+fn profile_create(app: AppHandle, args: CreateProfileArgs) -> Result<ProfileView, String> {
+    let g = global_dir().map_err(|e| e.to_string())?;
+    let mut reg = profiles::load_registry(&g);
+    let slug = registry_add_profile(
+        &mut reg,
+        &args.name,
+        &args.accent,
+        args.existing_name.as_deref(),
+        args.existing_accent.as_deref(),
+    )?;
+    profiles::save_registry(&g, &reg).map_err(|e| e.to_string())?;
+
+    // Seed the new profile's settings. NOT blank: agent DETECTION is a machine
+    // fact, so the registry is inherited from the profile that already ran it
+    // rather than making the user re-detect every CLI. See
+    // docs/plans/profiles.md, "Profile creation seeds, it never blanks".
+    let id = reg.id_for(&slug);
+    let mut seeded = load_settings_in(&ProfileId::Root);
+    seeded.default_tasks_path = if args.tasks_path.trim().is_empty() {
+        builtin_profile_tasks_path(&slug)
+    } else {
+        args.tasks_path.trim().to_string()
+    };
+    // Projects and tasks are the profile's own; only the machine-level agent
+    // registry carries over.
+    save_settings_in(&id, &seeded)?;
+    save_projects_in(&id, &[]).map_err(|e| e.to_string())?;
+
+    let order = reg.get(&slug).map(|p| p.order).unwrap_or(0);
+    let view = ProfileView {
+        slug: slug.clone(),
+        name: args.name.trim().to_string(),
+        accent: args.accent,
+        order,
+        open: false,
+        is_root: id.is_root(),
+    };
+    // Every window's strip has to learn there is now more than one profile.
+    forget_task_window(None);
+    rebuild_tray_menu(&app);
+    let _ = app.emit("termic://profiles-changed", ());
+    Ok(view)
+}
+
+#[tauri::command]
+fn profile_update(app: AppHandle, slug: String, name: Option<String>, accent: Option<String>) -> Result<(), String> {
+    let g = global_dir().map_err(|e| e.to_string())?;
+    let mut reg = profiles::load_registry(&g);
+    let Some(p) = reg.profiles.iter_mut().find(|p| p.slug == slug) else {
+        return Err(format!("no such profile: {slug}"));
+    };
+    // The SLUG is deliberately not touched. It keys both trees, and CWD-resume
+    // agents key sessions to the working directory, so a rename that relocated
+    // worktrees would silently orphan every conversation under them.
+    if let Some(n) = name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        p.name = n.to_string();
+    }
+    if let Some(a) = accent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        p.accent = a.to_string();
+    }
+    let title = format!("Termic - {}", p.name);
+    let id = reg.id_for(&slug);
+    profiles::save_registry(&g, &reg).map_err(|e| e.to_string())?;
+    {
+        use tauri::Manager;
+        if let Some(win) = app.get_webview_window(&id.window_label()) {
+            if !id.is_root() {
+                let _ = win.set_title(&title);
+            }
+        }
+    }
+    forget_task_window(None);
+    rebuild_tray_menu(&app);
+    let _ = app.emit("termic://profiles-changed", ());
+    Ok(())
+}
+
+/// Open a profile's window, or focus it if it is already up.
+///
+/// One action from the user's side, which is why the popover does not
+/// distinguish them: switching profiles IS opening a window.
+#[tauri::command]
+fn profile_open(app: AppHandle, slug: String) -> Result<(), String> {
+    use tauri::Manager;
+    let g = global_dir().map_err(|e| e.to_string())?;
+    let mut reg = profiles::load_registry(&g);
+    if reg.get(&slug).is_none() {
+        return Err(format!("no such profile: {slug}"));
+    }
+    let id = reg.id_for(&slug);
+
+    // Chrome's tie-break for a project that lives in several profiles is
+    // "most recently focused window", so focusing has to be recorded.
+    if let Some(p) = reg.profiles.iter_mut().find(|p| p.slug == slug) {
+        p.last_focused_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+    let _ = profiles::save_registry(&g, &reg);
+
+    let win = match app.get_webview_window(&id.window_label()) {
+        Some(w) => w,
+        None => build_profile_window(&app, &id).map_err(|e| e.to_string())?,
+    };
+    let _ = win.unminimize();
+    let _ = win.show();
+    focus_window_unless_e2e(&win);
+    // A profile window is a window: an app that was windowless has one again.
+    leave_windowless(&app);
+    // The menu marks the open profiles, so opening one changes it.
+    rebuild_tray_menu(&app);
+    Ok(())
+}
+
+/// Stop using profiles, keeping every byte of data.
+///
+/// A DIFFERENT operation from deleting a profile, and it has to be, because
+/// the two conflict for the last one: a delete is refused while the profile's
+/// window is open, and the last remaining profile is always the one whose
+/// window you are in. Without this, "a user can fully back out of the
+/// feature" (docs/plans/profiles.md) would be unreachable from inside the app.
+///
+/// So this is not a delete at all. It unlinks `profiles.json` and touches
+/// nothing else: the profile's data IS the root data, which stays exactly
+/// where it is, and the app returns to the shape it had before anyone made a
+/// profile. Refused while more than one profile exists, because then the
+/// question of what happens to the OTHER profiles' data has a real answer the
+/// user has to give.
+#[tauri::command]
+fn profiles_disable(app: AppHandle) -> Result<(), String> {
+    let g = global_dir().map_err(|e| e.to_string())?;
+    let reg = profiles::load_registry(&g);
+    if reg.profiles.len() > 1 {
+        return Err(
+            "delete the other profiles first: turning profiles off with several of them would leave their projects and tasks unreachable"
+                .into(),
+        );
+    }
+    // Only the root profile can be the last one standing. A non-root profile
+    // alone would mean the root's data is orphaned, which the delete path
+    // never produces, but refuse rather than silently strand it.
+    if reg.profiles.len() == 1 && reg.root_slug.is_none() {
+        return Err("this profile does not own the main data directory; delete it instead".into());
+    }
+    profiles::save_registry(&g, &profiles::Registry::default()).map_err(|e| e.to_string())?;
+    forget_task_window(None);
+    rebuild_tray_menu(&app);
+    let _ = app.emit("termic://profiles-changed", ());
+    Ok(())
+}
+
+/// Close a profile's window.
+///
+/// Exists because deleting a profile is refused while its window is open, and
+/// "go find that window and close it" is a poor instruction when the window
+/// may be on another Space or another monitor. The delete dialog offers this
+/// as a button instead.
+///
+/// Refuses to close the CALLING window: that is the red button's job, and
+/// closing the window you are driving from would leave the dialog you clicked
+/// in mid-air.
+#[tauri::command]
+fn profile_close(app: AppHandle, window: tauri::Window, slug: String) -> Result<(), String> {
+    use tauri::Manager;
+    let reg = profiles_registry();
+    if reg.get(&slug).is_none() {
+        return Err(format!("no such profile: {slug}"));
+    }
+    let id = reg.id_for(&slug);
+    let label = id.window_label();
+    if window.label() == label {
+        return Err("close this window with its own close button".into());
+    }
+    if let Some(win) = app.get_webview_window(&label) {
+        // A deliberate close, so launch restore must not bring it back.
+        set_open_at_quit(&id, false);
+        win.destroy().map_err(|e| e.to_string())?;
+    }
+    rebuild_tray_menu(&app);
+    let _ = app.emit("termic://profiles-changed", ());
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileDeletePreview {
+    pub slug: String,
+    pub name: String,
+    pub tasks: usize,
+    /// Tasks whose worktree has uncommitted changes. The count that decides
+    /// whether the confirmation checkbox is load-bearing or noise.
+    pub dirty: usize,
+    /// Tasks whose branch has commits the upstream does not have.
+    pub unpushed: usize,
+    /// Tasks pointing at the user's own repo checkout rather than a worktree
+    /// termic created. NEVER removed, in either scope.
+    pub main_checkouts: usize,
+    /// Where the worktrees are, shown verbatim in the "keep" option so the
+    /// user can go find them.
+    pub worktrees_hint: String,
+    /// True while the profile's window is up: the delete is REFUSED until it
+    /// is closed, so no PTY is running under the profile at the moment of
+    /// deletion and killing a live agent is never something this does behind
+    /// the user's back.
+    pub window_open: bool,
+}
+
+#[tauri::command]
+async fn profile_delete_preview(app: AppHandle, slug: String) -> Result<ProfileDeletePreview, String> {
+    tauri::async_runtime::spawn_blocking(move || profile_delete_preview_sync(&app, &slug))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn profile_delete_preview_sync(app: &AppHandle, slug: &str) -> Result<ProfileDeletePreview, String> {
+    use tauri::Manager;
+    let reg = profiles_registry();
+    let Some(p) = reg.get(slug) else { return Err(format!("no such profile: {slug}")) };
+    let id = reg.id_for(slug);
+    let tasks = load_tasks_in(&id);
+
+    let mut dirty = 0usize;
+    let mut unpushed = 0usize;
+    let mut main_checkouts = 0usize;
+    for t in &tasks {
+        if t.is_main_checkout {
+            main_checkouts += 1;
+        }
+        let path = Path::new(&t.path);
+        if !path.exists() {
+            continue;
+        }
+        if !git(&["status", "--porcelain"], path).unwrap_or_default().trim().is_empty() {
+            dirty += 1;
+        }
+        if ahead_count(path) > 0 {
+            unpushed += 1;
+        }
+    }
+    let worktrees_hint = load_settings_in(&id).default_tasks_path;
+    Ok(ProfileDeletePreview {
+        slug: slug.to_string(),
+        name: p.name.clone(),
+        tasks: tasks.len(),
+        dirty,
+        unpushed,
+        main_checkouts,
+        worktrees_hint,
+        window_open: app.get_webview_window(&id.window_label()).is_some(),
+    })
+}
+
+#[tauri::command]
+async fn profile_delete(app: AppHandle, slug: String, delete_worktrees: bool) -> Result<(), String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || profile_delete_sync(&app2, &slug, delete_worktrees))
+        .await
+        .map_err(|e| e.to_string())??;
+    forget_task_window(None);
+    rebuild_tray_menu(&app);
+    let _ = app.emit("termic://profiles-changed", ());
+    Ok(())
+}
+
+fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool) -> Result<(), String> {
+    use tauri::Manager;
+    let g = global_dir().map_err(|e| e.to_string())?;
+    let mut reg = profiles::load_registry(&g);
+    if reg.get(slug).is_none() {
+        return Err(format!("no such profile: {slug}"));
+    }
+    let id = reg.id_for(slug);
+
+    // PRECONDITION, not a race to handle: one window per profile makes this a
+    // rule the user can act on. Live agents in that window are their decision,
+    // made before the dialog appears.
+    if app.get_webview_window(&id.window_label()).is_some() {
+        return Err("close the profile's window before deleting it".into());
+    }
+
+    // Back up the metadata FIRST, following the task migration's precedent. A
+    // few JSON files, so it costs nothing and makes the cheap half of a
+    // mistake recoverable. Worktrees are NOT backed up: they are large, and
+    // the keep scope already leaves them alone.
+    let stamp = chrono::Utc::now().to_rfc3339().replace(':', "-");
+    let backup = g.join("backups").join(format!("pre-profile-delete-{slug}-{stamp}"));
+    let _ = fs::create_dir_all(&backup);
+    let src = profiles::profile_dir(&g, &id);
+    for f in ["settings.json", "projects.json"] {
+        let _ = fs::copy(src.join(f), backup.join(f));
+    }
+    if let Ok(rd) = fs::read_dir(src.join("tasks")) {
+        let _ = fs::create_dir_all(backup.join("tasks"));
+        for e in rd.flatten() {
+            let _ = fs::copy(e.path(), backup.join("tasks").join(e.file_name()));
+        }
+    }
+
+    if delete_worktrees {
+        for t in load_tasks_in(&id) {
+            // `is_main_checkout` points at the user's live repository, which
+            // termic did not create and must not remove. Same reason archive
+            // already skips `git worktree remove` for them.
+            if t.is_main_checkout {
+                continue;
+            }
+            let wt = PathBuf::from(&t.path);
+            if !wt.exists() {
+                continue;
+            }
+            // `git worktree remove --force` against the source repo, exactly
+            // as task_archive does, NEVER remove_dir_all: a blind recursive
+            // delete leaves a dangling registration in the parent repo's
+            // .git/worktrees/ until someone runs `git worktree prune`, and the
+            // parent repo is the user's own, not ours to leave dirty.
+            let repo = load_projects_all()
+                .into_iter()
+                .find(|p| p.id == t.project_id)
+                .map(|p| PathBuf::from(p.root_path));
+            if let Some(repo) = repo {
+                let _ = git(&["worktree", "remove", "--force", &t.path], &repo);
+            }
+            if wt.exists() {
+                dlog(&format!("[profiles] worktree survived removal, leaving it: {}", t.path));
+            }
+            prune_empty_worktree_ancestors(&wt);
+        }
+    }
+
+    // Branches are NEVER deleted. Archive asks separately, and a bulk profile
+    // delete is the worst possible place to answer that on the user's behalf.
+
+    // Drop the profile's data. For the ROOT profile this is the four entries
+    // it owns, never the directory: the root also holds genuinely global state
+    // (profiles.json, docker/, backups/).
+    if id.is_root() {
+        let _ = fs::remove_file(src.join("settings.json"));
+        let _ = fs::remove_file(src.join("projects.json"));
+        let _ = fs::remove_dir_all(src.join("tasks"));
+        let _ = fs::remove_dir_all(src.join("scratch"));
+        reg.root_slug = None;
+    } else {
+        let _ = fs::remove_dir_all(&src);
+        // Prune the now-empty `profiles/` parent, so backing out of the
+        // feature leaves the data dir looking exactly as it did before
+        // anyone made a profile. `remove_dir` (not _all): a non-empty parent
+        // means another profile still lives there and this is a no-op.
+        let _ = fs::remove_dir(g.join(profiles::PROFILES_SUBDIR));
+    }
+    reg.profiles.retain(|p| p.slug != slug);
+    // Deleting the LAST profile removes profiles.json entirely and returns the
+    // app to its pre-profiles shape (save_registry does the unlink), which is
+    // the property that makes trying the feature cheap.
+    profiles::save_registry(&g, &reg).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn projects_list(window: tauri::Window) -> Vec<Project> {
+    // A LIST shown in one window: scoped, and one of only two places a window
+    // is consulted at all. See `window_profile`.
+    load_projects_in(&window_profile(&window))
+}
+
+#[tauri::command]
+fn project_add(window: tauri::Window, root_path: String, non_git: Option<bool>) -> Result<Project, String> {
     // Trim whitespace + expand a leading `~` — users paste paths with
     // both routinely. The naive `pb.join(".git").exists()` check we used
     // to do here missed: worktrees (`.git` is a FILE not a dir),
@@ -3618,7 +4276,7 @@ fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, Stri
         // cli_server::handle_project_add's --non-git hint.
         return Err(format!("{} is not a git repo. Confirm adding it as a plain folder.", expanded));
     }
-    let mut list = load_projects();
+    let mut list = load_projects_all();
     let canon = fs::canonicalize(&pb).map_err(|e| e.to_string())?;
     if list.iter().any(|p| p.root_path == canon.to_string_lossy()) {
         // NOTE: the "project already added" substring is load-bearing for
@@ -3631,6 +4289,9 @@ fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, Stri
     let remote = if non_git { String::new() } else { detect_default_remote(&canon) };
     let base = if non_git { String::new() } else { detect_base_branch(&canon, &remote).unwrap_or_else(|_| "main".into()) };
     let p = Project {
+        // The one thing that genuinely cannot come from a record: a NEW
+        // project joins the profile whose window asked for it.
+        profile: window_profile(&window),
         id: Uuid::new_v4().to_string(),
         name,
         root_path: canon.to_string_lossy().into_owned(),
@@ -3715,7 +4376,7 @@ fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, Stri
 /// auto-create case + the project's display label). `member_ids`
 /// reference already-added Termic projects.
 #[tauri::command]
-fn project_add_multi(root_path: String, name: String, members: Vec<ProjectMember>, non_git: Option<bool>) -> Result<Project, String> {
+fn project_add_multi(window: tauri::Window, root_path: String, name: String, members: Vec<ProjectMember>, non_git: Option<bool>) -> Result<Project, String> {
     let non_git = non_git.unwrap_or(false);
     let trimmed_path = root_path.trim();
     let trimmed_name = name.trim();
@@ -3817,7 +4478,7 @@ fn project_add_multi(root_path: String, name: String, members: Vec<ProjectMember
         }
     };
 
-    let mut list = load_projects();
+    let mut list = load_projects_all();
     let canon = fs::canonicalize(&pb).map_err(|e| e.to_string())?;
     if list.iter().any(|p| p.root_path == canon.to_string_lossy()) {
         return Err("a project at this path is already added".into());
@@ -3845,6 +4506,9 @@ fn project_add_multi(root_path: String, name: String, members: Vec<ProjectMember
     let base = if non_git { String::new() } else { detect_base_branch(&canon, &remote).unwrap_or_else(|_| "main".into()) };
     let name = trimmed_name.to_string();
     let p = Project {
+        // The one thing that genuinely cannot come from a record: a NEW
+        // project joins the profile whose window asked for it.
+        profile: window_profile(&window),
         id: Uuid::new_v4().to_string(),
         name,
         root_path: canon.to_string_lossy().into_owned(),
@@ -3894,7 +4558,7 @@ fn project_add_multi(root_path: String, name: String, members: Vec<ProjectMember
 /// post-create. Errors for single-repo projects.
 #[tauri::command]
 fn project_set_members(id: String, members: Vec<ProjectMember>) -> Result<(), String> {
-    let mut list = load_projects();
+    let mut list = load_projects_all();
     let host = match list.iter().find(|p| p.id == id) {
         Some(p) => p.clone(),
         None => return Err("no such project".into()),
@@ -3930,7 +4594,7 @@ fn project_set_members(id: String, members: Vec<ProjectMember>) -> Result<(), St
 /// per-project sort_key field needed.
 #[tauri::command]
 fn project_reorder(ids: Vec<String>) -> Result<(), String> {
-    let mut list = load_projects();
+    let mut list = load_projects_all();
     let mut out: Vec<Project> = Vec::with_capacity(list.len());
     let mut taken: HashSet<String> = HashSet::new();
     for id in &ids {
@@ -3957,7 +4621,7 @@ fn project_set_group(ids: Vec<String>, group: Option<String>) -> Result<(), Stri
         let t = g.trim().to_string();
         if t.is_empty() { None } else { Some(t) }
     });
-    let mut list = load_projects();
+    let mut list = load_projects_all();
     for p in list.iter_mut() {
         if ids.contains(&p.id) {
             p.group = group.clone();
@@ -3968,7 +4632,7 @@ fn project_set_group(ids: Vec<String>, group: Option<String>) -> Result<(), Stri
 
 #[tauri::command]
 fn project_update(p: Project) -> Result<(), String> {
-    let mut list = load_projects();
+    let mut list = load_projects_all();
     if let Some(slot) = list.iter_mut().find(|x| x.id == p.id) {
         *slot = p;
         save_projects(&list).map_err(|e| e.to_string())?;
@@ -3986,7 +4650,7 @@ fn project_update(p: Project) -> Result<(), String> {
 #[tauri::command]
 async fn project_remove(id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let tasks: Vec<Task> = load_tasks()
+        let tasks: Vec<Task> = load_tasks_all()
             .into_iter().filter(|w| w.project_id == id).collect();
         for w in tasks {
             // task_archive_sync handles SIGTERMing scripts, running the
@@ -4000,7 +4664,7 @@ async fn project_remove(id: String) -> Result<(), String> {
             // entry pointing at a non-existent project.
             let _ = delete_task_file(&w.id);
         }
-        let mut list = load_projects();
+        let mut list = load_projects_all();
         list.retain(|p| p.id != id);
         save_projects(&list).map_err(|e| e.to_string())
     }).await.map_err(|e| e.to_string())?
@@ -4009,7 +4673,7 @@ async fn project_remove(id: String) -> Result<(), String> {
 // ───────────────────────────── task commands ─────────────────────────────
 
 #[tauri::command]
-fn tasks_list() -> Vec<Task> { load_tasks() }
+fn tasks_list() -> Vec<Task> { load_tasks_all() }
 
 /// GH #169: normalize an externally-started session id and seed it as the
 /// per-cli session, so the default tab's first spawn composes the agent's
@@ -4062,7 +4726,7 @@ fn task_open_repo(
     resume_session_id: Option<String>,
     resume_override: Option<String>,
 ) -> Result<Task, String> {
-    let proj = load_projects().into_iter().find(|p| p.id == project_id)
+    let proj = load_projects_all().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
     // CLI is now explicit — frontend's "+ Open repo with <agent>" passes the
     // chosen agent id. Falls back to project default for older call sites.
@@ -4096,7 +4760,7 @@ fn task_open_repo(
     let port_block_len = block_len(member_count_hint, extra_names.len() as u16);
     // Held until save_task below persists the claimed block.
     let _port_guard = PORT_ALLOC_LOCK.lock();
-    let port = next_base_port(&load_tasks(), port_block_len, current_port_range())?;
+    let port = next_base_port(&load_tasks_all(), port_block_len, current_port_range())?;
 
     // Multi-repo project opened in REPO mode: drop a symlink for
     // each member into the host's working dir so the agent at the
@@ -4181,7 +4845,7 @@ fn task_open_repo(
     // "Terminal" passes no name, so every unnamed session lands on the
     // branch name) is auto-bumped past the twins instead, or the second
     // unnamed session would be impossible.
-    let tasks_now = load_tasks();
+    let tasks_now = load_tasks_all();
     let ws_name = if derived {
         unique_task_name(&ws_name, &tasks_now, &proj.id)
     } else {
@@ -4223,7 +4887,7 @@ fn task_open_repo(
     // turned Docker mode on for this task, same as the always-on per-agent
     // config dir mount.
     let docker_extra_mounts = docker_extra_mounts
-        .unwrap_or_else(|| if docker_sandbox_enabled { load_settings_inner().docker_default_extra_mounts } else { Vec::new() });
+        .unwrap_or_else(|| if docker_sandbox_enabled { load_settings_in(&proj.profile).docker_default_extra_mounts } else { Vec::new() });
     // Externally-started session to attach (GH #169): the natural fit
     // here, since the main checkout shares its cwd with sessions the user
     // started in the repo directly. NOTE has_resumable_history stays
@@ -4234,6 +4898,10 @@ fn task_open_repo(
     let task = Task {
         id: Uuid::new_v4().to_string(),
         project_id: proj.id.clone(),
+        // A task's profile is ALWAYS its project's: a task belongs to a
+        // project and a project belongs to a profile, so creation never
+        // needs to be told which one.
+        profile: proj.profile.clone(),
         // Caller-supplied name (preferred — the sidebar prompts for one
         // so multiple repo-root sessions don't collide). Falls back to
         // the branch name; the "REPO ROOT" chip in the sidebar shows
@@ -4312,7 +4980,7 @@ fn canon_str(p: &str) -> String {
 /// Empty for non-git projects.
 #[tauri::command]
 fn task_importable_worktrees(project_id: String) -> Result<Vec<ImportableWorktree>, String> {
-    let proj = load_projects().into_iter().find(|p| p.id == project_id)
+    let proj = load_projects_all().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
     if proj.non_git { return Ok(Vec::new()); }
     let repo = PathBuf::from(&proj.root_path);
@@ -4322,7 +4990,7 @@ fn task_importable_worktrees(project_id: String) -> Result<Vec<ImportableWorktre
     let listed = git(&["worktree", "list", "--porcelain"], &repo).map_err(|e| e.to_string())?;
 
     let main_canon = canon_str(&proj.root_path);
-    let existing: HashSet<String> = load_tasks().iter()
+    let existing: HashSet<String> = load_tasks_all().iter()
         .filter(|w| w.project_id == proj.id)
         .map(|w| canon_str(&w.path))
         .collect();
@@ -4378,7 +5046,7 @@ fn task_import_worktree(
     resume_override: Option<String>,
     yolo: Option<bool>,
 ) -> Result<Task, String> {
-    let proj = load_projects().into_iter().find(|p| p.id == project_id)
+    let proj = load_projects_all().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
     if proj.non_git { return Err("project is not a git repo".into()); }
     let repo = PathBuf::from(&proj.root_path);
@@ -4406,7 +5074,7 @@ fn task_import_worktree(
     // Port lock held until save_task below: `existing_tasks` also feeds
     // the port allocation, so it must stay the authoritative occupancy.
     let _port_guard = PORT_ALLOC_LOCK.lock();
-    let existing_tasks = load_tasks();
+    let existing_tasks = load_tasks_all();
     if existing_tasks.iter().any(|w| !w.archived && canon_str(&w.path) == wt_canon) {
         return Err("this worktree is already open as a task".into());
     }
@@ -4441,7 +5109,7 @@ fn task_import_worktree(
     // Sandbox: honor the dialog's explicit choice when provided, else
     // fall back to the project default + the merged default lists (same
     // shape as task_create).
-    let globals = load_settings_inner();
+    let globals = load_settings_in(&proj.profile);
     let merge = |g: &[String], p: &[String]| -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -4489,6 +5157,10 @@ fn task_import_worktree(
     let task = Task {
         id: Uuid::new_v4().to_string(),
         project_id: proj.id.clone(),
+        // A task's profile is ALWAYS its project's: a task belongs to a
+        // project and a project belongs to a profile, so creation never
+        // needs to be told which one.
+        profile: proj.profile.clone(),
         name: ws_name,
         branch: branch.clone(),
         // We don't know the original base ref; the branch itself is a
@@ -4555,7 +5227,7 @@ async fn task_create(app: AppHandle, args: CreateTaskArgs) -> Result<Task, Strin
 /// script) with no second event name to wire up. Progress is best-effort:
 /// a dropped event only costs a missing log line, never the creation itself.
 fn emit_create_progress(app: &AppHandle, task_id: &str, line: impl Into<String>) {
-    let _ = app.emit(&format!("setup-output://{task_id}"), serde_json::json!({ "line": line.into() }));
+    emit_scoped(&app, &format!("setup-output://{task_id}"), serde_json::json!({ "line": line.into() }));
 }
 
 fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String> {
@@ -4566,7 +5238,7 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
     // can subscribe before the race window); the fallback only matters for
     // non-UI callers (CLI `new_task`), which don't listen anyway.
     let task_id = args.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
-    let projects = load_projects();
+    let projects = load_projects_all();
     let proj = projects.iter().find(|p| p.id == args.project_id)
         .ok_or("project not found")?.clone();
     let repo = PathBuf::from(&proj.root_path);
@@ -4594,8 +5266,11 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
 
     // Personal settings, loaded ONCE here and reused for the tasks root and
     // the sandbox defaults further down.
-    let globals = load_settings_inner();
-    let wt_root = project_tasks_root(&globals.default_tasks_path, &proj)?;
+    let globals = load_settings_in(&proj.profile);
+    // The PROJECT's profile owns the worktrees base. Reading the root's here
+    // was a real bug: a second profile's seeded `~/termic/profiles/<slug>/tasks`
+    // would be written to settings and then never used.
+    let wt_root = project_tasks_root(&load_settings_in(&proj.profile).default_tasks_path, &proj)?;
     fs::create_dir_all(&wt_root).map_err(|e| e.to_string())?;
     let wt_path = wt_root.join(&slug);
 
@@ -4779,7 +5454,7 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
     let port_guard = PORT_ALLOC_LOCK.lock();
     let extra_names = effective_extra_named_ports_from(&repo_cfg, &proj);
     let (port, extra_named_ports, port_block_len) =
-        allocate_task_ports(&load_tasks(), 0, &extra_names, current_port_range())?;
+        allocate_task_ports(&load_tasks_all(), 0, &extra_names, current_port_range())?;
 
     let cli = args.cli.unwrap_or_else(|| proj.default_cli.clone());
     // Only "custom" tasks carry a pre-set launch command; agent/shell tasks
@@ -4845,6 +5520,10 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
     let task = Task {
         id: task_id.clone(),
         project_id: proj.id.clone(),
+        // A task's profile is ALWAYS its project's: a task belongs to a
+        // project and a project belongs to a profile, so creation never
+        // needs to be told which one.
+        profile: proj.profile.clone(),
         name: args.name,
         branch,
         base_branch: base_full,
@@ -4976,7 +5655,7 @@ async fn task_create_multi(app: AppHandle, args: CreateMultiArgs) -> Result<Task
 }
 
 fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task, String> {
-    let projects = load_projects();
+    let projects = load_projects_all();
     let host = projects.iter().find(|p| p.id == args.project_id)
         .ok_or("host project not found")?.clone();
     if host.project_type != ProjectType::Multi {
@@ -5029,8 +5708,8 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     // Wrapper dir = `<tasks_root>/<host-slug>/<wsname>/`. The host's
     // resolved tasks root already encodes the `<...>/<host-slug>` half.
     // Settings loaded ONCE here, reused for the sandbox defaults further down.
-    let globals = load_settings_inner();
-    let wrapper = project_tasks_root(&globals.default_tasks_path, &host)?.join(&slug);
+    let globals = load_settings_in(&host.profile);
+    let wrapper = project_tasks_root(&load_settings_in(&host.profile).default_tasks_path, &host)?.join(&slug);
     if wrapper.exists() {
         return Err(format!("a task already exists at {}", wrapper.display()));
     }
@@ -5150,7 +5829,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     let port_guard = PORT_ALLOC_LOCK.lock();
     let extra_names = effective_extra_named_ports(&host);
     let (ws_port, extra_named_ports, port_block_len) =
-        allocate_task_ports(&load_tasks(), frozen.len() as u16, &extra_names, current_port_range())?;
+        allocate_task_ports(&load_tasks_all(), frozen.len() as u16, &extra_names, current_port_range())?;
     let mut next_member_port = ws_port + 1;
     for (mp, spec, dir_name) in frozen.into_iter() {
         let member_port = next_member_port;
@@ -5331,6 +6010,10 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     let task = Task {
         id: task_id.clone(),
         project_id: host.id.clone(),
+        // A task's profile is ALWAYS its project's: a task belongs to a
+        // project and a project belongs to a profile, so creation never
+        // needs to be told which one.
+        profile: host.profile.clone(),
         name: args.name,
         branch,
         base_branch,
@@ -5420,7 +6103,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         .map(|np| (np.name.clone(), np.port))
         .collect();
     if member_setups.is_empty() {
-        let _ = app.emit(&format!("setup-done://{}", task.id),
+        emit_scoped(&app, &format!("setup-done://{}", task.id),
             serde_json::json!({ "code": 0, "success": true }));
     } else {
         let app2 = app.clone();
@@ -5430,7 +6113,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
             let run_one = |label: &str, script: &str, cwd: &Path, port: u16| -> bool {
                 use std::io::{BufRead, BufReader};
                 use std::process::Stdio;
-                let _ = app2.emit(&format!("setup-output://{}", ws_id),
+                emit_scoped(&app2, &format!("setup-output://{}", ws_id),
                     serde_json::json!({ "line": format!("[{label}] $ {script}") }));
                 let mut cmd = Command::new("bash");
                 // Real login-shell env so setup finds bun/nvm/etc. and
@@ -5456,7 +6139,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
                 let mut child = match spawn_res {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = app2.emit(&format!("setup-output://{}", ws_id),
+                        emit_scoped(&app2, &format!("setup-output://{}", ws_id),
                             serde_json::json!({ "line": format!("[{label}] spawn error: {e}") }));
                         return false;
                     }
@@ -5466,14 +6149,14 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
                 let app_o = app2.clone(); let id_o = ws_id.clone(); let l_o = label.to_string();
                 let t_out = stdout.map(|s| thread::spawn(move || {
                     for line in BufReader::new(s).lines().map_while(|r| r.ok()) {
-                        let _ = app_o.emit(&format!("setup-output://{id_o}"),
+                        emit_scoped(&app_o, &format!("setup-output://{id_o}"),
                             serde_json::json!({ "line": format!("[{l_o}] {line}") }));
                     }
                 }));
                 let app_e = app2.clone(); let id_e = ws_id.clone(); let l_e = label.to_string();
                 let t_err = stderr.map(|s| thread::spawn(move || {
                     for line in BufReader::new(s).lines().map_while(|r| r.ok()) {
-                        let _ = app_e.emit(&format!("setup-output://{id_e}"),
+                        emit_scoped(&app_e, &format!("setup-output://{id_e}"),
                             serde_json::json!({ "line": format!("[{l_e}] {line}") }));
                     }
                 }));
@@ -5488,7 +6171,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
                 if !ok { break; }
                 if !run_one(label, script, cwd, *port) { ok = false; }
             }
-            let _ = app2.emit(&format!("setup-done://{}", ws_id),
+            emit_scoped(&app2, &format!("setup-done://{}", ws_id),
                 serde_json::json!({ "code": if ok { 0 } else { 1 }, "success": ok }));
         });
     }
@@ -5553,7 +6236,7 @@ fn ensure_multirepo_gitignore(wrapper: &Path, member_dirs: &[String]) -> std::io
 /// are meaningless.
 #[tauri::command]
 fn task_reorder(ids: Vec<String>) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     for (i, id) in ids.iter().enumerate() {
         let next = Some(i as u32);
         if let Some(t) = list.iter_mut().find(|t| &t.id == id) {
@@ -5572,7 +6255,7 @@ fn task_rename(id: String, name: String) -> Result<Task, String> {
     if new_name.is_empty() {
         return Err("name cannot be empty".into());
     }
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let idx = list.iter().position(|w| w.id == id).ok_or("no such task")?;
     // Same-project live duplicate: refuse, mirroring the CLI `new` check.
     // Two same-name tasks in one project make name resolution ambiguous
@@ -5593,7 +6276,7 @@ fn project_rename(id: String, name: String) -> Result<Project, String> {
     if new_name.is_empty() {
         return Err("name cannot be empty".into());
     }
-    let mut list = load_projects();
+    let mut list = load_projects_all();
     let p = list.iter_mut().find(|p| p.id == id).ok_or("no such project")?;
     p.name = new_name.to_string();
     save_projects(&list).map_err(|e| e.to_string())?;
@@ -5605,7 +6288,7 @@ fn task_set_cli(id: String, cli: String) -> Result<Task, String> {
     if !["claude", "codex", "agy", "grok", "copilot", "opencode"].contains(&cli.as_str()) {
         return Err(format!("unknown cli: {cli}"));
     }
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     w.cli = cli;
     save_task(w).map_err(|e| e.to_string())?;
@@ -5623,7 +6306,7 @@ fn task_set_custom_command(id: String, command: String) -> Result<Task, String> 
     if cmd.is_empty() {
         return Err("command is empty".into());
     }
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     if w.cli != "custom" {
         return Err("not a custom-command task".into());
@@ -5640,7 +6323,7 @@ fn task_set_custom_command(id: String, command: String) -> Result<Task, String> 
 #[tauri::command]
 fn task_set_resume_override(id: String, command: String) -> Result<Task, String> {
     let cmd = command.trim().to_string();
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     w.resume_override = if cmd.is_empty() { None } else { Some(cmd) };
     save_task(w).map_err(|e| e.to_string())?;
@@ -5656,7 +6339,7 @@ fn task_set_resume_override(id: String, command: String) -> Result<Task, String>
 /// disk write).
 #[tauri::command]
 fn task_set_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     // Carry forward each surviving tab's session uuid by id (owned by
     // task_set_tab_session_id, not by this payload).
@@ -5718,7 +6401,7 @@ fn task_set_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), String>
 /// tab is not (yet) persisted or the value is unchanged.
 #[tauri::command]
 fn task_set_tab_session_id(id: String, tab_id: String, uuid: String) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     let tab = match w.persisted_tabs.iter_mut().find(|t| t.id == tab_id) {
         Some(t) => t,
@@ -5740,7 +6423,7 @@ fn task_set_tab_session_id(id: String, tab_id: String, uuid: String) -> Result<(
 /// can be restored on the next relaunch. Pass `None` to clear (no splits).
 #[tauri::command]
 fn task_set_split_layout(id: String, layout: Option<String>) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     if w.split_layout == layout {
         return Ok(());
@@ -5755,7 +6438,7 @@ fn task_set_split_layout(id: String, layout: Option<String>) -> Result<(), Strin
 /// carry forward by tab id so a layout rewrite never wipes a minted uuid).
 #[tauri::command]
 fn task_set_right_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     let prior: std::collections::HashMap<String, Option<String>> = w
         .right_split_tabs
@@ -5801,7 +6484,7 @@ fn task_set_right_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), S
 /// Mirror of `task_set_tab_session_id` for right-split tabs.
 #[tauri::command]
 fn task_set_right_tab_session_id(id: String, tab_id: String, uuid: String) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     let tab = match w.right_split_tabs.iter_mut().find(|t| t.id == tab_id) {
         Some(t) => t,
@@ -5914,7 +6597,7 @@ fn sandbox_recent_denied_paths(id: String) -> Vec<DenyPath> {
 /// deserialize, so the checkbox never reached the backend.
 #[tauri::command]
 fn sandbox_set_monitor_filters(id: String, exclude_task: bool, wb_only: bool) -> Result<(), String> {
-    let dirs = load_tasks().into_iter().find(|w| w.id == id)
+    let dirs = load_tasks_all().into_iter().find(|w| w.id == id)
         .map(|w| sandbox::task_exclude_dirs(&w))
         .unwrap_or_default();
     sandbox::set_monitor_filters(&id, exclude_task, wb_only);
@@ -6019,7 +6702,7 @@ fn task_sandbox_add_allowed_host(
 ) -> Result<usize, String> {
     let host = host.trim().to_string();
     if host.is_empty() { return Err("empty host".into()); }
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     if !w.sandbox_allowed_hosts.iter().any(|h| h == &host) {
         w.sandbox_allowed_hosts.push(host.clone());
@@ -6033,7 +6716,7 @@ fn task_sandbox_add_allowed_host(
     // task they create. Sibling tasks that already exist
     // are NOT retroactively patched (would surprise the user) —
     // they'll still hit the deny once and click Allow themselves.
-    let mut projects = load_projects();
+    let mut projects = load_projects_all();
     if let Some(p) = projects.iter_mut().find(|p| p.id == project_id) {
         if !p.sandbox_allowed_hosts.iter().any(|h| h == &host) {
             p.sandbox_allowed_hosts.push(host);
@@ -6070,7 +6753,7 @@ fn task_sandbox_add_allowed_path(
     } else {
         path
     };
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     if !w.sandbox_rw_paths.iter().any(|p| p == &stored) {
         w.sandbox_rw_paths.push(stored.clone());
@@ -6079,7 +6762,7 @@ fn task_sandbox_add_allowed_path(
     save_task(w).map_err(|e| e.to_string())?;
     // Lift to project defaults too so future tasks inherit.
     // See task_sandbox_add_allowed_host for rationale.
-    let mut projects = load_projects();
+    let mut projects = load_projects_all();
     if let Some(p) = projects.iter_mut().find(|p| p.id == project_id) {
         if !p.sandbox_rw_paths.iter().any(|p| p == &stored) {
             p.sandbox_rw_paths.push(stored);
@@ -6110,14 +6793,14 @@ fn task_sandbox_remove_allowed_path(
     // tokenized at add-time, but the caller may pass either).
     let tokenized = tokenize_home_prefix(&path);
     let matches = |p: &String| p != &path && p != &tokenized;
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     w.sandbox_rw_paths.retain(matches);
     let project_id = w.project_id.clone();
     save_task(w).map_err(|e| e.to_string())?;
     // Mirror the add's project-lift: drop the entry from the project
     // defaults too so the Undo is a true revert.
-    let mut projects = load_projects();
+    let mut projects = load_projects_all();
     if let Some(p) = projects.iter_mut().find(|p| p.id == project_id) {
         let before = p.sandbox_rw_paths.len();
         p.sandbox_rw_paths.retain(matches);
@@ -6151,7 +6834,7 @@ fn tokenize_home_prefix(path: &str) -> String {
 /// is malformed. Keyed by project — backs the Repository settings.
 #[tauri::command]
 fn repo_config_load(project_id: String) -> Result<Option<repo_config::RepoConfig>, String> {
-    let p = load_projects()
+    let p = load_projects_all()
         .into_iter()
         .find(|p| p.id == project_id)
         .ok_or("no such project")?;
@@ -6172,7 +6855,7 @@ fn repo_config_load_at(path: String) -> Result<Option<repo_config::RepoConfig>, 
 /// `repo_config::save`). Backs the Repository settings' Scripts tab.
 #[tauri::command]
 fn repo_config_save(project_id: String, config: repo_config::RepoConfig) -> Result<(), String> {
-    let p = load_projects()
+    let p = load_projects_all()
         .into_iter()
         .find(|p| p.id == project_id)
         .ok_or("no such project")?;
@@ -6183,7 +6866,7 @@ fn repo_config_save(project_id: String, config: repo_config::RepoConfig) -> Resu
 /// none. Returns true if a file was created.
 #[tauri::command]
 fn repo_config_scaffold(project_id: String) -> Result<bool, String> {
-    let p = load_projects()
+    let p = load_projects_all()
         .into_iter()
         .find(|p| p.id == project_id)
         .ok_or("no such project")?;
@@ -6207,11 +6890,11 @@ fn repo_config_add_allowed_host(id: String, host: String) -> Result<(), String> 
 /// Resolve a task id to its owning Project (for repo_config writes
 /// keyed at the project's `root_path`).
 fn task_project(ws_id: &str) -> Result<Project, String> {
-    let task = load_tasks()
+    let task = load_tasks_all()
         .into_iter()
         .find(|w| w.id == ws_id)
         .ok_or("no such task")?;
-    load_projects()
+    load_projects_all()
         .into_iter()
         .find(|p| p.id == task.project_id)
         .ok_or_else(|| "no such project".into())
@@ -6234,7 +6917,7 @@ fn repo_config_add_allowed_path(id: String, path: String) -> Result<(), String> 
 #[tauri::command]
 async fn task_recent_denials(id: String, minutes: Option<u32>) -> Vec<String> {
     tauri::async_runtime::spawn_blocking(move || -> Vec<String> {
-        let Some(task) = load_tasks().into_iter().find(|w| w.id == id) else {
+        let Some(task) = load_tasks_all().into_iter().find(|w| w.id == id) else {
             return Vec::new();
         };
         sandbox::recent_denials(&task.path, minutes.unwrap_or(10))
@@ -6264,7 +6947,7 @@ fn task_set_sandbox(
     allowed_hosts: Vec<String>,
     kill_live: bool,
 ) -> Result<usize, String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     w.sandbox_mode = Some(mode);
     // Keep the legacy bool in sync so every existing "is there a cage"
@@ -6301,7 +6984,7 @@ fn task_set_docker(
 ) -> Result<usize, String> {
     docker::validate_extra_args(&extra_args)?;
     docker::validate_extra_mounts(&extra_mounts)?;
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     w.docker_sandbox_enabled = enabled;
     w.docker_extra_args = extra_args;
@@ -6561,6 +7244,357 @@ fn procmon_signal(
 /// needs OS focus; it already runs occluded, which is what this leaves it in.
 /// One helper rather than a `cfg` per call site, so a new one cannot quietly
 /// bring the problem back.
+
+// ─────────── event routing: which window gets a task's events ───────────
+//
+// With one window a broadcast was correct and free. With one window per
+// profile it is neither: every profile's webview would receive every other
+// profile's PTY bytes, setup logs and grep hits. Routing is DERIVABLE (task ->
+// project -> profile -> window), so nothing has to be tracked, but the
+// derivation must not touch the disk on a hot path.
+
+/// Memoized task id -> window label.
+///
+/// A task NEVER changes profile in v1, so an entry is permanent once resolved
+/// and a miss costs one directory scan. That is what lets the low-frequency
+/// emitters (setup output, script runs, greps, spotlight) route by task id
+/// without a `load_tasks_all()` per event. The PTY path does not come through
+/// here at all: it captures its label at SPAWN, where the task is already in
+/// hand for the Docker branch, so the hottest path in the app pays nothing.
+static TASK_WINDOW: std::sync::Mutex<Option<HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+/// The window label owning `task_id`, or `None` if it cannot be resolved.
+///
+/// `None` means BROADCAST at the call site, deliberately: an event with no
+/// resolvable owner reaching every window is the behaviour that predates
+/// profiles, and it is a far better failure than an event reaching nobody.
+pub(crate) fn window_for_task(task_id: &str) -> Option<String> {
+    if task_id.is_empty() {
+        return None;
+    }
+    let mut guard = TASK_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(label) = map.get(task_id) {
+        return Some(label.clone());
+    }
+    let found = load_tasks_all()
+        .into_iter()
+        .find(|t| t.id == task_id)
+        .map(|t| t.profile.window_label())?;
+    map.insert(task_id.to_string(), found.clone());
+    Some(found)
+}
+
+/// The window label owning `project_id`.
+pub(crate) fn window_for_project(project_id: &str) -> Option<String> {
+    load_projects_all()
+        .into_iter()
+        .find(|p| p.id == project_id)
+        .map(|p| p.profile.window_label())
+}
+
+/// Forget a task's routing. Called when a task is deleted, and when the
+/// registry changes, so a stale label cannot outlive the window it names.
+fn forget_task_window(task_id: Option<&str>) {
+    let mut guard = TASK_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    match task_id {
+        Some(id) => {
+            if let Some(m) = guard.as_mut() {
+                m.remove(id);
+            }
+        }
+        None => *guard = None,
+    }
+}
+
+/// The task id a task-keyed TOPIC carries.
+///
+/// Every one of these topics already embeds it (`pty://<id>`,
+/// `setup-done://<id>`, `script-output://<id>:<member>:<kind>`,
+/// `grep-done://<id>`), so routing needs nothing at the call site beyond
+/// swapping `app.emit` for [`emit_scoped`]. Parsing the topic rather than
+/// threading an id is what kept this a mechanical change across ~30 sites
+/// instead of thirty separate signature edits.
+fn task_id_in_topic(topic: &str) -> Option<&str> {
+    let rest = topic.split_once("://")?.1;
+    let id = rest.split(':').next()?;
+    (!id.is_empty()).then_some(id)
+}
+
+/// Emit a TASK-KEYED event to the window that owns the task.
+///
+/// Falls back to a broadcast when the owner cannot be resolved (see
+/// [`window_for_task`]).
+fn emit_scoped<S: Serialize + Clone>(app: &AppHandle, topic: &str, payload: S) {
+    match task_id_in_topic(topic).and_then(window_for_task) {
+        Some(label) => {
+            let _ = app.emit_to(label, topic, payload);
+        }
+        None => {
+            let _ = app.emit(topic, payload);
+        }
+    }
+}
+
+/// Emit an event whose task id is in the PAYLOAD rather than the topic
+/// (spotlight, whose topics are project-wide but whose payload names the task).
+fn emit_scoped_by_id<S: Serialize + Clone>(app: &AppHandle, task_id: &str, topic: &str, payload: S) {
+    match window_for_task(task_id) {
+        Some(label) => {
+            let _ = app.emit_to(label, topic, payload);
+        }
+        None => {
+            let _ = app.emit(topic, payload);
+        }
+    }
+}
+
+/// Every live PROFILE window, in no particular order.
+///
+/// Deliberately not "every window": the Activity monitor is a window too, and
+/// it must not keep the app out of windowless mode or receive a profile's
+/// events. `ProfileId::from_window_label` returning `None` is what separates
+/// them.
+fn profile_windows(app: &AppHandle) -> Vec<tauri::WebviewWindow> {
+    use tauri::Manager;
+    app.webview_windows()
+        .into_iter()
+        .filter(|(label, _)| ProfileId::from_window_label(label).is_some())
+        .map(|(_, w)| w)
+        .collect()
+}
+
+/// Build a profile's window: the SAME window for every profile, differing
+/// only in its label and title.
+///
+/// Extracted from `setup` when profiles landed, so the root profile's window
+/// and a second profile's window cannot drift. The label matters beyond
+/// identity: `tauri-plugin-window-state` keys saved frames by it, so each
+/// profile remembers its own geometry, and the root profile keeps the literal
+/// `main` label a pre-profiles install already has a frame saved under.
+fn build_profile_window(app: &AppHandle, id: &ProfileId) -> tauri::Result<tauri::WebviewWindow> {
+    use tauri::Manager;
+    let label = id.window_label();
+    if let Some(win) = app.get_webview_window(&label) {
+        return Ok(win);
+    }
+    let title = match id {
+        ProfileId::Root => "Termic".to_string(),
+        ProfileId::Slug(s) => {
+            // The profile NAME, not the slug: the title bar is user-facing.
+            // Falls back to the slug if the registry has not caught up, which
+            // is better than an untitled window.
+            let reg = profiles_registry();
+            let name = reg.get(s).map(|p| p.name.clone()).unwrap_or_else(|| s.clone());
+            format!("Termic - {name}")
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let traffic_y: f64 = std::env::var("TERMIC_TRAFFIC_Y")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or_else(|| if is_macos_tahoe() { 21.0 } else { 16.0 });
+
+    #[allow(unused_mut)]
+    let mut builder = tauri::WebviewWindowBuilder::new(
+        app, &label, tauri::WebviewUrl::default(),
+    )
+    .title(&title)
+    .inner_size(1500.0, 1000.0)
+    .min_inner_size(900.0, 600.0)
+    .visible(false);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true)
+            .traffic_light_position(tauri::LogicalPosition::new(16.0, traffic_y));
+    }
+
+    let win = builder.build()?;
+
+    // Restore saved bounds ourselves (the plugin skips "main" via
+    // skip_initial_state) so the ordering is deterministic. SIZE +
+    // POSITION + MAXIMIZED — but NOT VISIBLE (restore_state would
+    // `show()` the window immediately, defeating the
+    // position-before-show dance below and risking a flash on the
+    // wrong monitor) and NOT FULLSCREEN (would re-enter fullscreen on
+    // whatever Space it was saved on — the exact yank we avoid).
+    // MAXIMIZED is safe to restore: a zoomed window stays on the
+    // current Space, so there's no Space-yank, and a user who quit
+    // maximized expects to relaunch maximized.
+    {
+        use tauri_plugin_window_state::{StateFlags, WindowExt};
+        let _ = win.restore_state(
+            StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED,
+        );
+    }
+
+    // A restored-maximized ("zoomed") window already fills one
+    // monitor: its inner_size never trips the minimum, and nudging it
+    // to the cursor's monitor would un-zoom it. So the clamp-up and
+    // cursor-monitor reposition below apply only to normally-sized
+    // windows. position_on_cursor_monitor itself no-ops when the
+    // restored position is already on the cursor's monitor, so it
+    // cooperates with this restore.
+    if !win.is_maximized().unwrap_or(false) {
+        // tauri-plugin-window-state restores prior bounds verbatim — it
+        // does NOT enforce minWidth / minHeight. If a previous session
+        // saved a sub-minimum size (seen after some updates and after
+        // first-launch races), the window comes back as a postage
+        // stamp. Clamp UP here before showing. Physical pixels via
+        // inner_size + scale_factor keeps the math correct on retina.
+        if let (Ok(sz), scale) = (win.inner_size(), win.scale_factor().unwrap_or(1.0)) {
+            let logical_w = (sz.width  as f64) / scale;
+            let logical_h = (sz.height as f64) / scale;
+            const MIN_W: f64 = 900.0;
+            const MIN_H: f64 = 600.0;
+            if logical_w < MIN_W || logical_h < MIN_H {
+                // Snap back to a comfortable default instead of the
+                // bare min — a 900x600 box is still cramped for the
+                // app's 3-column layout. 1400x900 matches our intended
+                // launch size on fresh installs.
+                let _ = win.set_size(tauri::LogicalSize::new(1400.0_f64, 900.0));
+            }
+        }
+        let _ = position_on_cursor_monitor(&win);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let handle = app.clone();
+        let is_root = id.is_root();
+        let close_id = id.clone();
+        let window_for_close = win.clone();
+        win.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // ALWAYS prevent first, then decide. Letting the close
+                // through and going windowless afterwards would race the
+                // window's own teardown, and "ask" needs the window
+                // alive to show the prompt in it.
+                api.prevent_close();
+                // With several profiles up, closing ONE is just closing that
+                // window: the app is not windowless while another profile is
+                // still on screen, and the close-action setting (menu bar /
+                // quit / ask) is about the LAST window going away. A
+                // non-root profile also destroys rather than hides, so the
+                // popover shows it closed and reopening rebuilds it.
+                if profile_windows(&handle).len() > 1 {
+                    // A DELIBERATE close is remembered, so relaunch does not
+                    // resurrect a window the user put away. App quit does not
+                    // come through here, which is what makes restore work.
+                    set_open_at_quit(&close_id, false);
+                    if is_root {
+                        let _ = window_for_close.hide();
+                    } else {
+                        let _ = window_for_close.destroy();
+                    }
+                    return;
+                }
+                // KNOWN EXCEPTION to "no sync IO on the event-loop
+                // thread" (docs/ipc.md): load_settings_inner() reads +
+                // parses settings.json here. Once per click of a button
+                // a human pressed, on a file we just wrote, so it is
+                // bounded and unmeasurable - but it IS the rule being
+                // bent, and re-reading is what makes a Settings change
+                // apply without a restart.
+                match close_action_from(load_settings_inner().close_action.as_deref()) {
+                    CloseAction::MenuBar => enter_windowless(&handle),
+                    CloseAction::Quit => handle.exit(0),
+                    // The webview owns the prompt (CloseDialog, whose
+                    // dismissal cancels the close outright); it answers
+                    // via window_close_choice.
+                    CloseAction::Ask => {
+                        let _ = handle.emit_to(
+                            window_for_close.label(),
+                            "termic://close-requested",
+                            (),
+                        );
+                        // The emit is fire-and-forget, so a webview that
+                        // never wired its listener (initWindowlessMode
+                        // rejected, or the click landed mid-boot) would
+                        // leave the red button a silent no-op with only
+                        // Cmd-Q left. The webview ACKs the request the
+                        // moment it receives it; no ack means no
+                        // listener, so fall back to the NON-destructive
+                        // outcome. Keyed on the ack rather than on a
+                        // choice, because a user who DISMISSES the
+                        // prompt is cancelling the close on purpose and
+                        // must not be overridden.
+                        CLOSE_PROMPT_ACKED.store(false, Ordering::SeqCst);
+                        let fb = handle.clone();
+                        thread::spawn(move || {
+                            thread::sleep(CLOSE_PROMPT_ACK_GRACE);
+                            if !CLOSE_PROMPT_ACKED.load(Ordering::SeqCst) {
+                                dlog("[windowless] no close-prompt ack; going windowless");
+                                enter_windowless(&fb);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    round_window_corners_for_tahoe(&win);
+    set_open_at_quit(id, true);
+    Ok(win)
+}
+
+/// Remember whether a profile had a window up, for launch restore.
+///
+/// A no-op for the root profile of a DORMANT install: there is no registry to
+/// write, and creating one here would make the feature exist for someone who
+/// never asked for it.
+fn set_open_at_quit(id: &ProfileId, open: bool) {
+    let Ok(g) = global_dir() else { return };
+    let mut reg = profiles::load_registry(&g);
+    if reg.profiles.is_empty() {
+        return;
+    }
+    let slug = match id {
+        ProfileId::Root => reg.root_slug.clone(),
+        ProfileId::Slug(s) => Some(s.clone()),
+    };
+    let Some(slug) = slug else { return };
+    let Some(p) = reg.profiles.iter_mut().find(|p| p.slug == slug) else { return };
+    if p.open_at_quit == open {
+        return;
+    }
+    p.open_at_quit = open;
+    let _ = profiles::save_registry(&g, &reg);
+}
+
+/// Reopen every profile that had a window when the app last quit.
+///
+/// Ordered so the most recently focused ends up frontmost, and it is opened
+/// LAST for that reason. A dormant install does nothing at all here.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+fn restore_open_profiles(app: &AppHandle) {
+    let reg = profiles_registry();
+    if reg.is_dormant() {
+        return;
+    }
+    let mut want: Vec<&profiles::Profile> = reg.profiles.iter().filter(|p| p.open_at_quit).collect();
+    // Least recently focused first, so the last window built is the one the
+    // user was in.
+    want.sort_by(|a, b| a.last_focused_at.cmp(&b.last_focused_at));
+    for p in want {
+        let id = reg.id_for(&p.slug);
+        if id.is_root() {
+            // Already built by `setup`; nothing to restore.
+            continue;
+        }
+        match build_profile_window(app, &id) {
+            Ok(w) => { let _ = w.show(); }
+            Err(e) => dlog(&format!("[profiles] restore {} failed: {e}", p.slug)),
+        }
+    }
+}
+
 fn focus_window_unless_e2e(win: &tauri::WebviewWindow) {
     #[cfg(not(feature = "e2e"))]
     {
@@ -6740,7 +7774,7 @@ pub(crate) fn stop_tab_ptys(manager: &PtyManager, task_id: &str, tab_id: &str) -
 /// flips a live agent via its runtime YOLO command when supported).
 #[tauri::command]
 fn task_set_yolo(id: String, yolo: bool) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     w.yolo = yolo;
     save_task(w).map_err(|e| e.to_string())?;
@@ -6751,7 +7785,7 @@ fn task_set_yolo(id: String, yolo: bool) -> Result<(), String> {
 /// only — resume gating now uses `has_resumable_history` instead.
 #[tauri::command]
 fn task_record_spawn(id: String) -> Result<u32, String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     w.spawn_count = w.spawn_count.saturating_add(1);
     save_task(w).map_err(|e| e.to_string())?;
@@ -6768,7 +7802,7 @@ fn task_record_spawn(id: String) -> Result<u32, String> {
 ///     and shouldn't re-try.
 #[tauri::command]
 fn task_set_has_history(id: String, value: bool) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     if w.has_resumable_history == value { return Ok(()); }
     w.has_resumable_history = value;
@@ -6784,7 +7818,7 @@ fn task_set_has_history(id: String, value: bool) -> Result<(), String> {
 /// same uuid is a cheap no-op (no disk write).
 #[tauri::command]
 fn task_set_agent_session_id(id: String, cli: String, uuid: String) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     // Empty uuid = clear the slot. Used when a resume attempt died fast,
     // signalling the stored uuid no longer resolves to a live session
@@ -6871,9 +7905,9 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
     // never fired, before we tear down the worktree the container mounts.
     docker::cleanup_task(&id);
 
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("task not found")?;
-    let proj = load_projects().into_iter().find(|p| p.id == w.project_id);
+    let proj = load_projects_all().into_iter().find(|p| p.id == w.project_id);
 
     // Kill any running setup/run scripts for this task BEFORE doing
     // anything else — otherwise dev servers (npm run dev, runserver, etc.)
@@ -6937,7 +7971,7 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
         // self by id; w.archived isn't set yet, so we'd otherwise match
         // ourselves.) Without this, archiving one DPF repo-root session
         // silently emptied another's repo list (no command ever ran).
-        let sibling_links: HashSet<String> = load_tasks().into_iter()
+        let sibling_links: HashSet<String> = load_tasks_all().into_iter()
             .filter(|o| o.id != w.id && !o.archived && o.path == w.path)
             .flat_map(|o| o.composition.into_iter()
                 .filter(|cm| cm.mode == MemberMode::RepoRoot)
@@ -6967,7 +8001,7 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
     // them, NEVER touch the linked checkout. Errors per-member are
     // recorded but don't abort the loop (best-effort cleanup).
     if !w.composition.is_empty() {
-        let all_projects = load_projects();
+        let all_projects = load_projects_all();
         for m in &w.composition {
             match m.mode {
                 MemberMode::RepoRoot => {
@@ -7061,7 +8095,7 @@ async fn task_restore(app: AppHandle, id: String) -> Result<Task, String> {
 }
 
 fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let idx = list.iter().position(|w| w.id == id).ok_or("task not found")?;
     if !list[idx].archived {
         return Err("task is not archived".into());
@@ -7077,7 +8111,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
         ));
     }
 
-    let proj = load_projects().into_iter()
+    let proj = load_projects_all().into_iter()
         .find(|p| p.id == list[idx].project_id)
         .ok_or("project not found")?;
 
@@ -7092,7 +8126,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
         // top-up persisted meanwhile. Everything restore does before
         // this point only READS the record, so nothing is lost.
         let _port_guard = PORT_ALLOC_LOCK.lock();
-        let snapshot = load_tasks();
+        let snapshot = load_tasks_all();
         if let Some(fresh) = snapshot.iter().find(|t| t.id == id) {
             list[idx] = fresh.clone();
         }
@@ -7246,7 +8280,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
         }
 
         // Recreate each member (best-effort — errors don't abort the restore).
-        let all_projects = load_projects();
+        let all_projects = load_projects_all();
         let composition = list[idx].composition.clone();
         let base_branch = list[idx].base_branch.clone();
         for m in &composition {
@@ -7298,7 +8332,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
     // READS the record, so nothing is lost. Released right after the
     // save_task below persists the (possibly re-homed) ports.
     let port_guard = PORT_ALLOC_LOCK.lock();
-    let snapshot = load_tasks();
+    let snapshot = load_tasks_all();
     if let Some(fresh) = snapshot.iter().find(|t| t.id == id) {
         list[idx] = fresh.clone();
     }
@@ -7335,8 +8369,8 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
 
 #[tauri::command]
 fn task_run_script(id: String, which: String) -> Result<String, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no such task")?;
-    let p = load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no such task")?;
+    let p = load_projects_all().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
     let (setup, run, archive) = effective_scripts(&p);
     let script = match which.as_str() {
         "setup" => setup,
@@ -7378,8 +8412,8 @@ async fn task_diff(id: String) -> Result<TaskDiffSummary, String> {
 }
 
 pub(crate) fn task_diff_inner(id: String) -> Result<TaskDiffSummary, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
-    load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    load_projects_all().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
     let wt = PathBuf::from(&w.path);
     // Resolved through resolve_base_ref (see diff_base_ref's doc comment) so a
     // local-only repo still reports changes. None means no tracked baseline
@@ -7528,8 +8562,8 @@ impl SendDiffError {
 pub(crate) fn task_send_diff_to_main_inner(id: &str) -> Result<SendDiffResult, SendDiffError> {
     let other = SendDiffError::Other;
     {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or_else(|| other("no such task".into()))?;
-        let p = load_projects()
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or_else(|| other("no such task".into()))?;
+        let p = load_projects_all()
             .into_iter()
             .find(|p| p.id == w.project_id)
             .ok_or_else(|| other("project missing".into()))?;
@@ -7702,7 +8736,7 @@ pub struct TaskChanges {
 
 #[tauri::command]
 fn task_changes(id: String) -> Result<TaskChanges, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
 
     // Parse `git status --porcelain` into our ChangedFile shape.
     let parse = |out: &str| -> Vec<ChangedFile> {
@@ -7728,7 +8762,7 @@ fn task_changes(id: String) -> Result<TaskChanges, String> {
     let host_out = git(&["status", "--porcelain", "-uall"], Path::new(&w.path))
         .map_err(|e| e.to_string())?;
     let host_files = parse(&host_out);
-    let host_name = load_projects().into_iter()
+    let host_name = load_projects_all().into_iter()
         .find(|p| p.id == w.project_id)
         .map(|p| p.name)
         .unwrap_or_else(|| w.name.clone());
@@ -7913,7 +8947,7 @@ fn parse_porcelain_line(line: &str) -> (Option<GitFile>, Option<GitFile>) {
 #[tauri::command]
 async fn task_git_status(id: String) -> Result<GitStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
 
         let branch_of = |p: &Path| -> String {
             git(&["branch", "--show-current"], p).map(|s| s.trim().to_string()).unwrap_or_default()
@@ -7955,7 +8989,7 @@ async fn task_git_status(id: String) -> Result<GitStatus, String> {
             }
         };
 
-        let host_name = load_projects().into_iter()
+        let host_name = load_projects_all().into_iter()
             .find(|p| p.id == w.project_id)
             .map(|p| p.name)
             .unwrap_or_else(|| w.name.clone());
@@ -7995,7 +9029,7 @@ struct CheckoutResult {
 #[tauri::command]
 async fn project_git_branches(project_id: String) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
-        let proj = load_projects().into_iter().find(|p| p.id == project_id)
+        let proj = load_projects_all().into_iter().find(|p| p.id == project_id)
             .ok_or("project not found")?;
         if proj.non_git { return Ok(Vec::new()); }
         let repo = PathBuf::from(&proj.root_path);
@@ -8022,7 +9056,7 @@ struct BranchContext {
 #[tauri::command]
 async fn project_branch_context(project_id: String) -> Result<BranchContext, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<BranchContext, String> {
-        let proj = load_projects().into_iter().find(|p| p.id == project_id)
+        let proj = load_projects_all().into_iter().find(|p| p.id == project_id)
             .ok_or("project not found")?;
         if proj.non_git {
             return Ok(BranchContext { head: None, local: Vec::new(), remote: Vec::new() });
@@ -8058,7 +9092,7 @@ async fn project_branch_context(project_id: String) -> Result<BranchContext, Str
 #[tauri::command]
 async fn task_git_branches(id: String, dir_name: String) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         let out = git(&["branch", "--format=%(refname:short)"], &cwd).map_err(|e| e.to_string())?;
         Ok(out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
@@ -8075,7 +9109,7 @@ async fn task_git_branches(id: String, dir_name: String) -> Result<Vec<String>, 
 #[tauri::command]
 async fn task_git_checkout(id: String, dir_name: String, branch: String) -> Result<CheckoutResult, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<CheckoutResult, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         let dirty = !git(&["status", "--porcelain"], &cwd).map_err(|e| e.to_string())?.trim().is_empty();
         let mut stashed = false;
@@ -8294,9 +9328,9 @@ fn git_update_repo(cwd: &Path, mode: UpdateMode, base: &str) -> Result<UpdateRes
 #[tauri::command]
 async fn task_git_update(id: String, dir_name: String, mode: UpdateMode) -> Result<UpdateResult, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<UpdateResult, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
-        let base = repo_base_branch(&w, &dir_name, &load_projects());
+        let base = repo_base_branch(&w, &dir_name, &load_projects_all());
         git_update_repo(&cwd, mode, &base)
     })
     .await
@@ -8309,7 +9343,7 @@ async fn task_git_update(id: String, dir_name: String, mode: UpdateMode) -> Resu
 #[tauri::command]
 async fn task_git_update_info(id: String, dir_name: String) -> Result<UpdateInfo, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<UpdateInfo, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         let branch = git(&["branch", "--show-current"], &cwd)
             .map_err(|e| e.to_string())?
@@ -8318,7 +9352,7 @@ async fn task_git_update_info(id: String, dir_name: String) -> Result<UpdateInfo
         let upstream = git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], &cwd)
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        Ok(UpdateInfo { branch, upstream, base: repo_base_branch(&w, &dir_name, &load_projects()) })
+        Ok(UpdateInfo { branch, upstream, base: repo_base_branch(&w, &dir_name, &load_projects_all()) })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -8485,7 +9519,7 @@ fn git_refs(cwd: &Path) -> Vec<GitRef> {
 #[tauri::command]
 async fn task_git_refs(id: String, dir_name: String) -> Result<Vec<GitRef>, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<GitRef>, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         Ok(git_refs(&cwd))
     })
@@ -8623,7 +9657,7 @@ async fn task_git_log(
     refs: Option<Vec<String>>,
 ) -> Result<GitLogPage, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<GitLogPage, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         Ok(git_log_page(
             &cwd, skip, limit, all_branches,
@@ -8816,7 +9850,7 @@ fn task_git_blame_for_task(w: &Task, path: &str) -> Result<BlameFile, String> {
 #[tauri::command]
 async fn task_git_blame(id: String, path: String) -> Result<BlameFile, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<BlameFile, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         task_git_blame_for_task(&w, &path)
     })
     .await
@@ -8853,7 +9887,7 @@ fn task_git_commit_meta_for_task(w: &Task, path: &str, sha: &str) -> Result<GitC
 #[tauri::command]
 async fn task_git_commit_meta(id: String, path: String, sha: String) -> Result<GitCommit, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<GitCommit, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         task_git_commit_meta_for_task(&w, &path, &sha)
     })
     .await
@@ -8883,7 +9917,7 @@ fn task_git_commit_offset_for_task(w: &Task, dir_name: &str, sha: &str) -> Resul
 #[tauri::command]
 async fn task_git_commit_offset(id: String, dir_name: String, sha: String) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<usize, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         task_git_commit_offset_for_task(&w, &dir_name, &sha)
     })
     .await
@@ -8951,7 +9985,7 @@ async fn task_git_commit_files(
     sha: String,
 ) -> Result<Vec<GitFile>, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<GitFile>, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         git_commit_files(&cwd, &sha)
     })
@@ -9247,7 +10281,7 @@ async fn task_git_compare(
     merge_base: bool,
 ) -> Result<GitCompare, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<GitCompare, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         git_compare(&cwd, &base, merge_base)
     })
@@ -9270,7 +10304,7 @@ fn repo_cwd(w: &Task, dir_name: &str) -> Result<PathBuf, String> {
 #[tauri::command]
 async fn task_stage(id: String, dir_name: String, paths: Vec<String>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         if paths.is_empty() { return Ok(()); }
         let mut args: Vec<&str> = vec!["add", "--"];
@@ -9284,7 +10318,7 @@ async fn task_stage(id: String, dir_name: String, paths: Vec<String>) -> Result<
 #[tauri::command]
 async fn task_unstage(id: String, dir_name: String, paths: Vec<String>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         if paths.is_empty() { return Ok(()); }
         let mut args: Vec<&str> = vec!["reset", "-q", "HEAD", "--"];
@@ -9300,7 +10334,7 @@ async fn task_commit(
     id: String, dir_name: String, subject: String, body: String, amend: bool, push: bool,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
 
         let subject = subject.trim().to_string();
@@ -9356,7 +10390,7 @@ pub struct PrLookup {
 }
 
 fn pr_lookup_blocking(id: &str) -> Result<PrLookup, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     let cwd = PathBuf::from(&w.path);
     // Cached, no network: a poll on a non-forge repo must cost a hashmap
     // read, not a subprocess, because the PR card polls every task the user
@@ -9406,7 +10440,7 @@ fn pr_lookup_blocking(id: &str) -> Result<PrLookup, String> {
             // (and the next app launch) can resolve by number.
             if let Some(ref p) = pr {
                 if w.pr_number != Some(p.number) || w.pr_provider.as_deref() != Some(provider) {
-                    let mut list = load_tasks();
+                    let mut list = load_tasks_all();
                     if let Some(wm) = list.iter_mut().find(|x| x.id == id) {
                         wm.pr_url = Some(p.url.clone());
                         wm.pr_number = Some(p.number);
@@ -9462,7 +10496,7 @@ struct IssueLookup {
 }
 
 fn issue_lookup_blocking(project_id: &str, limit: u32) -> Result<IssueLookup, String> {
-    let p = load_projects()
+    let p = load_projects_all()
         .into_iter()
         .find(|p| p.id == project_id)
         .ok_or("no project")?;
@@ -9519,7 +10553,7 @@ struct ForgeProvider {
 #[tauri::command]
 async fn project_forge_provider(project_id: String) -> Result<ForgeProvider, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let p = load_projects()
+        let p = load_projects_all()
             .into_iter()
             .find(|p| p.id == project_id)
             .ok_or("no project")?;
@@ -9563,7 +10597,7 @@ async fn task_pr_create(
     draft: bool,
 ) -> Result<PrLookup, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = PathBuf::from(&w.path);
         let title = title.trim();
         if title.is_empty() {
@@ -9617,7 +10651,7 @@ async fn task_pr_create(
         // this, but creation should never lose the URL even if the status
         // fetch right after hiccups.
         {
-            let mut list = load_tasks();
+            let mut list = load_tasks_all();
             if let Some(wm) = list.iter_mut().find(|x| x.id == id) {
                 wm.pr_url = Some(url.clone());
                 wm.pr_number = forge::pr_number_from_url(&url);
@@ -9637,7 +10671,7 @@ async fn task_pr_create(
 #[tauri::command]
 async fn task_pr_comments(id: String) -> Result<Vec<forge::PrComment>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let provider = w.pr_provider.clone().ok_or("no PR known for this task yet")?;
         let number = w.pr_number.ok_or("no PR known for this task yet")?;
         let cwd = PathBuf::from(&w.path);
@@ -9653,7 +10687,7 @@ async fn task_pr_comments(id: String) -> Result<Vec<forge::PrComment>, String> {
 /// Persist the comment-watcher opt-in for a task (the PR card bell).
 #[tauri::command]
 fn task_set_pr_watch(id: String, watch: bool) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     if w.pr_watch == watch {
         return Ok(());
@@ -9667,7 +10701,7 @@ fn task_set_pr_watch(id: String, watch: bool) -> Result<(), String> {
 /// agent.
 #[tauri::command]
 fn task_set_pr_comments_seen(id: String, iso: String) -> Result<(), String> {
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
     let next = if iso.is_empty() { None } else { Some(iso) };
     if w.pr_comments_seen_at == next {
@@ -9707,7 +10741,7 @@ fn git_push(cwd: &Path) -> Result<(), String> {
 #[tauri::command]
 async fn task_git_push(id: String, dir_name: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         git_push(&cwd)
     })
@@ -9722,7 +10756,7 @@ async fn task_git_push(id: String, dir_name: String) -> Result<(), String> {
 #[tauri::command]
 async fn task_discard(id: String, dir_name: String, paths: Vec<String>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let cwd = repo_cwd(&w, &dir_name)?;
         for p in &paths {
             // `git ls-files --error-unmatch` exits non-zero for untracked
@@ -9810,7 +10844,7 @@ fn safe_task_path(ws_path: &Path, rel: &str) -> Result<PathBuf, String> {
 /// keep the strict check, so nothing can MUTATE the main checkout by writing
 /// through a link from a worktree task.
 fn safe_task_read_path(w: &Task, base: &Path, rel: &str) -> Result<PathBuf, String> {
-    let root = load_projects()
+    let root = load_projects_all()
         .into_iter()
         .find(|p| p.id == w.project_id)
         .map(|p| PathBuf::from(p.root_path));
@@ -9907,7 +10941,7 @@ fn check_task_path_existence(ws_path: &Path, rel: &str) -> Result<PathStat, Stri
 
 #[tauri::command]
 fn task_path_stat(id: String, path: String) -> Result<PathStat, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     // Unlike a diff/read, "is this a directory" is a sensible question for a
     // path that's exactly a composition member's own root (e.g. a markdown
     // link's `..`/`/` resolves there per resolveTaskHref's member-floor
@@ -10178,7 +11212,7 @@ fn read_external_file(path: &str) -> Result<String, String> {
 
 #[tauri::command]
 fn task_file_read(id: String, path: String) -> Result<String, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     // Member-aware: a `<dir_name>/…` path resolves inside that member's repo
     // (which may live outside the wrapper for repo_root members), matching
     // the diff/finder/grep path scheme.
@@ -10321,7 +11355,7 @@ struct Base64Read {
 /// plus an image/PDF extension whitelist and a 20 MB cap. Split from the
 /// `#[tauri::command]` wrapper (mirroring `task_file_diff_sides_for_task`)
 /// so tests can exercise it with an in-memory `Task` instead of
-/// `load_tasks()`.
+/// `load_tasks_all()`.
 fn task_file_read_base64_for_task(w: &Task, path: &str, known_fp: Option<&str>) -> Result<Base64Read, String> {
     use base64::Engine as _;
     let (cwd, rel) = resolve_task_git_path(w, path)?;
@@ -10361,7 +11395,7 @@ fn task_file_read_base64_for_task(w: &Task, path: &str, known_fp: Option<&str>) 
 #[tauri::command]
 async fn task_file_read_base64(id: String, path: String, known_fp: Option<String>) -> Result<Base64Read, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         task_file_read_base64_for_task(&w, &path, known_fp.as_deref())
     })
     .await
@@ -10392,14 +11426,14 @@ fn task_file_fp_for_task(w: &Task, path: &str) -> Result<String, String> {
 /// discipline targets.
 #[tauri::command]
 fn task_file_fp(id: String, path: String) -> Result<String, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     task_file_fp_for_task(&w, &path)
 }
 
 /// Read an allowlisted preview file (image/PDF) as raw bytes + mime, reusing
 /// the SAME member-aware resolution, worktree containment, extension
 /// allowlist, and 20 MB cap as `task_file_read_base64_for_task` — just
-/// without the base64 encode. Split from the `load_tasks()` lookup (mirroring
+/// without the base64 encode. Split from the `load_tasks_all()` lookup (mirroring
 /// `task_file_read_base64_for_task`) so tests can exercise it with an
 /// in-memory `Task`.
 fn read_preview_file_for_task(w: &Task, path: &str) -> Result<(Vec<u8>, &'static str), String> {
@@ -10413,7 +11447,7 @@ fn read_preview_file_for_task(w: &Task, path: &str) -> Result<(Vec<u8>, &'static
 /// `read_preview_file_for_task` for the `taskpdf:` URI-scheme handler, which
 /// only has the task id from the URL. Backs `taskpdf_response` below.
 fn read_preview_file(id: &str, path: &str) -> Result<(Vec<u8>, &'static str), String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     read_preview_file_for_task(&w, path)
 }
 
@@ -10455,7 +11489,7 @@ fn taskpdf_response(uri_path: &str) -> tauri::http::Response<Vec<u8>> {
 /// the spawn_blocking discipline targets.
 #[tauri::command]
 fn task_file_write(id: String, path: String, content: String) -> Result<(), String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     let (cwd, rel) = resolve_task_git_path(&w, &path)?;
     let abs = safe_task_path(&cwd, &rel)?;
     // Atomic: uncommitted source is unrecoverable if a truncate-write tears.
@@ -10511,11 +11545,28 @@ fn scratch_id_ok(id: &str) -> bool {
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// A task's scratchpad dir, in the profile that owns the task.
+///
+/// Resolved from the RECORD rather than a passed-in profile, so every existing
+/// call site keeps working with only a task id in hand. An unknown id falls
+/// back to the root profile, which is where it would have been written before
+/// profiles existed.
+fn scratch_profile_of(task_id: &str) -> ProfileId {
+    load_tasks_all()
+        .into_iter()
+        .find(|t| t.id == task_id)
+        .map(|t| t.profile)
+        .unwrap_or_default()
+}
+
 fn scratch_dir(task_id: &str) -> Result<PathBuf, String> {
     if !scratch_id_ok(task_id) {
         return Err(format!("invalid task id: {task_id:?}"));
     }
-    let p = data_dir().map_err(|e| e.to_string())?.join("scratch").join(task_id);
+    let p = profile_dir(&scratch_profile_of(task_id))
+        .map_err(|e| e.to_string())?
+        .join("scratch")
+        .join(task_id);
     fs::create_dir_all(&p).map_err(|e| format!("create scratch dir failed: {e}"))?;
     Ok(p)
 }
@@ -10554,8 +11605,12 @@ fn scratch_purge_task(task_id: &str) {
     if !scratch_id_ok(task_id) {
         return;
     }
-    if let Ok(d) = data_dir() {
-        let _ = fs::remove_dir_all(d.join("scratch").join(task_id));
+    // Sweep every profile: purge runs AFTER the task record is gone, so there
+    // is no longer a record to resolve the profile from.
+    for pid in profiles_registry().ids() {
+        if let Ok(d) = profile_dir(&pid) {
+            let _ = fs::remove_dir_all(d.join("scratch").join(task_id));
+        }
     }
 }
 
@@ -10728,7 +11783,7 @@ async fn scratch_promote(
     overwrite: bool,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == task_id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == task_id).ok_or("no task")?;
         let buf = scratch_buffer_path(&task_id, &id)?;
         let content = fs::read_to_string(&buf).unwrap_or_default();
         let (cwd, rel) = resolve_task_git_path(&w, &rel_path)?;
@@ -10763,7 +11818,7 @@ async fn scratch_promote(
 #[tauri::command]
 async fn scratch_promote_target_exists(task_id: String, rel_path: String) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == task_id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == task_id).ok_or("no task")?;
         let (cwd, rel) = resolve_task_git_path(&w, &rel_path)?;
         if rel.trim().is_empty() {
             return Ok(false);
@@ -10781,7 +11836,7 @@ async fn scratch_promote_target_exists(task_id: String, rel_path: String) -> Res
 /// caller can update an open tab / re-select the row.
 #[tauri::command]
 fn task_path_rename(id: String, path: String, new_name: String) -> Result<String, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     let trimmed = new_name.trim();
     if trimmed.is_empty() || trimmed.contains('/') || trimmed == "." || trimmed == ".." {
         return Err(format!("invalid name: {new_name:?}"));
@@ -10808,7 +11863,7 @@ fn task_path_rename(id: String, path: String, new_name: String) -> Result<String
 /// recursively. Member-aware + worktree-constrained.
 #[tauri::command]
 fn task_path_delete(id: String, path: String) -> Result<(), String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     let (cwd, rel) = resolve_task_git_path(&w, &path)?;
     let abs = safe_task_path(&cwd, &rel)?;
     let meta = fs::symlink_metadata(&abs).map_err(|e| format!("stat failed: {e}"))?;
@@ -10826,7 +11881,7 @@ fn task_path_delete(id: String, path: String) -> Result<(), String> {
 /// containing folder (no portable "select" verb).
 #[tauri::command]
 fn task_reveal_path(id: String, path: String) -> Result<(), String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     // Revealing a directory (including a composition member's own root) is
     // meaningful here, unlike for a diff/read — allow the bare-member-root case.
     let (cwd, rel) = resolve_task_git_path_ex(&w, &path, true)?;
@@ -11054,19 +12109,19 @@ fn task_file_diff_sides(
     path: String,
     scope: Option<String>,
 ) -> Result<FileDiffSides, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     task_file_diff_sides_for_task(&w, &path, scope.as_deref())
 }
 
 #[tauri::command]
 fn task_file_diff(id: String, path: String) -> Result<String, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     task_file_diff_for_task(&w, &path)
 }
 
 #[tauri::command]
 fn task_files(id: String) -> Result<Vec<String>, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(&w.path) {
         for e in rd.flatten() {
@@ -11111,7 +12166,7 @@ fn compile_exclude_patterns(repo_path: &str) -> Vec<glob::Pattern> {
 /// projects.json for tasks created before members went inline.
 fn member_repo_path(m: &TaskMember) -> String {
     if !m.repo_path.is_empty() { return m.repo_path.clone(); }
-    load_projects().into_iter().find(|p| p.id == m.project_id)
+    load_projects_all().into_iter().find(|p| p.id == m.project_id)
         .map(|p| p.root_path).unwrap_or_default()
 }
 
@@ -11141,7 +12196,7 @@ async fn task_dir_list(id: String, rel: String, heal: bool) -> Result<Vec<FileEn
 }
 
 fn task_dir_list_sync(id: String, rel: String, heal: bool) -> Result<Vec<FileEntry>, String> {
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
     let base = PathBuf::from(&w.path);
     // Multi-repo: when the relative path enters a composition member
     // (e.g. "pydpf" or "pydpf/src"), resolve under that member's real
@@ -11182,7 +12237,7 @@ fn task_dir_list_sync(id: String, rel: String, heal: bool) -> Result<Vec<FileEnt
     let (owner_repo_path, local_rel): (String, &str) = match &member_hit {
         Some((m, remainder)) => (member_repo_path(m), remainder.as_str()),
         None => (
-            load_projects().into_iter().find(|p| p.id == w.project_id)
+            load_projects_all().into_iter().find(|p| p.id == w.project_id)
                 .map(|p| p.root_path).unwrap_or_default(),
             rel.as_str(),
         ),
@@ -11274,7 +12329,7 @@ fn task_dir_list_sync(id: String, rel: String, heal: bool) -> Result<Vec<FileEnt
 #[tauri::command]
 async fn task_list_files_for_finder(id: String) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         // List tracked + untracked files in a repo, prefixing each with
         // `prefix` (empty for the host; `<dir_name>/` for members) so member
         // paths resolve from the wrapper. `patterns` are that repo's exclude
@@ -11297,7 +12352,7 @@ async fn task_list_files_for_finder(id: String) -> Result<Vec<String>, String> {
         };
         // Host repo first, then each multi-repo member (serially). Each repo's
         // excludes are compiled once (its own + the personal global list).
-        let host_repo_path = load_projects().into_iter().find(|p| p.id == w.project_id)
+        let host_repo_path = load_projects_all().into_iter().find(|p| p.id == w.project_id)
             .map(|p| p.root_path).unwrap_or_default();
         let mut files = ls(&w.path, "", &compile_exclude_patterns(&host_repo_path));
         for m in &w.composition {
@@ -11331,7 +12386,7 @@ fn path_suffix_matches(path: &str, clicked: &str) -> bool {
 async fn task_match_ignored_files(id: String, clicked: String) -> Result<Vec<String>, String> {
     const MAX_MATCHES: usize = 30;
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
         let q = clicked.trim_start_matches("./").trim_start_matches('/');
         if q.is_empty() {
             return Ok(Vec::new());
@@ -11356,7 +12411,7 @@ async fn task_match_ignored_files(id: String, clicked: String) -> Result<Vec<Str
                 }
             }
         };
-        let host_repo_path = load_projects().into_iter().find(|p| p.id == w.project_id)
+        let host_repo_path = load_projects_all().into_iter().find(|p| p.id == w.project_id)
             .map(|p| p.root_path).unwrap_or_default();
         scan(&w.path, "", &compile_exclude_patterns(&host_repo_path));
         for m in &w.composition {
@@ -11690,9 +12745,9 @@ fn run_script_streaming(
         let mut child = match spawn_res {
             Ok(c) => c,
             Err(e) => {
-                let _ = app.emit(&format!("setup-output://{ws_id}"),
+                emit_scoped(&app, &format!("setup-output://{ws_id}"),
                     serde_json::json!({ "line": format!("[spawn error] {e}") }));
-                let _ = app.emit(&format!("setup-done://{ws_id}"),
+                emit_scoped(&app, &format!("setup-done://{ws_id}"),
                     serde_json::json!({ "code": serde_json::Value::Null, "success": false }));
                 return;
             }
@@ -11702,14 +12757,14 @@ fn run_script_streaming(
         let app_o = app.clone(); let id_o = ws_id.clone();
         let t_out = stdout.map(|s| thread::spawn(move || {
             for line in BufReader::new(s).lines().map_while(|r| r.ok()) {
-                let _ = app_o.emit(&format!("setup-output://{id_o}"),
+                emit_scoped(&app_o, &format!("setup-output://{id_o}"),
                     serde_json::json!({ "line": line }));
             }
         }));
         let app_e = app.clone(); let id_e = ws_id.clone();
         let t_err = stderr.map(|s| thread::spawn(move || {
             for line in BufReader::new(s).lines().map_while(|r| r.ok()) {
-                let _ = app_e.emit(&format!("setup-output://{id_e}"),
+                emit_scoped(&app_e, &format!("setup-output://{id_e}"),
                     serde_json::json!({ "line": line }));
             }
         }));
@@ -11719,7 +12774,7 @@ fn run_script_streaming(
         if let Some(t) = t_err { let _ = t.join(); }
         let code = status.as_ref().ok().and_then(|s| s.code());
         let success = status.map(|s| s.success()).unwrap_or(false);
-        let _ = app.emit(&format!("setup-done://{ws_id}"),
+        emit_scoped(&app, &format!("setup-done://{ws_id}"),
             serde_json::json!({ "code": code, "success": success }));
     });
 }
@@ -12234,7 +13289,7 @@ async fn lsp_resolve_asset(spec: &LspInstall) -> ResolvedAsset {
 /// Where a downloaded server lives: termic-owned, versioned, and deletable
 /// wholesale. Never anywhere on the user's PATH.
 fn lsp_server_dir(language: &str, version: &str) -> Result<PathBuf, String> {
-    Ok(data_dir()
+    Ok(global_dir()
         .map_err(|e| e.to_string())?
         .join("servers")
         .join(language)
@@ -12251,7 +13306,7 @@ fn lsp_server_dir(language: &str, version: &str) -> Result<PathBuf, String> {
 fn lsp_installed_exe(language: &str) -> Option<(String, Vec<String>)> {
     let spec = lsp_install_spec(language)?;
     let rel = if spec.exe_in_archive.is_empty() { "server" } else { spec.exe_in_archive };
-    let base = data_dir().ok()?.join("servers").join(language);
+    let base = global_dir().ok()?.join("servers").join(language);
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in fs::read_dir(&base).ok()?.flatten() {
         // Belt and braces with the staging move: anything dot-prefixed is
@@ -12756,7 +13811,7 @@ async fn lsp_install_version(
 
 /// Installed versions of a language's server, newest first.
 fn lsp_installed_versions(language: &str) -> Vec<(String, std::time::SystemTime)> {
-    let Ok(base) = data_dir().map(|d| d.join("servers").join(language)) else {
+    let Ok(base) = global_dir().map(|d| d.join("servers").join(language)) else {
         return vec![];
     };
     lsp_versions_in(&base)
@@ -12842,7 +13897,7 @@ struct LspCatalogEntry {
 /// environment (the project's environment is the project's) and NOT anything
 /// on the user's PATH. Deleting termic's data directory removes it.
 fn zuban_dir() -> Option<PathBuf> {
-    Some(data_dir().ok()?.join("servers").join("python-zuban"))
+    Some(global_dir().ok()?.join("servers").join("python-zuban"))
 }
 
 /// termic's own zuban, when it has one.
@@ -13991,9 +15046,9 @@ fn spotlight_kill_run(ws_id: &str) {
 /// Stop spotlight for a task without requiring an AppHandle (called
 /// from task_archive_sync). Caller emits the status event if needed.
 fn spotlight_stop_for_ws(ws_id: &str) {
-    let tasks = load_tasks();
+    let tasks = load_tasks_all();
     let Some(w) = tasks.iter().find(|w| w.id == ws_id) else { return };
-    let projects = load_projects();
+    let projects = load_projects_all();
     let Some(p) = projects.iter().find(|p| p.id == w.project_id) else { return };
     let main = PathBuf::from(&p.root_path);
     if let Some(state) = spotlight_remove(&p.id) {
@@ -14020,9 +15075,9 @@ async fn task_spotlight_start(id: String, app: AppHandle) -> Result<(), String> 
 }
 
 fn spotlight_start_sync(ws_id: String, app: AppHandle) -> Result<(), String> {
-    let w = load_tasks().into_iter().find(|w| w.id == ws_id)
+    let w = load_tasks_all().into_iter().find(|w| w.id == ws_id)
         .ok_or("no such task")?;
-    let p = load_projects().into_iter().find(|p| p.id == w.project_id)
+    let p = load_projects_all().into_iter().find(|p| p.id == w.project_id)
         .ok_or("project missing")?;
 
     if !p.spotlight_enabled {
@@ -14052,7 +15107,9 @@ fn spotlight_start_sync(ws_id: String, app: AppHandle) -> Result<(), String> {
         // spotlight target) before reverting main + applying the new one.
         spotlight_kill_run(&existing.ws_id);
         spotlight_revert(&main, &existing.original_ref, &existing.applied_untracked)?;
-        let _ = app.emit("spotlight://status", serde_json::json!({
+        // The task is being CLEARED, so route by the one being torn down:
+        // its window is the one whose spotlight state just changed.
+        emit_scoped_by_id(&app, &existing.ws_id, "spotlight://status", serde_json::json!({
             "project_id": &project_id,
             "ws_id": serde_json::Value::Null,
         }));
@@ -14128,7 +15185,7 @@ fn spotlight_start_sync(ws_id: String, app: AppHandle) -> Result<(), String> {
                 }
 
                 if let Err(e) = spotlight_revert(&poll_main, &poll_orig, &current_untracked) {
-                    let _ = poll_app.emit("spotlight://error", serde_json::json!({
+                    emit_scoped_by_id(&poll_app, &poll_ws_id, "spotlight://error", serde_json::json!({
                         "project_id": &poll_project_id,
                         "ws_id": &poll_ws_id,
                         "message": e,
@@ -14139,7 +15196,7 @@ fn spotlight_start_sync(ws_id: String, app: AppHandle) -> Result<(), String> {
                 match spotlight_apply(&poll_worktree, &poll_main, &poll_base, &poll_ws_name) {
                     Ok(r) => {
                         spotlight_update_untracked(&poll_project_id, r.applied_untracked.clone());
-                        let _ = poll_app.emit("spotlight://synced", serde_json::json!({
+                        emit_scoped_by_id(&poll_app, &poll_ws_id, "spotlight://synced", serde_json::json!({
                             "project_id": &poll_project_id,
                             "ws_id": &poll_ws_id,
                             "committed_files":   r.committed_files,
@@ -14148,7 +15205,7 @@ fn spotlight_start_sync(ws_id: String, app: AppHandle) -> Result<(), String> {
                         }));
                     }
                     Err(e) => {
-                        let _ = poll_app.emit("spotlight://error", serde_json::json!({
+                        emit_scoped_by_id(&poll_app, &poll_ws_id, "spotlight://error", serde_json::json!({
                             "project_id": &poll_project_id,
                             "ws_id": &poll_ws_id,
                             "message": e,
@@ -14168,11 +15225,11 @@ fn spotlight_start_sync(ws_id: String, app: AppHandle) -> Result<(), String> {
 
     // Emit status FIRST so the frontend clears the log, THEN emit synced
     // so the initial sync detail arrives into the freshly-cleared log.
-    let _ = app.emit("spotlight://status", serde_json::json!({
+    emit_scoped_by_id(&app, &ws_id, "spotlight://status", serde_json::json!({
         "project_id": &project_id,
         "ws_id": &ws_id,
     }));
-    let _ = app.emit("spotlight://synced", serde_json::json!({
+    emit_scoped_by_id(&app, &ws_id, "spotlight://synced", serde_json::json!({
         "project_id": &project_id,
         "ws_id": &ws_id,
         "committed_files":   r.committed_files,
@@ -14191,9 +15248,9 @@ async fn task_spotlight_stop(id: String, app: AppHandle) -> Result<(), String> {
 }
 
 fn spotlight_stop_sync(ws_id: String, app: AppHandle) -> Result<(), String> {
-    let w = load_tasks().into_iter().find(|w| w.id == ws_id)
+    let w = load_tasks_all().into_iter().find(|w| w.id == ws_id)
         .ok_or("no such task")?;
-    let p = load_projects().into_iter().find(|p| p.id == w.project_id)
+    let p = load_projects_all().into_iter().find(|p| p.id == w.project_id)
         .ok_or("project missing")?;
     let main = PathBuf::from(&p.root_path);
 
@@ -14205,7 +15262,7 @@ fn spotlight_stop_sync(ws_id: String, app: AppHandle) -> Result<(), String> {
         spotlight_revert(&main, &state.original_ref, &state.applied_untracked)?;
     }
 
-    let _ = app.emit("spotlight://status", serde_json::json!({
+    emit_scoped_by_id(&app, &ws_id, "spotlight://status", serde_json::json!({
         "project_id": &p.id,
         "ws_id": serde_json::Value::Null,
     }));
@@ -14216,9 +15273,9 @@ fn spotlight_stop_sync(ws_id: String, app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn task_spotlight_resync(id: String, app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let w = load_tasks().into_iter().find(|w| w.id == id)
+        let w = load_tasks_all().into_iter().find(|w| w.id == id)
             .ok_or("no such task")?;
-        let p = load_projects().into_iter().find(|p| p.id == w.project_id)
+        let p = load_projects_all().into_iter().find(|p| p.id == w.project_id)
             .ok_or("project missing")?;
         let worktree = PathBuf::from(&w.path);
         let main     = PathBuf::from(&p.root_path);
@@ -14238,7 +15295,7 @@ async fn task_spotlight_resync(id: String, app: AppHandle) -> Result<(), String>
         let r = spotlight_apply(&worktree, &main, &w.base_branch, &w.name)?;
         spotlight_update_untracked(&p.id, r.applied_untracked.clone());
 
-        let _ = app.emit("spotlight://synced", serde_json::json!({
+        emit_scoped_by_id(&app, &id, "spotlight://synced", serde_json::json!({
             "project_id": &p.id,
             "ws_id": &id,
             "committed_files":   r.committed_files,
@@ -14263,9 +15320,9 @@ fn task_ensure_extra_ports(id: String) -> Result<Task, String> {
     // Held until save_task below: a stray allocated against a stale
     // snapshot could collide with a concurrent create's block.
     let _port_guard = PORT_ALLOC_LOCK.lock();
-    let mut list = load_tasks();
+    let mut list = load_tasks_all();
     let idx = list.iter().position(|w| w.id == id).ok_or("no such task")?;
-    let Some(proj) = load_projects().into_iter().find(|p| p.id == list[idx].project_id) else {
+    let Some(proj) = load_projects_all().into_iter().find(|p| p.id == list[idx].project_id) else {
         return Ok(list[idx].clone()); // orphaned task: spawn with the frozen pairs
     };
     let snapshot = list.clone();
@@ -14301,9 +15358,9 @@ fn task_run_script_stream(
     // Port lock spans load -> top-up -> save only; dropped before the
     // script actually spawns.
     let port_guard = PORT_ALLOC_LOCK.lock();
-    let all_tasks = load_tasks();
+    let all_tasks = load_tasks_all();
     let mut w = all_tasks.iter().find(|w| w.id == id).cloned().ok_or("no such task")?;
-    let p = load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
+    let p = load_projects_all().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
     // On-the-fly ports (GH #196): names configured after this task was
     // created freeze into its buffer (or overflow to a stray port) now,
     // so this run sees them.
@@ -14375,7 +15432,7 @@ fn task_run_script_stream(
 
     // Empty script → no-op but emit done so the UI doesn't spin forever.
     if script.trim().is_empty() {
-        let _ = app.emit(&emit_done,
+        emit_scoped(&app, &emit_done,
             serde_json::json!({ "code": 0, "success": true }));
         return Ok(());
     }
@@ -14464,9 +15521,9 @@ fn task_run_script_stream(
         let mut child = match spawn_res {
             Ok(c) => c,
             Err(e) => {
-                let _ = app_o.emit(&emit_out_o,
+                emit_scoped(&app_o, &emit_out_o,
                     serde_json::json!({ "line": format!("[spawn error] {e}") }));
-                let _ = app_o.emit(&emit_done_o,
+                emit_scoped(&app_o, &emit_done_o,
                     serde_json::json!({ "code": serde_json::Value::Null, "success": false }));
                 return;
             }
@@ -14479,13 +15536,13 @@ fn task_run_script_stream(
         let app1 = app_o.clone(); let ch1 = emit_out_o.clone();
         let t_out = stdout.map(|s| thread::spawn(move || {
             for line in BufReader::new(s).lines().map_while(|r| r.ok()) {
-                let _ = app1.emit(&ch1, serde_json::json!({ "line": line }));
+                emit_scoped(&app1, &ch1, serde_json::json!({ "line": line }));
             }
         }));
         let app2 = app_o.clone(); let ch2 = emit_out_o.clone();
         let t_err = stderr.map(|s| thread::spawn(move || {
             for line in BufReader::new(s).lines().map_while(|r| r.ok()) {
-                let _ = app2.emit(&ch2, serde_json::json!({ "line": line }));
+                emit_scoped(&app2, &ch2, serde_json::json!({ "line": line }));
             }
         }));
         let status = child.wait();
@@ -14494,7 +15551,7 @@ fn task_run_script_stream(
         if running_scripts_finish(&map_key_o, pid) {
             let code = status.as_ref().ok().and_then(|s| s.code());
             let success = status.map(|s| s.success()).unwrap_or(false);
-            let _ = app_o.emit(&emit_done_o,
+            emit_scoped(&app_o, &emit_done_o,
                 serde_json::json!({ "code": code, "success": success }));
         }
     });
@@ -14745,7 +15802,7 @@ fn task_grep_start(
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no such task")?;
+    let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no such task")?;
     let cwd = std::path::PathBuf::from(&w.path);
     // Search the host repo first, then each multi-repo member, serially.
     // Member result paths are prefixed with `<dir_name>/` so they resolve
@@ -14762,7 +15819,7 @@ fn task_grep_start(
     // Empty query → just emit done. UI shouldn't bother calling us, but
     // be defensive (debounce can race).
     if query.trim().is_empty() {
-        let _ = app.emit(&emit_done, serde_json::json!({ "truncated": false }));
+        emit_scoped(&app, &emit_done, serde_json::json!({ "truncated": false }));
         return Ok(());
     }
 
@@ -14834,7 +15891,7 @@ fn task_grep_start(
         let flush_batch = |app: &tauri::AppHandle, topic: &str, batch: &mut Vec<serde_json::Value>| {
             if batch.is_empty() { return; }
             let payload = serde_json::json!({ "hits": batch.clone() });
-            let _ = app.emit(topic, payload);
+            emit_scoped(&app, topic, payload);
             batch.clear();
         };
 
@@ -14915,7 +15972,7 @@ fn task_grep_start(
             }
         }
         if !superseded {
-            let _ = app_o.emit(&emit_done, serde_json::json!({ "truncated": truncated }));
+            emit_scoped(&app_o, &emit_done, serde_json::json!({ "truncated": truncated }));
         }
         // search_id_o is only used in the topic strings above; reference it
         // here so the borrow checker doesn't complain about an unused move.
@@ -15025,16 +16082,16 @@ fn home_dir() -> String {
 /// `project_id` = None checks the value as the GLOBAL default across every
 /// project; Some(id) checks it as that one project's override.
 #[tauri::command]
-fn tasks_path_conflicts(path: String, project_id: Option<String>) -> Vec<String> {
+fn tasks_path_conflicts(window: tauri::Window, path: String, project_id: Option<String>) -> Vec<String> {
     // Neither mode normally needs settings.json: in global mode the CANDIDATE
     // is the default, and in override mode a non-empty candidate short-circuits
     // the default entirely. Only an EMPTY override (which means "inherit")
     // has to read the stored value, so the load stays off the typing path.
     let is_override = project_id.is_some();
     let inherited = (is_override && path.trim().is_empty())
-        .then(|| load_settings_inner().default_tasks_path)
+        .then(|| load_settings_in(&window_profile(&window)).default_tasks_path)
         .unwrap_or_default();
-    load_projects()
+    load_projects_in(&window_profile(&window))
         .into_iter()
         .filter(|p| match project_id.as_deref() {
             Some(id) => p.id == id,
@@ -15069,7 +16126,7 @@ fn tasks_path_conflicts(path: String, project_id: Option<String>) -> Vec<String>
 /// still show the user where tasks will go.
 #[tauri::command]
 fn project_tasks_path_default(project_id: String) -> Result<String, String> {
-    let p = load_projects().into_iter().find(|p| p.id == project_id)
+    let p = load_projects_all().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
     Ok(project_tasks_root_default(&p).to_string_lossy().into_owned())
 }
@@ -15291,7 +16348,7 @@ fn after_open(os: &str, spawned: bool, exit_ok: bool) -> AfterOpen {
 /// command (which would otherwise linger in release builds).
 #[cfg(feature = "e2e")]
 fn e2e_record_open(path: &str) {
-    if let Ok(dir) = data_dir() {
+    if let Ok(dir) = global_dir() {
         let _ = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -15504,7 +16561,7 @@ fn browser_command_check(command: String) -> Result<(), String> {
 /// precedence rules picked with plain `fs` and no extra release-build IPC.
 #[cfg(feature = "e2e")]
 fn e2e_record_browser(argv: &[String]) {
-    if let Ok(dir) = data_dir() {
+    if let Ok(dir) = global_dir() {
         let line = serde_json::to_string(argv).unwrap_or_default();
         let _ = fs::OpenOptions::new()
             .create(true)
@@ -16612,12 +17669,17 @@ fn default_agents() -> Vec<Agent> {
     ]
 }
 
-fn settings_file() -> Result<PathBuf> {
-    Ok(data_dir()?.join("settings.json"))
+fn settings_file_in(id: &ProfileId) -> Result<PathBuf> {
+    Ok(profile_dir(id)?.join("settings.json"))
 }
 
-pub(crate) fn load_settings_inner() -> Settings {
-    let f = match settings_file() { Ok(p) => p, Err(_) => return seeded_defaults() };
+/// Settings for the profile a record belongs to.
+///
+/// Settings are profile-scoped IN FULL (docs/plans/profiles.md, "Scope"), so
+/// this is the real accessor and [`load_settings_inner`] is the convenience
+/// wrapper for the root.
+pub(crate) fn load_settings_in(id: &ProfileId) -> Settings {
+    let f = match settings_file_in(id) { Ok(p) => p, Err(_) => return seeded_defaults() };
     let mut s: Settings = match fs::read_to_string(&f) {
         // Fall back to seeded_defaults(), NOT bare Settings::default(): the
         // latter derives EMPTY seeded lists (worktree_symlink_paths), which is
@@ -16767,6 +17829,18 @@ pub(crate) fn load_settings_inner() -> Settings {
     s
 }
 
+/// The ROOT profile's settings.
+///
+/// Kept as the no-argument accessor because most call sites read a flag this
+/// doc's scope table already calls machine-wide (`cli_enabled`, `mcp_enabled`,
+/// `docker_sandbox_enabled`), and because the dormant install this resolves
+/// identically for is the overwhelmingly common one. A site that is acting on
+/// behalf of a specific task or project must use [`load_settings_in`] with
+/// that record's profile instead.
+pub(crate) fn load_settings_inner() -> Settings {
+    load_settings_in(&ProfileId::Root)
+}
+
 fn seeded_defaults() -> Settings {
     Settings {
         agents: default_agents(),
@@ -16783,7 +17857,12 @@ fn seeded_defaults() -> Settings {
 }
 
 #[tauri::command]
-fn settings_load() -> Settings { load_settings_inner() }
+fn settings_load(window: tauri::Window) -> Settings {
+    // The CALLING WINDOW's profile. Settings are scoped in full
+    // (docs/profiles.md), so the Settings dialog in a second profile's window
+    // must read and write that profile's file, not the root's.
+    load_settings_in(&window_profile(&window))
+}
 
 /// Expose the ship-time defaults for the agent registry. Used by the
 /// Settings → Agents UI to show "modified" indicators and offer a
@@ -17070,7 +18149,7 @@ async fn docker_command_preview(task_id: Option<String>, agent_id: Option<String
 fn docker_command_preview_sync(task_id: Option<String>, agent_id: Option<String>) -> Result<DockerCommandPreview, String> {
     // No task id = the settings-level preview (no task selected yet).
     let task = match task_id {
-        Some(id) => load_tasks()
+        Some(id) => load_tasks_all()
             .into_iter()
             .find(|t| t.id == id)
             .ok_or_else(|| "task not found".to_string())?,
@@ -17205,9 +18284,9 @@ fn run_capture_command_blocking(
 }
 
 #[tauri::command]
-fn settings_save(app: AppHandle, s: Settings) -> Result<(), String> {
+fn settings_save(app: AppHandle, window: tauri::Window, s: Settings) -> Result<(), String> {
     let tray_on = tray_enabled_pref(&s);
-    save_settings_inner(&s)?;
+    save_settings_in(&window_profile(&window), &s)?;
     // Applies live: flipping the toggle in Settings shouldn't need a restart
     // to show/hide the menu-bar item, matching close_action/cli_enabled's
     // "re-read per use" behavior.
@@ -17221,17 +18300,22 @@ fn settings_save(app: AppHandle, s: Settings) -> Result<(), String> {
 /// The single settings writer. Extracted so Rust-side toggles (the menu-bar
 /// item, the close-button choice) persist through exactly the same path the
 /// Settings UI does, instead of growing a second encoder that could drift.
-pub(crate) fn save_settings_inner(s: &Settings) -> Result<(), String> {
-    let f = settings_file().map_err(|e| e.to_string())?;
+pub(crate) fn save_settings_in(id: &ProfileId, s: &Settings) -> Result<(), String> {
+    let f = settings_file_in(id).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
     write_atomic(&f, json.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// The ROOT profile's settings writer. Mirror of [`load_settings_inner`].
+pub(crate) fn save_settings_inner(s: &Settings) -> Result<(), String> {
+    save_settings_in(&ProfileId::Root, s)
 }
 
 /// Hide (`dismissed = true`) or restore (`false`) a discovered repo from the
 /// Add Project picker. Persists the CANONICAL path in Settings so the choice
 /// survives restarts; discovery keeps finding the repo but flags it dismissed.
 #[tauri::command]
-fn discovery_dismiss(path: String, dismissed: bool) -> Result<(), String> {
+fn discovery_dismiss(window: tauri::Window, path: String, dismissed: bool) -> Result<(), String> {
     // Match discover_repos, which returns canonical paths — canonicalize so a
     // symlinked or non-normalized input still lands on the same key. A deleted
     // repo can't canonicalize; fall back to the raw path so a stale entry is
@@ -17239,7 +18323,7 @@ fn discovery_dismiss(path: String, dismissed: bool) -> Result<(), String> {
     let canon = fs::canonicalize(&path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or(path);
-    let mut s = load_settings_inner();
+    let mut s = load_settings_in(&window_profile(&window));
     if dismissed {
         if !s.discovery_dismissed.contains(&canon) {
             s.discovery_dismissed.push(canon);
@@ -17247,7 +18331,7 @@ fn discovery_dismiss(path: String, dismissed: bool) -> Result<(), String> {
     } else {
         s.discovery_dismissed.retain(|p| p != &canon);
     }
-    save_settings_inner(&s)
+    save_settings_in(&window_profile(&window), &s)
 }
 
 /// Replace just the agents list, preserving the rest of settings (repos_dir,
@@ -17255,13 +18339,13 @@ fn discovery_dismiss(path: String, dismissed: bool) -> Result<(), String> {
 /// CLI commands, args, and YOLO flags without us shipping a new release every
 /// time an agent CLI changes a flag.
 #[tauri::command]
-fn agents_save(agents: Vec<Agent>) -> Result<(), String> {
-    let mut s = load_settings_inner();
+fn agents_save(window: tauri::Window, agents: Vec<Agent>) -> Result<(), String> {
+    let mut s = load_settings_in(&window_profile(&window));
     // Defensive: ensure no two agents share an id (would break task.cli
     // lookups). If duplicates, keep the first occurrence.
     let mut seen = std::collections::HashSet::new();
     s.agents = agents.into_iter().filter(|a| seen.insert(a.id.clone())).collect();
-    save_settings_inner(&s)
+    save_settings_in(&window_profile(&window), &s)
 }
 
 // ───────────────────────────── custom themes ─────────────────────────────
@@ -17297,7 +18381,7 @@ pub struct CustomThemeFile {
 /// `$XDG_CONFIG_HOME/termic/themes`, defaulting to `~/.config/termic/themes`
 /// — the same path shape on every platform (wezterm/starship convention;
 /// on Windows `~` is the user profile dir). Themes are hand-authored,
-/// stowable config, unlike the app-owned JSON in `data_dir()`, so they
+/// stowable config, unlike the app-owned JSON in `global_dir()`, so they
 /// live under `.config` and deliberately skip the `termic_dev` split
 /// (dev builds should see your real themes; the files are inert and
 /// validated, so they can't destabilize a dev run).
@@ -17420,14 +18504,20 @@ fn repo_activity_time(repo: &Path) -> std::time::SystemTime {
 /// are skipped at both levels. Sorted by most recent activity (newest
 /// first) so the repos you actually work in surface at the top.
 #[tauri::command]
-fn discover_repos(dir: String) -> Result<Vec<DiscoveredRepo>, String> {
+fn discover_repos(window: tauri::Window, dir: String) -> Result<Vec<DiscoveredRepo>, String> {
+    discover_repos_in(&window_profile(&window), dir)
+}
+
+/// The profile-scoped half, split out so unit tests can call it without a
+/// `tauri::Window` (which cannot be constructed off a running app).
+fn discover_repos_in(profile: &ProfileId, dir: String) -> Result<Vec<DiscoveredRepo>, String> {
     let root = PathBuf::from(shellexpand(&dir));
-    let added: std::collections::HashSet<String> = load_projects()
+    let added: std::collections::HashSet<String> = load_projects_in(&profile.clone())
         .into_iter()
         .map(|p| p.root_path)
         .collect();
     let dismissed: std::collections::HashSet<String> =
-        load_settings_inner().discovery_dismissed.into_iter().collect();
+        load_settings_in(&profile.clone()).discovery_dismissed.into_iter().collect();
     discover_repos_inner(&root, &added, &dismissed)
 }
 
@@ -17921,12 +19011,18 @@ fn tray_icon_image_badge(count: usize) -> tauri::image::Image<'static> {
 /// pre-sorted by project name then attention-before-done then task name —
 /// `build_tray_menu` trusts that order rather than re-sorting.
 #[derive(serde::Deserialize)]
+#[derive(Clone)]
 struct TrayAttentionItem {
     task_id: String,
     task_name: String,
     project_name: String,
     /// "waiting" (blocked on the user) or "done" (finished a turn).
     state: String,
+    /// Filled in by the MERGE (GH #280), never by the webview: which profile's
+    /// window this row lives in. `None` when there is only one profile, which
+    /// is what keeps a single-profile install's menu unchanged.
+    #[serde(skip)]
+    profile_name: Option<String>,
 }
 
 /// Menu rows before Show/Quit are truncated past this count, so a runaway
@@ -17937,6 +19033,59 @@ const TRAY_ATTENTION_CAP: usize = 40;
 /// project, one disabled header row per project) followed by the constant
 /// Show Termic / Quit Termic pair. Shared by the initial build and every
 /// later `tray_set_attention` push so both stay in lockstep.
+/// Every window's attention set, keyed by window label (GH #280).
+///
+/// The menu-bar item legitimately sees every profile at once: knowing an agent
+/// needs you in the OTHER window is the reason it exists. But each window now
+/// computes from its OWN profile, so the payloads are disjoint and Rust has to
+/// merge N partial sets into one menu rather than take the last writer.
+static TRAY_ATTENTION: std::sync::Mutex<Option<HashMap<String, Vec<TrayAttentionItem>>>> =
+    std::sync::Mutex::new(None);
+
+/// Merge every window's set into one list, ordered so rows group by profile
+/// and then by project.
+///
+/// Windows that no longer exist are dropped in the same pass: a closed
+/// profile's tasks keep RUNNING (PTYs live in Rust), but they are no longer
+/// reachable by clicking a row, and a menu that raises a window that is not
+/// there is worse than one that omits them.
+fn merged_tray_attention(app: &AppHandle) -> Vec<TrayAttentionItem> {
+    use tauri::Manager;
+    let mut guard = TRAY_ATTENTION.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.retain(|label, _| app.get_webview_window(label).is_some());
+
+    let reg = profiles_registry();
+    let mut out: Vec<TrayAttentionItem> = Vec::new();
+    // Registry order, so the menu's profile sections do not reshuffle
+    // between rebuilds.
+    let mut labels: Vec<String> = reg.profiles.iter().map(|p| reg.id_for(&p.slug).window_label()).collect();
+    for label in map.keys() {
+        if !labels.contains(label) {
+            labels.push(label.clone());
+        }
+    }
+    for label in labels {
+        let Some(items) = map.get(&label) else { continue };
+        // Only label rows by profile when there IS more than one, or a
+        // single-profile install grows a redundant heading it never had.
+        let profile_name = (reg.profiles.len() > 1)
+            .then(|| {
+                ProfileId::from_window_label(&label).and_then(|id| match id {
+                    ProfileId::Root => reg.root_slug.as_deref().and_then(|s| reg.get(s)).map(|p| p.name.clone()),
+                    ProfileId::Slug(sl) => reg.get(&sl).map(|p| p.name.clone()),
+                })
+            })
+            .flatten();
+        for it in items {
+            let mut it = it.clone();
+            it.profile_name = profile_name.clone();
+            out.push(it);
+        }
+    }
+    out
+}
+
 fn build_tray_menu(
     app: &AppHandle,
     items: &[TrayAttentionItem],
@@ -17946,18 +19095,27 @@ fn build_tray_menu(
     let mut entries: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = Vec::new();
     if !items.is_empty() {
         let shown = &items[..items.len().min(TRAY_ATTENTION_CAP)];
-        let mut last_project: Option<&str> = None;
+        let mut last_group: Option<(Option<String>, String)> = None;
         for it in shown {
-            if last_project != Some(it.project_name.as_str()) {
+            let group = (it.profile_name.clone(), it.project_name.clone());
+            if last_group.as_ref() != Some(&group) {
+                // With several profiles up, the header reads
+                // "Work - termic" so the row answers "which window is this
+                // in" before you click it. One profile: project name alone,
+                // exactly as before.
+                let label = match &it.profile_name {
+                    Some(p) => format!("{p} - {}", it.project_name),
+                    None => it.project_name.clone(),
+                };
                 let header = MenuItem::with_id(
                     app,
-                    format!("tray_header_{}", it.project_name),
-                    &it.project_name,
+                    format!("tray_header_{label}"),
+                    &label,
                     false,
                     None::<&str>,
                 )?;
                 entries.push(Box::new(header));
-                last_project = Some(it.project_name.as_str());
+                last_group = Some(group);
             }
             // Icon carries the state (amber dot / blue dot, tray_row_icon)
             // — no text prefix/suffix needed. (Emoji was tried in between:
@@ -17989,8 +19147,48 @@ fn build_tray_menu(
 
     let show = MenuItem::with_id(app, "tray_show", "Show Termic", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
+
+    // Profiles (GH #280). This is the switcher that works with NO WINDOW
+    // FOCUSED, which is why it is here and not only in the command palette:
+    // Cmd+N is already New task, so profiles cannot take Chrome's new-window
+    // convention, and the menu-bar item is the one surface reachable from a
+    // windowless app. Nothing renders while the feature is dormant, so a
+    // single-profile install's menu is unchanged.
+    let profile_rows: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = {
+        let reg = profiles_registry();
+        let mut rows: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = Vec::new();
+        if !reg.is_dormant() {
+            let mut sorted = reg.profiles.clone();
+            sorted.sort_by_key(|p| p.order);
+            for p in &sorted {
+                let open = {
+                    use tauri::Manager;
+                    app.get_webview_window(&reg.id_for(&p.slug).window_label()).is_some()
+                };
+                rows.push(Box::new(MenuItem::with_id(
+                    app,
+                    format!("tray_profile_{}", p.slug),
+                    // The open ones are marked rather than hidden or disabled:
+                    // clicking is one action either way (focus it, or launch
+                    // it), so the marker is information, not a second control.
+                    if open { format!("{} (open)", p.name) } else { p.name.clone() },
+                    true,
+                    None::<&str>,
+                )?));
+            }
+        }
+        rows
+    };
     let quit = MenuItem::with_id(app, "tray_quit", "Quit Termic", true, None::<&str>)?;
     entries.push(Box::new(show));
+    if !profile_rows.is_empty() {
+        entries.push(Box::new(PredefinedMenuItem::separator(app)?));
+        let header = MenuItem::with_id(app, "tray_profiles_header", "Profiles", false, None::<&str>)?;
+        entries.push(Box::new(header));
+        for r in profile_rows {
+            entries.push(r);
+        }
+    }
     entries.push(Box::new(sep));
     // Separator so Quit is not one slip away from Show: this Quit kills every
     // running agent, and it is the item people reach for by muscle memory.
@@ -18027,7 +19225,25 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 // already visible, just backgrounded), then route to the
                 // task the user clicked.
                 leave_windowless(app);
-                let _ = app.emit("termic://focus-task", task_id.to_string());
+                // The menu-bar item legitimately sees every profile at once
+                // (knowing an agent needs you in the OTHER window is why it
+                // exists), so the click has to raise the owning window rather
+                // than assume there is only one. A broadcast would make every
+                // profile try to focus a task only one of them has.
+                raise_task_window(app, task_id);
+                emit_scoped_by_id(app, task_id, "termic://focus-task", task_id.to_string());
+                return;
+            }
+            if let Some(slug) = id.strip_prefix("tray_profile_") {
+                // Focus the profile's window, or launch it. From the user's
+                // side that is one action, which is why the row does not
+                // distinguish them.
+                let app2 = app.clone();
+                let slug = slug.to_string();
+                leave_windowless(app);
+                tauri::async_runtime::spawn(async move {
+                    let _ = profile_open(app2, slug);
+                });
                 return;
             }
             match id {
@@ -18049,7 +19265,32 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 /// list (`trayAttention.ts`). A no-op push (empty list) clears both back to
 /// the bare Show/Quit menu and the plain template mark.
 #[tauri::command]
-fn tray_set_attention(app: AppHandle, items: Vec<TrayAttentionItem>) -> Result<(), String> {
+/// Rebuild the menu-bar menu from current state.
+///
+/// Called whenever the REGISTRY changes (create / rename / delete / disable)
+/// and whenever a profile window opens or closes, because the menu now lists
+/// profiles and marks the open ones. Without this the menu would only catch up
+/// on the next attention push, so a profile created while nothing is working
+/// would simply not be there.
+fn rebuild_tray_menu(app: &AppHandle) {
+    let items = merged_tray_attention(app);
+    if let Ok(menu) = build_tray_menu(app, &items) {
+        if let Some(tray) = app.tray_by_id("main") {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+}
+
+#[tauri::command]
+fn tray_set_attention(app: AppHandle, window: tauri::Window, items: Vec<TrayAttentionItem>) -> Result<(), String> {
+    // Store THIS window's set, then rebuild from the merge: with one window
+    // per profile the last writer would otherwise erase every other profile's
+    // rows, which is the exact opposite of what the menu-bar item is for.
+    {
+        let mut guard = TRAY_ATTENTION.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get_or_insert_with(HashMap::new).insert(window.label().to_string(), items);
+    }
+    let items = merged_tray_attention(&app);
     let menu = build_tray_menu(&app, &items).map_err(|e| e.to_string())?;
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_menu(Some(menu));
@@ -18153,11 +19394,16 @@ fn set_tray_visible(app: &AppHandle, visible: bool) -> bool {
 
 /// Hide the window and go windowless. Idempotent.
 pub(crate) fn enter_windowless(app: &AppHandle) {
-    use tauri::Manager;
+    
     if WINDOWLESS.load(Ordering::SeqCst) {
         return;
     }
-    if let Some(win) = app.get_webview_window("main") {
+    // EVERY profile window, not just "main". WINDOWLESS is one flag for the
+    // whole app, and it gates the activation-policy drop to Accessory: leaving
+    // another profile's window visible while flagged windowless would drop the
+    // Dock icon out from under a window the user can still see.
+    let wins = profile_windows(app);
+    for win in &wins {
         // Hiding a NATIVE FULLSCREEN window is orderOut: on a window that owns
         // a Space - it orphans that Space and can restore into it later. Leave
         // fullscreen first; harmless when not in it.
@@ -18206,7 +19452,7 @@ pub(crate) fn enter_windowless(app: &AppHandle) {
 /// Bring the UI back. Drives the menu-bar item, dock-icon clicks
 /// (RunEvent::Reopen), and the CLI's `raise` verb. Idempotent.
 pub(crate) fn leave_windowless(app: &AppHandle) {
-    use tauri::Manager;
+    
     let was = WINDOWLESS.swap(false, Ordering::SeqCst);
     SHOWN_ONCE.store(true, Ordering::SeqCst);
     if was {
@@ -18220,13 +19466,25 @@ pub(crate) fn leave_windowless(app: &AppHandle) {
     // The zero→non-zero edge is also what repairs xterm's viewport scroller
     // (lib/xtermViewportSync).
     let _ = app.emit("termic://windowless", false);
-    if let Some(win) = app.get_webview_window("main") {
+    // Restore every profile window that exists. They exist because the user
+    // opened them, so hiding all and restoring one would silently lose a
+    // profile the user had up.
+    let wins = profile_windows(app);
+    for win in &wins {
         // Unminimize here, not at the call sites: the tray's "Show Termic" and
         // RunEvent::Reopen used to skip it while `raise` did it, so the three
         // entry points disagreed.
         let _ = win.unminimize();
         let _ = win.show();
-        focus_window_unless_e2e(&win);
+    }
+    // Focus exactly one, and prefer the root: focusing each in turn would
+    // leave whichever happened to be last in the map on top.
+    if let Some(win) = wins
+        .iter()
+        .find(|w| w.label() == ProfileId::Root.window_label())
+        .or_else(|| wins.first())
+    {
+        focus_window_unless_e2e(win);
     }
 }
 
@@ -18245,14 +19503,130 @@ pub(crate) fn leave_windowless(app: &AppHandle) {
 // drains atomically. That single-reader shape is also why a link arriving
 // while the app is live cannot be handled twice: the nudge carries no
 // payload, so there is nothing to double-handle.
-static PENDING_DEEP_LINKS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+/// Queued `termic://` URLs, each paired with the WINDOW LABEL it is for.
+///
+/// Keyed rather than a flat Vec because `deep_link_take_pending` is a
+/// `std::mem::take`: with N windows, whichever webview drained first swallowed
+/// every queued URL, including ones meant for another profile. Routing is
+/// decided once, here, at queue time.
+static PENDING_DEEP_LINKS: parking_lot::Mutex<Vec<(String, String)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Which window a `termic://` URL is for.
+///
+/// Rust deliberately does NOT parse these URLs (the webview owns the whole
+/// contract, see the note above) and that stays true: this reads ONE query
+/// parameter, `project`, which is the minimum needed to pick a window, and
+/// interprets nothing else. An unresolvable target falls back to the most
+/// recently focused open profile, which is decision 4's rule for a project
+/// living in several profiles and the only sensible answer for a link naming
+/// no project at all.
+fn deep_link_target(app: &AppHandle, url: &str) -> String {
+    let project = url
+        .split_once('?')
+        .map(|(_, q)| q)
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .find_map(|kv| kv.strip_prefix("project="))
+        .map(|v| percent_decode_loose(&v.replace('+', " ")));
+    if let Some(name) = project.as_deref().filter(|n| !n.is_empty()) {
+        let hits: Vec<Project> = load_projects_all()
+            .into_iter()
+            .filter(|p| p.name.eq_ignore_ascii_case(name) || p.id == name)
+            .collect();
+        if hits.len() == 1 {
+            return hits[0].profile.window_label();
+        }
+        if hits.len() > 1 {
+            // The same project in several profiles: Chrome's rule, most
+            // recently focused wins.
+            let reg = profiles_registry();
+            let mut best: Option<(String, String)> = None;
+            for h in &hits {
+                let slug = match &h.profile {
+                    ProfileId::Root => reg.root_slug.clone(),
+                    ProfileId::Slug(sl) => Some(sl.clone()),
+                };
+                let when = slug
+                    .as_deref()
+                    .and_then(|sl| reg.get(sl))
+                    .and_then(|p| p.last_focused_at.clone())
+                    .unwrap_or_default();
+                if best.as_ref().map(|(w, _)| when > *w).unwrap_or(true) {
+                    best = Some((when, h.profile.window_label()));
+                }
+            }
+            if let Some((_, label)) = best {
+                return label;
+            }
+        }
+    }
+    most_recent_profile_label(app)
+}
+
+/// Minimal `%XX` decoding, enough for a project name in a query string. Not a
+/// general URL decoder and must not become one.
+fn percent_decode_loose(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The label of the most recently focused OPEN profile window.
+pub(crate) fn most_recent_profile_label(app: &AppHandle) -> String {
+    let reg = profiles_registry();
+    let open = profile_windows(app);
+    let mut best: Option<(String, String)> = None;
+    for p in &reg.profiles {
+        let label = reg.id_for(&p.slug).window_label();
+        if !open.iter().any(|w| w.label() == label) {
+            continue;
+        }
+        let when = p.last_focused_at.clone().unwrap_or_default();
+        if best.as_ref().map(|(w, _)| when > *w).unwrap_or(true) {
+            best = Some((when, label));
+        }
+    }
+    best.map(|(_, l)| l)
+        .or_else(|| open.first().map(|w| w.label().to_string()))
+        .unwrap_or_else(|| ProfileId::Root.window_label())
+}
+
+/// Raise the window owning `task_id`, opening that profile if it is closed.
+fn raise_task_window(app: &AppHandle, task_id: &str) {
+    use tauri::Manager;
+    let Some(label) = window_for_task(task_id) else { return };
+    if app.get_webview_window(&label).is_none() {
+        if let Some(id) = ProfileId::from_window_label(&label) {
+            let _ = build_profile_window(app, &id);
+        }
+    }
+    if let Some(win) = app.get_webview_window(&label) {
+        let _ = win.unminimize();
+        let _ = win.show();
+        focus_window_unless_e2e(&win);
+    }
+}
 
 /// Queue a `termic://` URL and nudge the webview. Safe to call before the
 /// window exists (the emit is dropped, the queue survives).
 pub(crate) fn queue_deep_link(app: &AppHandle, url: &str) {
     use tauri::Manager;
     dlog(&format!("[deeplink] queued {url}"));
-    PENDING_DEEP_LINKS.lock().push(url.to_string());
+    let target = deep_link_target(app, url);
+    PENDING_DEEP_LINKS.lock().push((target.clone(), url.to_string()));
     // Come to front. A link that opens a dialog (or selects a task) behind a
     // hidden window is indistinguishable from one that did nothing, and
     // windowless mode makes that the DEFAULT outcome for a menu-bar-only
@@ -18263,18 +19637,46 @@ pub(crate) fn queue_deep_link(app: &AppHandle, url: &str) {
     // runs before the window is built, and leave_windowless would flip
     // SHOWN_ONCE / the activation policy early, ahead of the normal startup
     // ordering. The webview's own boot drain covers that case.
-    if app.get_webview_window("main").is_some() {
+    if !profile_windows(app).is_empty() {
         leave_windowless(app);
     }
-    let _ = app.emit("termic://deep-link", ());
+    // Open the owning profile's window if it is closed, then raise it: a link
+    // that lands in a window the user cannot see is indistinguishable from one
+    // that did nothing. This runs AFTER the routing decision, deliberately:
+    // `leave_windowless` no longer decides which window comes up.
+    if let Some(id) = ProfileId::from_window_label(&target) {
+        if app.get_webview_window(&target).is_none() && !profile_windows(app).is_empty() {
+            let _ = build_profile_window(app, &id);
+        }
+        if let Some(win) = app.get_webview_window(&target) {
+            let _ = win.unminimize();
+            let _ = win.show();
+            focus_window_unless_e2e(&win);
+        }
+    }
+    let _ = app.emit_to(&target, "termic://deep-link", ());
 }
 
 /// Drain the queue. The webview calls this on boot AND on every
 /// `termic://deep-link` nudge, so a link that arrived before the listener
 /// existed is picked up by the boot read instead of being lost.
 #[tauri::command]
-fn deep_link_take_pending() -> Vec<String> {
-    std::mem::take(&mut *PENDING_DEEP_LINKS.lock())
+fn deep_link_take_pending(window: tauri::Window) -> Vec<String> {
+    // Drain only what is addressed to THIS window. The old `mem::take` handed
+    // the whole queue to whichever webview asked first, which with several
+    // profiles up meant one window swallowing another profile's links.
+    let mut q = PENDING_DEEP_LINKS.lock();
+    let label = window.label().to_string();
+    let mut mine = Vec::new();
+    q.retain(|(target, url)| {
+        if *target == label {
+            mine.push(url.clone());
+            false
+        } else {
+            true
+        }
+    });
+    mine
 }
 
 /// macOS handoff for a `termic://` link that LaunchServices routed to the
@@ -18516,7 +19918,7 @@ pub fn run() {
                      [termic]   the owner is whatever `lsof <socket>` reports. `make beta` builds a\n\
                      [termic]   RELEASE app that shares the shipped app's data dir, so either one\n\
                      [termic]   holding the socket blocks the other.",
-                    data_dir()
+                    global_dir()
                         .map(|d| d.join(termic_proto::SOCKET_FILE).display().to_string())
                         .unwrap_or_else(|_| "<unresolved data dir>".into()),
                 );
@@ -18609,77 +20011,7 @@ pub fn run() {
             // signal — y=21 on Tahoe, y=16 on the older chrome older OSes get.
             // Overridable at runtime via TERMIC_TRAFFIC_Y so the exact value can
             // be swept without a recompile (set it, relaunch the process, eyeball).
-            #[cfg(target_os = "macos")]
-            let traffic_y: f64 = std::env::var("TERMIC_TRAFFIC_Y")
-                .ok()
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .unwrap_or_else(|| if is_macos_tahoe() { 21.0 } else { 16.0 });
-
-            #[allow(unused_mut)]
-            let mut builder = tauri::WebviewWindowBuilder::new(
-                app.handle(), "main", tauri::WebviewUrl::default(),
-            )
-            .title("Termic")
-            .inner_size(1500.0, 1000.0)
-            .min_inner_size(900.0, 600.0)
-            .visible(false);
-
-            #[cfg(target_os = "macos")]
-            {
-                builder = builder
-                    .title_bar_style(tauri::TitleBarStyle::Overlay)
-                    .hidden_title(true)
-                    .traffic_light_position(tauri::LogicalPosition::new(16.0, traffic_y));
-            }
-
-            let win = builder.build()?;
-
-            // Restore saved bounds ourselves (the plugin skips "main" via
-            // skip_initial_state) so the ordering is deterministic. SIZE +
-            // POSITION + MAXIMIZED — but NOT VISIBLE (restore_state would
-            // `show()` the window immediately, defeating the
-            // position-before-show dance below and risking a flash on the
-            // wrong monitor) and NOT FULLSCREEN (would re-enter fullscreen on
-            // whatever Space it was saved on — the exact yank we avoid).
-            // MAXIMIZED is safe to restore: a zoomed window stays on the
-            // current Space, so there's no Space-yank, and a user who quit
-            // maximized expects to relaunch maximized.
-            {
-                use tauri_plugin_window_state::{StateFlags, WindowExt};
-                let _ = win.restore_state(
-                    StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED,
-                );
-            }
-
-            // A restored-maximized ("zoomed") window already fills one
-            // monitor: its inner_size never trips the minimum, and nudging it
-            // to the cursor's monitor would un-zoom it. So the clamp-up and
-            // cursor-monitor reposition below apply only to normally-sized
-            // windows. position_on_cursor_monitor itself no-ops when the
-            // restored position is already on the cursor's monitor, so it
-            // cooperates with this restore.
-            if !win.is_maximized().unwrap_or(false) {
-                // tauri-plugin-window-state restores prior bounds verbatim — it
-                // does NOT enforce minWidth / minHeight. If a previous session
-                // saved a sub-minimum size (seen after some updates and after
-                // first-launch races), the window comes back as a postage
-                // stamp. Clamp UP here before showing. Physical pixels via
-                // inner_size + scale_factor keeps the math correct on retina.
-                if let (Ok(sz), scale) = (win.inner_size(), win.scale_factor().unwrap_or(1.0)) {
-                    let logical_w = (sz.width  as f64) / scale;
-                    let logical_h = (sz.height as f64) / scale;
-                    const MIN_W: f64 = 900.0;
-                    const MIN_H: f64 = 600.0;
-                    if logical_w < MIN_W || logical_h < MIN_H {
-                        // Snap back to a comfortable default instead of the
-                        // bare min — a 900x600 box is still cramped for the
-                        // app's 3-column layout. 1400x900 matches our intended
-                        // launch size on fresh installs.
-                        let _ = win.set_size(tauri::LogicalSize::new(1400.0_f64, 900.0));
-                    }
-                }
-                let _ = position_on_cursor_monitor(&win);
-            }
+            let win = build_profile_window(app.handle(), &ProfileId::Root)?;
             // The menu-bar item exists from boot but stays hidden until we
             // windowless, so a normal windowed session gains nothing visible.
             if let Err(e) = build_tray(app.handle()) {
@@ -18716,55 +20048,19 @@ pub fn run() {
             // platforms keep Tauri's native close. `--headless` still
             // goes windowless everywhere, because there the user asked for no
             // window. See docs/ideas/windows.md.
-            #[cfg(target_os = "macos")]
-            {
-                let handle = app.handle().clone();
-                win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        // ALWAYS prevent first, then decide. Letting the close
-                        // through and going windowless afterwards would race the
-                        // window's own teardown, and "ask" needs the window
-                        // alive to show the prompt in it.
-                        api.prevent_close();
-                        // KNOWN EXCEPTION to "no sync IO on the event-loop
-                        // thread" (docs/ipc.md): load_settings_inner() reads +
-                        // parses settings.json here. Once per click of a button
-                        // a human pressed, on a file we just wrote, so it is
-                        // bounded and unmeasurable - but it IS the rule being
-                        // bent, and re-reading is what makes a Settings change
-                        // apply without a restart.
-                        match close_action_from(load_settings_inner().close_action.as_deref()) {
-                            CloseAction::MenuBar => enter_windowless(&handle),
-                            CloseAction::Quit => handle.exit(0),
-                            // The webview owns the prompt (CloseDialog, whose
-                            // dismissal cancels the close outright); it answers
-                            // via window_close_choice.
-                            CloseAction::Ask => {
-                                let _ = handle.emit("termic://close-requested", ());
-                                // The emit is fire-and-forget, so a webview that
-                                // never wired its listener (initWindowlessMode
-                                // rejected, or the click landed mid-boot) would
-                                // leave the red button a silent no-op with only
-                                // Cmd-Q left. The webview ACKs the request the
-                                // moment it receives it; no ack means no
-                                // listener, so fall back to the NON-destructive
-                                // outcome. Keyed on the ack rather than on a
-                                // choice, because a user who DISMISSES the
-                                // prompt is cancelling the close on purpose and
-                                // must not be overridden.
-                                CLOSE_PROMPT_ACKED.store(false, Ordering::SeqCst);
-                                let fb = handle.clone();
-                                thread::spawn(move || {
-                                    thread::sleep(CLOSE_PROMPT_ACK_GRACE);
-                                    if !CLOSE_PROMPT_ACKED.load(Ordering::SeqCst) {
-                                        dlog("[windowless] no close-prompt ack; going windowless");
-                                        enter_windowless(&fb);
-                                    }
-                                });
-                            }
-                        }
-                    }
-                });
+
+            // Reopen the profiles that were up at quit (GH #280). AFTER the
+            // root window's show/focus dance so the restore cannot race the
+            // position-before-show ordering, and skipped entirely when
+            // headless (the user asked for no window).
+            //
+            // NOT under `e2e`: the suite reuses ONE window across spec files
+            // and asserts on handle counts, so a restored second window would
+            // break every spec, not just the profiles one. Same class of
+            // accommodation as `focus_window_unless_e2e`.
+            #[cfg(not(feature = "e2e"))]
+            if !headless {
+                restore_open_profiles(app.handle());
             }
 
             // Dev-only automation bridge (no-op unless debug build AND
@@ -18815,6 +20111,7 @@ pub fn run() {
             agent_usage::agent_usage_codex,
             perf_boot_elapsed_ms,
             deep_link_take_pending,
+            profiles_list, profiles_disable, profile_create, profile_close, profile_update, profile_open, profile_delete_preview, profile_delete,
             projects_list, project_add, project_add_multi, project_set_members, project_update, project_remove, project_reorder, project_set_group,
             tasks_list, task_create, task_create_multi, task_open_repo, task_importable_worktrees, task_import_worktree, task_archive, task_set_cli, task_set_custom_command, task_set_resume_override, task_set_sandbox, task_set_docker, task_set_yolo,
             sandbox_available, sandbox_deny_counts, sandbox_recent_denied_hosts, sandbox_recent_denied_paths, sandbox_access_counts, sandbox_recent_access_hosts, sandbox_recent_access_paths, sandbox_set_monitor_filters, task_sandbox_add_allowed_host, task_sandbox_add_allowed_path, task_sandbox_remove_allowed_path, agent_sandbox_add_allowed_path, agent_sandbox_add_allowed_host, task_recent_denials,
@@ -18928,9 +20225,9 @@ fn cleanup_children(app: &tauri::AppHandle) {
             g.as_mut().map(|m| m.drain().map(|(_, v)| v).collect()).unwrap_or_default()
         };
         for state in sessions {
-            let projects = load_projects();
+            let projects = load_projects_all();
             // Find the project that owns this session by matching ws_id.
-            let tasks = load_tasks();
+            let tasks = load_tasks_all();
             if let Some(w) = tasks.iter().find(|w| w.id == state.ws_id) {
                 if let Some(p) = projects.iter().find(|p| p.id == w.project_id) {
                     let main = PathBuf::from(&p.root_path);
@@ -19186,6 +20483,549 @@ fn position_on_cursor_monitor(win: &tauri::WebviewWindow) -> Result<(), Box<dyn 
 
 #[cfg(test)]
 mod tests {
+
+    // ───────── profiles: the data layer (docs/plans/profiles.md) ─────────
+    //
+    // These pin the one invariant the whole design rests on: the profile
+    // rides the RECORD, so a by-id lookup works across profiles and a write
+    // goes back where the record came from. Break any of these and the
+    // failure mode is silent cross-profile data movement, not a crash.
+
+    use crate::profiles::{Profile, ProfileId, Registry};
+    use crate::test_support::with_scratch_data_dir;
+
+    fn two_profile_registry() -> Registry {
+        Registry {
+            profiles: vec![
+                Profile { slug: "work".into(), name: "Work".into(), accent: "#f00".into(), order: 0, last_focused_at: None, open_at_quit: false },
+                Profile { slug: "home".into(), name: "Home".into(), accent: "#0f0".into(), order: 1, last_focused_at: None, open_at_quit: false },
+            ],
+            // "work" owns the ROOT dir: the pre-profiles install that got
+            // named when the second profile was created.
+            root_slug: Some("work".into()),
+        }
+    }
+
+    fn a_task(id: &str, profile: ProfileId) -> crate::Task {
+        crate::Task {
+            id: id.into(),
+            project_id: "p1".into(),
+            name: id.into(),
+            branch: id.into(),
+            base_branch: "main".into(),
+            path: format!("/tmp/{id}"),
+            cli: "claude".into(),
+            port: 18100,
+            created: "2026-01-01T00:00:00Z".into(),
+            profile,
+            ..Default::default()
+        }
+    }
+
+    fn a_project(id: &str, profile: ProfileId) -> crate::Project {
+        crate::Project {
+            id: id.into(),
+            name: id.into(),
+            root_path: format!("/tmp/repo-{id}"),
+            profile,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_dormant_install_still_reads_and_writes_the_root_exactly_as_before() {
+        // The migration-free property, asserted rather than assumed: with no
+        // profiles.json, a task lands in `<data>/tasks/` and nowhere else.
+        with_scratch_data_dir(|data| {
+            crate::save_task(&a_task("t1", ProfileId::Root)).unwrap();
+            assert!(data.join("tasks/t1.json").exists());
+            assert!(!data.join("profiles").exists(), "a dormant install grew a profiles/ tree");
+            assert!(!data.join("profiles.json").exists());
+
+            let all = crate::load_tasks_all();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].id, "t1");
+            assert_eq!(all[0].profile, ProfileId::Root);
+        });
+    }
+
+    #[test]
+    fn the_profile_tag_is_never_written_to_disk() {
+        // `serde(skip)`, so an existing install's files stay byte-identical
+        // and there is no schema bump. If this regresses, every task record
+        // on every user's disk gains a field on next write.
+        with_scratch_data_dir(|data| {
+            crate::save_task(&a_task("t1", ProfileId::Root)).unwrap();
+            let raw = std::fs::read_to_string(data.join("tasks/t1.json")).unwrap();
+            assert!(!raw.contains("profile"), "the tag leaked into the record:\n{raw}");
+        });
+    }
+
+    #[test]
+    fn a_task_is_written_back_to_the_profile_it_came_from() {
+        // The mechanism itself. `save_task` consults `w.profile`, so a
+        // mutate-and-save round trip cannot move a task between profiles.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::save_task(&a_task("t1", ProfileId::Root)).unwrap();
+            crate::save_task(&a_task("t2", ProfileId::Slug("home".into()))).unwrap();
+
+            assert!(data.join("tasks/t1.json").exists());
+            assert!(data.join("profiles/home/tasks/t2.json").exists());
+            assert!(!data.join("tasks/t2.json").exists(), "t2 landed in the root profile");
+
+            // Load by id (no profile named anywhere), mutate, save.
+            let mut t = crate::load_tasks_all().into_iter().find(|t| t.id == "t2").unwrap();
+            assert_eq!(t.profile, ProfileId::Slug("home".into()));
+            t.name = "renamed".into();
+            crate::save_task(&t).unwrap();
+
+            assert!(!data.join("tasks/t2.json").exists(), "the save-back moved t2 into the root");
+            let back = crate::load_tasks_in(&ProfileId::Slug("home".into()));
+            assert_eq!(back.len(), 1);
+            assert_eq!(back[0].name, "renamed");
+        });
+    }
+
+    #[test]
+    fn load_all_sees_every_profile_and_load_in_sees_exactly_one() {
+        // The split that makes a leak something you have to type. `_all` is
+        // for by-id lookup and the port allocator; `_in` is for lists.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::save_task(&a_task("t1", ProfileId::Root)).unwrap();
+            crate::save_task(&a_task("t2", ProfileId::Slug("home".into()))).unwrap();
+
+            let mut all: Vec<String> = crate::load_tasks_all().into_iter().map(|t| t.id).collect();
+            all.sort();
+            assert_eq!(all, vec!["t1", "t2"]);
+
+            let root: Vec<String> = crate::load_tasks_in(&ProfileId::Root).into_iter().map(|t| t.id).collect();
+            assert_eq!(root, vec!["t1"]);
+            let home: Vec<String> =
+                crate::load_tasks_in(&ProfileId::Slug("home".into())).into_iter().map(|t| t.id).collect();
+            assert_eq!(home, vec!["t2"]);
+        });
+    }
+
+    #[test]
+    fn saving_a_mixed_project_list_does_not_move_anything_between_profiles() {
+        // The dangerous shape: a caller loads ALL projects, edits one, and
+        // saves the whole list. Writing that list to one profile would drag
+        // every other profile's projects into it.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::save_projects_in(&ProfileId::Root, &[a_project("p1", ProfileId::Root)]).unwrap();
+            crate::save_projects_in(
+                &ProfileId::Slug("home".into()),
+                &[a_project("p2", ProfileId::Slug("home".into()))],
+            )
+            .unwrap();
+
+            let mut all = crate::load_projects_all();
+            assert_eq!(all.len(), 2);
+            for p in all.iter_mut() {
+                if p.id == "p2" { p.name = "renamed".into(); }
+            }
+            crate::save_projects(&all).unwrap();
+
+            let root = crate::load_projects_in(&ProfileId::Root);
+            let home = crate::load_projects_in(&ProfileId::Slug("home".into()));
+            assert_eq!(root.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["p1"]);
+            assert_eq!(home.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["p2"]);
+            assert_eq!(home[0].name, "renamed");
+        });
+    }
+
+    #[test]
+    fn removing_the_last_project_of_a_profile_empties_only_that_profile() {
+        // The other half of the mixed-list hazard: a DELETE expressed as
+        // "save the list without it" must empty that one profile, not every
+        // profile whose projects are missing from the list.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::save_projects_in(&ProfileId::Root, &[a_project("p1", ProfileId::Root)]).unwrap();
+            crate::save_projects_in(
+                &ProfileId::Slug("home".into()),
+                &[a_project("p2", ProfileId::Slug("home".into()))],
+            )
+            .unwrap();
+
+            let kept: Vec<crate::Project> =
+                crate::load_projects_all().into_iter().filter(|p| p.id != "p2").collect();
+            crate::save_projects(&kept).unwrap();
+
+            assert_eq!(crate::load_projects_in(&ProfileId::Root).len(), 1);
+            assert!(crate::load_projects_in(&ProfileId::Slug("home".into())).is_empty());
+        });
+    }
+
+    #[test]
+    fn deleting_a_task_by_id_finds_it_in_whichever_profile_holds_it() {
+        // The caller has only an id. Sweeping is correct and an unlink of a
+        // path that does not exist is free.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::save_task(&a_task("t1", ProfileId::Root)).unwrap();
+            crate::save_task(&a_task("t2", ProfileId::Slug("home".into()))).unwrap();
+
+            crate::delete_task_file("t2").unwrap();
+            assert!(!data.join("profiles/home/tasks/t2.json").exists());
+            assert!(data.join("tasks/t1.json").exists(), "the sweep took an unrelated profile's task");
+        });
+    }
+
+    #[test]
+    fn settings_are_scoped_in_full_and_the_root_profile_keeps_its_own_file() {
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            let mut root = crate::load_settings_in(&ProfileId::Root);
+            root.default_tasks_path = "~/root-tasks".into();
+            crate::save_settings_in(&ProfileId::Root, &root).unwrap();
+
+            let mut home = crate::load_settings_in(&ProfileId::Slug("home".into()));
+            home.default_tasks_path = "~/home-tasks".into();
+            crate::save_settings_in(&ProfileId::Slug("home".into()), &home).unwrap();
+
+            assert!(data.join("settings.json").exists());
+            assert!(data.join("profiles/home/settings.json").exists());
+            assert_eq!(crate::load_settings_in(&ProfileId::Root).default_tasks_path, "~/root-tasks");
+            assert_eq!(
+                crate::load_settings_in(&ProfileId::Slug("home".into())).default_tasks_path,
+                "~/home-tasks"
+            );
+        });
+    }
+
+    #[test]
+    fn the_port_allocator_sees_across_profiles() {
+        // One process, one port space. A per-profile view would hand two
+        // profiles the same block, which is exactly the collision the process
+        // model rejects two OS processes for.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            let mut t1 = a_task("t1", ProfileId::Root);
+            t1.port = 18100;
+            crate::save_task(&t1).unwrap();
+            let mut t2 = a_task("t2", ProfileId::Slug("home".into()));
+            t2.port = 18106;
+            crate::save_task(&t2).unwrap();
+
+            let ports: std::collections::HashSet<u16> =
+                crate::load_tasks_all().iter().map(|t| t.port).collect();
+            assert!(ports.contains(&18100) && ports.contains(&18106),
+                "the allocator's view is missing a profile: {ports:?}");
+        });
+    }
+
+    #[test]
+    fn the_first_create_adopts_the_install_that_already_exists() {
+        // Creating the first new profile is the moment the current install
+        // becomes "a profile". Both entries land in one write, and the
+        // existing one owns the root dir so nothing has to move.
+        let mut reg = Registry::default();
+        let slug = crate::registry_add_profile(&mut reg, "Personal", "#0f0", Some("Work"), Some("#f00")).unwrap();
+        assert_eq!(slug, "personal");
+        assert_eq!(reg.profiles.len(), 2);
+        assert_eq!(reg.root_slug.as_deref(), Some("work"));
+        assert_eq!(reg.id_for("work"), ProfileId::Root);
+        assert_eq!(reg.id_for("personal"), ProfileId::Slug("personal".into()));
+    }
+
+    #[test]
+    fn the_first_create_refuses_without_a_name_for_the_existing_profile() {
+        // Otherwise the strip reads "Default" forever, which is the state the
+        // wizard exists to prevent.
+        let mut reg = Registry::default();
+        assert!(crate::registry_add_profile(&mut reg, "Personal", "#0f0", None, None).is_err());
+        assert!(crate::registry_add_profile(&mut reg, "Personal", "#0f0", Some("   "), None).is_err());
+        // And it left nothing half-written.
+        assert!(reg.profiles.is_empty());
+        assert!(reg.root_slug.is_none());
+    }
+
+    #[test]
+    fn a_later_create_needs_no_existing_name_and_dedupes_the_slug() {
+        let mut reg = Registry::default();
+        crate::registry_add_profile(&mut reg, "Work", "#f00", Some("Work"), None).unwrap();
+        // "Work" twice: the adopted root already took the slug.
+        assert_eq!(reg.profiles[0].slug, "work");
+        assert_eq!(reg.profiles[1].slug, "work-2");
+        let third = crate::registry_add_profile(&mut reg, "Work", "#00f", None, None).unwrap();
+        assert_eq!(third, "work-3");
+    }
+
+    #[test]
+    fn a_rename_never_touches_the_slug() {
+        // The slug keys BOTH trees and CWD-resume agents key sessions to the
+        // working directory, so a rename that relocated worktrees would
+        // orphan every conversation under them.
+        with_scratch_data_dir(|data| {
+            let mut reg = Registry::default();
+            crate::registry_add_profile(&mut reg, "Personal", "#0f0", Some("Work"), None).unwrap();
+            crate::profiles::save_registry(data, &reg).unwrap();
+
+            let mut reloaded = crate::profiles::load_registry(data);
+            let p = reloaded.profiles.iter_mut().find(|p| p.slug == "personal").unwrap();
+            p.name = "Side projects".into();
+            crate::profiles::save_registry(data, &reloaded).unwrap();
+
+            let after = crate::profiles::load_registry(data);
+            let p = after.get("personal").unwrap();
+            assert_eq!(p.slug, "personal", "the slug moved on a rename");
+            assert_eq!(p.name, "Side projects");
+        });
+    }
+
+    #[test]
+    fn a_new_profile_is_seeded_under_profiles_not_beside_tasks() {
+        // The `profiles/` level namespaces slugs: a profile called "tasks" or
+        // "workspaces" would otherwise land on the two directories under
+        // ~/<APP_DIR>/ that already mean something.
+        assert_eq!(
+            crate::builtin_profile_tasks_path("work"),
+            format!("~/{}/profiles/work/tasks", crate::APP_DIR)
+        );
+        assert_eq!(
+            crate::builtin_profile_tasks_path("tasks"),
+            format!("~/{}/profiles/tasks/tasks", crate::APP_DIR)
+        );
+    }
+
+    #[test]
+    fn a_task_keyed_topic_yields_its_task_id() {
+        // Routing parses the TOPIC rather than threading an id, which is what
+        // kept ~30 emit sites a one-word change. Every shape has to work.
+        use crate::task_id_in_topic;
+        assert_eq!(task_id_in_topic("pty://abc"), Some("abc"));
+        assert_eq!(task_id_in_topic("pty-exit://abc"), Some("abc"));
+        assert_eq!(task_id_in_topic("setup-done://abc"), Some("abc"));
+        assert_eq!(task_id_in_topic("grep-done://abc"), Some("abc"));
+        // script topics append `:<member>:<kind>` after the id.
+        assert_eq!(task_id_in_topic("script-output://abc:web:run"), Some("abc"));
+        assert_eq!(task_id_in_topic("script-done://abc::setup"), Some("abc"));
+        // Not task-keyed: these must fall through to a broadcast, not route
+        // to a window named by a fragment of the topic.
+        assert_eq!(task_id_in_topic("termic://windowless"), Some("windowless"));
+        assert_eq!(task_id_in_topic("no-scheme"), None);
+        assert_eq!(task_id_in_topic("pty://"), None);
+    }
+
+    #[test]
+    fn an_unresolvable_task_broadcasts_rather_than_reaching_nobody() {
+        // The failure mode matters: an event with no resolvable owner going
+        // everywhere is what predates profiles, and is far better than one
+        // that silently reaches no window at all.
+        with_scratch_data_dir(|_| {
+            crate::forget_task_window(None);
+            assert_eq!(crate::window_for_task("does-not-exist"), None);
+        });
+    }
+
+    #[test]
+    fn a_tasks_events_route_to_its_own_profiles_window() {
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::forget_task_window(None);
+            crate::save_task(&a_task("t1", ProfileId::Root)).unwrap();
+            crate::save_task(&a_task("t2", ProfileId::Slug("home".into()))).unwrap();
+
+            assert_eq!(crate::window_for_task("t1").as_deref(), Some("main"));
+            assert_eq!(crate::window_for_task("t2").as_deref(), Some("profile-home"));
+        });
+    }
+
+    #[test]
+    fn the_routing_cache_is_dropped_when_a_task_or_the_registry_changes() {
+        // A cached label outliving the window it names is the one way this
+        // memo can be wrong, so both invalidation paths are pinned.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::forget_task_window(None);
+            crate::save_task(&a_task("t2", ProfileId::Slug("home".into()))).unwrap();
+            assert_eq!(crate::window_for_task("t2").as_deref(), Some("profile-home"));
+
+            crate::delete_task_file("t2").unwrap();
+            assert_eq!(crate::window_for_task("t2"), None, "a deleted task kept its cached window");
+        });
+    }
+
+    #[test]
+    fn a_deep_link_naming_a_project_is_queued_for_that_projects_window() {
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::save_projects_in(&ProfileId::Root, &[a_project("p1", ProfileId::Root)]).unwrap();
+            let mut home = a_project("p2", ProfileId::Slug("home".into()));
+            home.name = "Side Project".into();
+            crate::save_projects_in(&ProfileId::Slug("home".into()), &[home]).unwrap();
+
+            // Resolution is by name (what a termic:// link carries), case
+            // insensitively, and `+`/%XX decoded.
+            let hits: Vec<String> = crate::load_projects_all()
+                .into_iter()
+                .filter(|p| p.name.eq_ignore_ascii_case("side project"))
+                .map(|p| p.profile.window_label())
+                .collect();
+            assert_eq!(hits, vec!["profile-home"]);
+        });
+    }
+
+    #[test]
+    fn a_project_name_in_a_link_is_decoded_before_it_is_matched() {
+        assert_eq!(crate::percent_decode_loose("Side%20Project"), "Side Project");
+        assert_eq!(crate::percent_decode_loose("caf%C3%A9"), "café");
+        // A stray percent is left alone rather than eating the next two chars.
+        assert_eq!(crate::percent_decode_loose("100%"), "100%");
+        assert_eq!(crate::percent_decode_loose("%zz"), "%zz");
+    }
+
+    #[test]
+    fn the_cli_profile_flag_matches_a_slug_or_a_display_name() {
+        // The user sees the NAME in the strip and the SLUG on disk, and should
+        // not have to know which one the flag wants.
+        with_scratch_data_dir(|data| {
+            let mut reg = Registry::default();
+            crate::registry_add_profile(&mut reg, "Side Project", "#0f0", Some("Work"), None).unwrap();
+            crate::profiles::save_registry(data, &reg).unwrap();
+
+            let f = crate::cli_server::resolve_requested_profile;
+            assert_eq!(f("Work").unwrap(), "main");
+            assert_eq!(f("work").unwrap(), "main");
+            assert_eq!(f("Side Project").unwrap(), "profile-side-project");
+            assert_eq!(f("side-project").unwrap(), "profile-side-project");
+            assert_eq!(f("SIDE-PROJECT").unwrap(), "profile-side-project");
+        });
+    }
+
+    #[test]
+    fn an_unknown_cli_profile_is_an_error_and_never_another_profile() {
+        // Falling back would act on the wrong profile's data. The server
+        // already refuses to guess for an unknown project; same rule.
+        with_scratch_data_dir(|data| {
+            let mut reg = Registry::default();
+            crate::registry_add_profile(&mut reg, "Personal", "#0f0", Some("Work"), None).unwrap();
+            crate::profiles::save_registry(data, &reg).unwrap();
+
+            let err = crate::cli_server::resolve_requested_profile("nope").unwrap_err();
+            assert!(err.contains("nope"), "{err}");
+            // And it names what IS available, so the user can fix it without
+            // going to find the list.
+            assert!(err.contains("Work") && err.contains("Personal"), "{err}");
+        });
+    }
+
+    #[test]
+    fn the_cli_profile_flag_on_an_install_with_no_profiles_says_so() {
+        with_scratch_data_dir(|_| {
+            let err = crate::cli_server::resolve_requested_profile("work").unwrap_err();
+            assert!(err.contains("no profiles"), "{err}");
+        });
+    }
+
+    #[test]
+    fn a_dormant_install_never_grows_a_registry_from_window_bookkeeping() {
+        // set_open_at_quit runs on every window build. If it created a
+        // registry, the feature would switch itself on for someone who never
+        // asked, and a strip would appear out of nowhere.
+        with_scratch_data_dir(|data| {
+            crate::set_open_at_quit(&ProfileId::Root, true);
+            assert!(!data.join("profiles.json").exists());
+            assert!(crate::profiles_registry().is_dormant());
+        });
+    }
+
+    #[test]
+    fn launch_restore_remembers_what_was_open_and_forgets_what_was_closed() {
+        with_scratch_data_dir(|data| {
+            let mut reg = Registry::default();
+            crate::registry_add_profile(&mut reg, "Personal", "#0f0", Some("Work"), None).unwrap();
+            crate::profiles::save_registry(data, &reg).unwrap();
+
+            crate::set_open_at_quit(&ProfileId::Root, true);
+            crate::set_open_at_quit(&ProfileId::Slug("personal".into()), true);
+            let after = crate::profiles_registry();
+            assert!(after.get("work").unwrap().open_at_quit);
+            assert!(after.get("personal").unwrap().open_at_quit);
+
+            // A deliberate close is remembered, so relaunch does not
+            // resurrect a window the user put away.
+            crate::set_open_at_quit(&ProfileId::Slug("personal".into()), false);
+            let after = crate::profiles_registry();
+            assert!(after.get("work").unwrap().open_at_quit);
+            assert!(!after.get("personal").unwrap().open_at_quit);
+        });
+    }
+
+    #[test]
+    fn a_projects_worktree_base_comes_from_its_own_profiles_settings() {
+        // The bug this pins was real and silent: task creation read the ROOT
+        // profile's `default_tasks_path`, so a second profile's seeded
+        // `~/termic/profiles/<slug>/tasks` was written to its settings and
+        // then never used. Every worktree landed in the root's tree.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+
+            let mut root_s = crate::load_settings_in(&ProfileId::Root);
+            root_s.default_tasks_path = "/tmp/root-tasks".into();
+            crate::save_settings_in(&ProfileId::Root, &root_s).unwrap();
+
+            let home = ProfileId::Slug("home".into());
+            let mut home_s = crate::load_settings_in(&home);
+            home_s.default_tasks_path = "/tmp/home-tasks".into();
+            crate::save_settings_in(&home, &home_s).unwrap();
+
+            // A project with no per-project override follows ITS profile.
+            let root_proj = a_project("p1", ProfileId::Root);
+            let home_proj = a_project("p2", home.clone());
+            assert!(
+                crate::project_tasks_root_default(&root_proj).starts_with("/tmp/root-tasks"),
+                "{:?}", crate::project_tasks_root_default(&root_proj),
+            );
+            assert!(
+                crate::project_tasks_root_default(&home_proj).starts_with("/tmp/home-tasks"),
+                "the second profile's worktrees would land in the root's tree: {:?}",
+                crate::project_tasks_root_default(&home_proj),
+            );
+        });
+    }
+
+    #[test]
+    fn a_profiles_settings_are_read_and_written_independently() {
+        // "Scoped in full" is the promise, so the whole object round-trips per
+        // profile rather than a chosen subset of fields.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            let home = ProfileId::Slug("home".into());
+
+            let mut root_s = crate::load_settings_in(&ProfileId::Root);
+            root_s.sandbox_default_rw_paths = vec!["/root/only".into()];
+            root_s.file_tree_exclude = vec!["root-only".into()];
+            crate::save_settings_in(&ProfileId::Root, &root_s).unwrap();
+
+            let mut home_s = crate::load_settings_in(&home);
+            home_s.sandbox_default_rw_paths = vec!["/home/only".into()];
+            home_s.file_tree_exclude = vec!["home-only".into()];
+            crate::save_settings_in(&home, &home_s).unwrap();
+
+            assert_eq!(crate::load_settings_in(&ProfileId::Root).file_tree_exclude, vec!["root-only"]);
+            assert_eq!(crate::load_settings_in(&home).file_tree_exclude, vec!["home-only"]);
+            assert_eq!(crate::load_settings_in(&ProfileId::Root).sandbox_default_rw_paths, vec!["/root/only"]);
+            assert_eq!(crate::load_settings_in(&home).sandbox_default_rw_paths, vec!["/home/only"]);
+        });
+    }
+
+    #[test]
+    fn a_window_label_picks_the_profile_and_an_unknown_window_falls_back_to_root() {
+        assert_eq!(ProfileId::from_window_label("main").unwrap(), ProfileId::Root);
+        assert_eq!(
+            ProfileId::from_window_label("profile-home").unwrap(),
+            ProfileId::Slug("home".into())
+        );
+        // `window_profile` unwraps_or_default, so a non-profile window (the
+        // Activity monitor) addresses the root, which is what it addressed
+        // before profiles existed.
+        assert_eq!(ProfileId::from_window_label("procmon").unwrap_or_default(), ProfileId::Root);
+    }
     use super::*;
     use std::fs;
     use tempfile::tempdir;
@@ -20610,7 +22450,7 @@ mod tests {
         fs::create_dir_all(base.join(rel).join(".git")).unwrap();
     }
     fn discovered_names(dir: &Path) -> std::collections::HashSet<String> {
-        discover_repos(dir.to_string_lossy().into_owned())
+        discover_repos_in(&ProfileId::Root, dir.to_string_lossy().into_owned())
             .unwrap()
             .into_iter()
             .map(|r| r.name)
@@ -20903,7 +22743,7 @@ mod tests {
         mkrepo(root.path(), "repo-a");
         mkrepo(root.path(), "repo-b");
         std::os::unix::fs::symlink(root.path(), root.path().join("all")).unwrap();
-        let repos = discover_repos(root.path().to_string_lossy().into_owned()).unwrap();
+        let repos = discover_repos_in(&ProfileId::Root, root.path().to_string_lossy().into_owned()).unwrap();
         let names: Vec<_> = repos.iter().map(|r| r.name.clone()).collect();
         assert_eq!(repos.len(), 2, "each repo should appear once, got {names:?}");
     }
@@ -21112,7 +22952,7 @@ mod tests {
     fn scratch_id_ok_refuses_path_segments() {
         assert!(scratch_id_ok("2f1c9b4e-0000-4aaa-bbbb-cccccccccccc"));
         assert!(scratch_id_ok("pad_1"));
-        // Every one of these would become a path segment under data_dir().
+        // Every one of these would become a path segment under global_dir().
         for bad in ["", "..", "a/b", "a\\b", "a.txt", "../../etc/passwd", "a b"] {
             assert!(!scratch_id_ok(bad), "{bad:?} must be refused");
         }

@@ -28,6 +28,7 @@ import { selectionToFields, type MemberMode, type ImportableWorktree, type Sandb
 import { projectForgeIssues } from "@/lib/ipc";
 import { buildIssuePrompt, issueBranch, issueTaskName } from "@/lib/issuePrompt";
 import { readMemberModes, persistMemberMode, seedMemberMode } from "@/components/dialogs/memberModes";
+import { scoped } from "@/lib/profileScope";
 
 const CLIS = ["claude", "codex", "agy", "grok", "opencode"] as const;
 
@@ -37,8 +38,8 @@ const CLIS = ["claude", "codex", "agy", "grok", "opencode"] as const;
 // globally (not per-project): the choice is about how the user works, not the
 // repo. Hard constraints still override at open time (non-git forces repo_root;
 // an unsupported OS forces sandbox off).
-const LS_LAST_MODE    = "newTaskLastMode";
-const LS_LAST_SANDBOX = "newTaskLastSandboxMode";
+const LS_LAST_MODE    = scoped("newTaskLastMode");
+const LS_LAST_SANDBOX = scoped("newTaskLastSandboxMode");
 function readLastMode(): "worktree" | "repo_root" | null {
   try { const v = localStorage.getItem(LS_LAST_MODE); return v === "worktree" || v === "repo_root" ? v : null; } catch { return null; }
 }
