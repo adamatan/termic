@@ -52,6 +52,42 @@ If the answer is no or "not yet", stop and let them drive it. If they say open i
 
 Agent-written PRs are welcome in this repo (see [CONTRIBUTING.md](CONTRIBUTING.md#agent-written-prs), and most of Termic is one). This is the one gate they have to pass, and it is the same gate a hand-written PR passes.
 
+### Building UI unattended: look at it before you call it done
+
+**Only when no human is going to test it.** If the maintainer is driving the
+change, their pass is the check and this is wasted time. But when you build a
+UI from scratch with nobody in the loop, shipping it unseen means nobody has
+ever looked at it, and green suites do not fill that hole.
+
+So: drive it with the e2e suite, `snap()` each state, and READ THE IMAGES BACK.
+Not the ad-hoc bridge (see ## What NOT to do) - a written spec, so the states
+you captured stay covered afterwards. Capturing them is usually a reason to
+drive the real dialogs rather than the store, which is better coverage anyway.
+
+This is not a formality. Building profiles, 18 passing e2e cases said the UI
+was fine and four things were wrong, three of them visible only to an eye:
+
+- avatar monograms read `PE` and `WO`, the first two letters of a one-word name
+- two pickers in one dialog shared a `data-testid`, so the spec drove the wrong
+  one, coloured the wrong profile, and passed
+- a path preview hardcoded `~/termic/...` while the dev app dir is
+  `termic_dev`, and stated it as fact
+- a radio group where the dot moved and the highlight did not, because
+  `transition-colors` never repaints a themed border-color in WKWebView
+
+Two rules for what happens after you spot something:
+
+**Measure, do not squint.** A screenshot tells you something is wrong, not
+what. Assert the computed value (`getComputedStyle().borderTopColor`, the
+rendered text, the node count) and let it name the defect. Half the time the
+answer is that the SPEC was wrong, which a screenshot alone would have blamed
+on the app.
+
+**Run the control before writing a causal claim.** "X causes Y" earns a comment
+in the code and a note in gotchas.md, and both outlive you. Remove X and
+confirm Y goes; put X back and confirm Y returns. Three plausible explanations
+were wrong before the real one, and each would have been written down as fact.
+
 ## Scratchpad
 
 `scratchpad/` at the repo root is gitignored and local-only. Put throwaway work there: market/competitor research, GTM notes, half-finished drafts, one-off analysis, anything that shouldn't ship or be reviewed. Nothing in it has to be release-quality. Working docs meant for contributors belong in the tracked `docs/` tree: `docs/ideas/` for anything not yet approved, `docs/plans/` for approved implementation-ready specs. See ## Docs tree.
