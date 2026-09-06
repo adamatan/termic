@@ -679,6 +679,44 @@ new dir gets symlinks back to the primary for settings, instructions, skills,
 commands and history, so a second account does not fork the user's setup. This
 is invisible: the user never learns a directory exists.
 
+### P1 has shipped, and how it survives agents changing under us
+
+`agent_dirs::login_store` is the table, with six measured shapes
+(`ConfigDir`, `SelfHostingDir`, `ParentDir`, `XdgRoot`, `HomeOnly`,
+`TokenVar`), plus `login_env` (what to set) and `login_config_dir` (where the
+agent will actually write, which differs from the store for the three shapes
+that append). `config_relocation_env` is DERIVED from it rather than kept as a
+second table.
+
+`SelfHostingDir` exists because grok forced a distinction that looked like one
+fact and is two: `GROK_HOME` does move grok's login (measured), but its binary
+and bundled skills live in that same tree, so the directory can never be a
+Docker mount target. An existing test caught the conflation the moment grok
+was typed as a plain `ConfigDir`.
+
+Three guards keep this honest as agents ship changes, which is the whole
+maintenance risk of a table describing other people's software:
+
+- **`every_builtin_agent_has_a_measured_login_store`** fails when a built-in
+  is added without a row, so adding an agent forces the measurement instead of
+  deferring it. `None` stays a legitimate answer: an agent whose boundary
+  nobody has measured must NOT get a switcher that silently shares one login.
+- **`docker_only_ever_sees_the_shape_it_can_actually_honour`** pins that only
+  `ConfigDir` reaches `config_relocation_env`. Docker sets that variable to
+  the container path it mounted, so a `ParentDir` would write one level below
+  the mount and an `XdgRoot` would redirect unrelated tools in the container.
+- **`make login-probe`** is the one that catches REAL drift. Unit tests only
+  prove the table is self-consistent; the probe points each variable at an
+  empty directory against the actual installed CLI and asserts it reports
+  itself signed out. Local only, never CI, same rule as `make lsp-smoke`,
+  because it needs the CLIs installed and logged in. It reads no credential:
+  it only observes whether the agent thinks it has one.
+  `the_probe_covers_every_agent_with_a_measured_login_store` fails when the
+  table gains an agent the probe does not check, so the two cannot drift apart.
+
+Run on 2026-09-06: seven agents probed, zero drift, copilot skipped (it has no
+read-only auth command; `COPILOT_HOME` is documented rather than measured).
+
 ### Order, and what each step is worth alone
 
 | | Step | Ships what |

@@ -148,6 +148,10 @@ lsp-smoke: ## Drive the REAL language servers on this machine against tiny fixtu
 	@node scripts/lsp-smoke.mjs
 .PHONY: lsp-smoke
 
+login-probe: ## Check each agent's login STILL follows the env var agent_dirs::login_store claims. Local only, never CI. `make login-probe AGENT=claude` for one. See docs/plans/agent-credentials.md.
+	@node scripts/login-probe.mjs $(AGENT)
+.PHONY: login-probe
+
 lsp-smoke-record: ## Same, plus refresh the recorded workspace/symbol answers the offline suite ranks.
 	@node scripts/lsp-smoke.mjs --record
 .PHONY: lsp-smoke-record

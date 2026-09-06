@@ -193,12 +193,144 @@ pub fn resolve_agent(agents: &[crate::Agent], id: &str) -> Option<crate::Agent> 
 /// Only agents that genuinely relocate everything are listed. grok has no clean
 /// relocation env (binary, skills and config all share `~/.grok`), and the
 /// others fold their HOME-root dotfiles into the same dir once relocated.
-pub fn config_relocation_env(base_id: &str) -> Option<&'static str> {
+/// How ONE agent's login can be pointed somewhere else (GH #278).
+///
+/// This is the account switcher's whole per-agent knowledge, and it is
+/// deliberately a table of FACTS rather than a per-agent abstraction: when an
+/// agent moves its credential, the fix is one row here, not a new impl.
+///
+/// Every variant exists because an agent measured that way; there is no
+/// speculative shape. See docs/plans/agent-credentials.md for the
+/// measurements, and `login_store` below for which agent is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginStore {
+    /// The variable IS the config dir. `CLAUDE_CONFIG_DIR=<store>`.
+    ConfigDir { env: &'static str },
+    /// The variable is a PARENT and the agent appends a fixed name to it.
+    /// `GEMINI_CLI_HOME=<store>` puts the config in `<store>/.gemini`.
+    /// Setting it to the config dir itself nests one level too deep.
+    ParentDir { env: &'static str, child: &'static str },
+    /// A generic XDG root the agent hangs its own directory off, and which
+    /// OTHER tools in the same environment also read. Broader than the agent,
+    /// which is a thing the UI has to admit rather than hide.
+    XdgRoot { env: &'static str, child: &'static str },
+    /// No dedicated variable at all: only a `HOME` override moves the login,
+    /// so the store has to be a home-shaped directory.
+    HomeOnly { child: &'static str },
+    /// The variable moves the LOGIN, but that directory also holds the agent's
+    /// own binary or bundled assets, so it can never be handed to Docker as a
+    /// mount target: mounting an empty dir over it shadows the binary and the
+    /// agent vanishes.
+    ///
+    /// grok is the whole reason this variant exists, and it is worth keeping
+    /// separate from `ConfigDir` rather than adding a flag: the two facts
+    /// ("the login follows this var" and "this dir is safe to relocate
+    /// wholesale") look like one and are not, and conflating them is how the
+    /// Docker mount would silently break.
+    SelfHostingDir { env: &'static str },
+    /// A token variable that takes precedence over whatever is stored, so no
+    /// directory is involved at all. The cheapest shape, and the only one
+    /// that is genuinely credentials-only.
+    TokenVar { env: &'static str },
+}
+
+/// Where this agent's LOGIN can be relocated to, or `None` when nobody has
+/// measured it.
+///
+/// `None` is honest, not a gap to fill with a guess: an agent whose boundary
+/// is unknown must not get an account switcher that silently shares one login
+/// between "accounts". `every_builtin_agent_has_a_measured_login_store` fails
+/// when a new built-in arrives without a row, so adding an agent forces the
+/// measurement rather than deferring it.
+pub fn login_store(base_id: &str) -> Option<LoginStore> {
+    use LoginStore::*;
     match base_id {
-        "claude" => Some("CLAUDE_CONFIG_DIR"),
-        "codex" => Some("CODEX_HOME"),
+        // Measured: relocating the var moves the whole config dir, dotfile
+        // included, and claude's Keychain service is keyed by a hash OF THAT
+        // PATH, which is what lets two accounts be live at once.
+        "claude" => Some(ConfigDir { env: "CLAUDE_CONFIG_DIR" }),
+        "codex" => Some(ConfigDir { env: "CODEX_HOME" }),
+        // COPILOT_HOME relocates the dir; COPILOT_GITHUB_TOKEN would skip the
+        // directory entirely. The dir is chosen for consistency with the other
+        // seven, and because it is the shape `copilot login` writes into.
+        "copilot" => Some(ConfigDir { env: "COPILOT_HOME" }),
+        // Measured: GEMINI_CLI_HOME=<tmp> created `<tmp>/.gemini/`. The var is
+        // a PARENT. Pointing it at the config dir would nest.
+        "agy" | "antigravity" => Some(ParentDir { env: "GEMINI_CLI_HOME", child: ".gemini" }),
+        // Measured: the login follows GROK_HOME. But the BINARY (`~/.grok/bin`)
+        // and bundled skills live in that same tree, so relocating the auth is
+        // NOT the same as moving the dir, and Docker must keep declining it.
+        "grok" => Some(SelfHostingDir { env: "GROK_HOME" }),
+        // Measured: only XDG_DATA_HOME moved it. Generic, shared with other
+        // tools in the same environment.
+        "opencode" => Some(XdgRoot { env: "XDG_DATA_HOME", child: "opencode" }),
+        // Measured: XDG_CONFIG_HOME moves the metadata index, which is enough
+        // to isolate. Whether the KEYCHAIN item behind it is keyed per dir is
+        // unresolved, so muse may be serial-switch only. See the plan.
+        "muse" => Some(XdgRoot { env: "XDG_CONFIG_HOME", child: "muse" }),
+        // Measured: no dedicated variable exists; a HOME override does isolate
+        // it (`ready` became `credentials_not_configured`).
+        "pi" => Some(HomeOnly { child: ".pi" }),
         _ => None,
     }
+}
+
+/// The variable that IS an agent's whole config dir, or `None`.
+///
+/// Derived from [`login_store`] rather than kept as a second table: two
+/// hand-maintained copies is exactly the drift this module exists to prevent.
+///
+/// Only `ConfigDir` qualifies, and that restriction is load-bearing rather
+/// than tidiness. Docker sets this variable to the container path it mounted,
+/// so handing it a `ParentDir` would make gemini write to `<mount>/.gemini`
+/// (one level below the mount, i.e. into the throwaway layer) and an
+/// `XdgRoot` would redirect unrelated tools in the container.
+pub fn config_relocation_env(base_id: &str) -> Option<&'static str> {
+    match login_store(base_id) {
+        Some(LoginStore::ConfigDir { env }) => Some(env),
+        _ => None,
+    }
+}
+
+/// The environment that points `base_id` at `store` for its login.
+///
+/// One place, so a caller never has to know which shape an agent is. Returns
+/// empty for an agent with no measured boundary, which means "this agent
+/// cannot hold a second account" and must be surfaced rather than silently
+/// producing a shared login.
+pub fn login_env(base_id: &str, store: &std::path::Path) -> Vec<(String, String)> {
+    let Some(shape) = login_store(base_id) else { return Vec::new() };
+    let p = store.to_string_lossy().into_owned();
+    match shape {
+        // The store IS the config dir, or the parent/root the agent hangs its
+        // own directory off. In every directory shape the caller passes the
+        // same store path and this decides what the agent is told.
+        LoginStore::ConfigDir { env } => vec![(env.into(), p)],
+        LoginStore::SelfHostingDir { env } => vec![(env.into(), p)],
+        LoginStore::ParentDir { env, .. } => vec![(env.into(), p)],
+        LoginStore::XdgRoot { env, .. } => vec![(env.into(), p)],
+        LoginStore::HomeOnly { .. } => vec![("HOME".into(), p)],
+        // No directory at all. The token is not known here: the caller reads
+        // it from the account's own store, so this only names the variable.
+        LoginStore::TokenVar { env } => vec![(env.into(), String::new())],
+    }
+}
+
+/// Where the agent will actually put its config, given a store path.
+///
+/// Differs from the store for the shapes that append: gemini's variable is a
+/// parent, opencode's and muse's are generic roots. Callers that need to look
+/// AT the login (to report an identity, or to symlink shared settings back)
+/// need this, not the store path.
+pub fn login_config_dir(base_id: &str, store: &std::path::Path) -> Option<std::path::PathBuf> {
+    Some(match login_store(base_id)? {
+        LoginStore::ConfigDir { .. } => store.to_path_buf(),
+        LoginStore::SelfHostingDir { .. } => store.to_path_buf(),
+        LoginStore::ParentDir { child, .. } => store.join(child),
+        LoginStore::XdgRoot { child, .. } => store.join(child),
+        LoginStore::HomeOnly { child } => store.join(child),
+        LoginStore::TokenVar { .. } => return None,
+    })
 }
 
 pub fn state_dirs(agent_id: &str) -> &'static [&'static str] {
@@ -263,44 +395,165 @@ mod instance_dir_tests {
     // of them are expressible through this module, so these pin the gap rather
     // than the wish.
 
+    /// Every agent termic ships. Kept as one list so the guards below cannot
+    /// silently stop covering an agent someone added.
+    const BUILT_INS: &[&str] = &["claude", "codex", "copilot", "agy", "grok", "opencode", "pi", "muse"];
+
     #[test]
-    fn only_two_agents_have_a_relocation_var_today() {
-        // The switcher needs one per agent. Six of the eight built-ins return
-        // None here, so on the host they currently have no login isolation at
-        // all, whatever their CLI supports.
-        let have: Vec<&str> = ["claude", "codex", "copilot", "agy", "grok", "opencode", "pi", "muse"]
-            .into_iter()
-            .filter(|a| config_relocation_env(a).is_some())
+    fn every_builtin_agent_has_a_measured_login_store() {
+        // THE MAINTENANCE GUARD. Adding an agent without measuring where its
+        // login lives would give it an account switcher that silently shares
+        // one login between "accounts", which is worse than not offering one.
+        // This fails the moment a built-in appears without a row.
+        let missing: Vec<&str> = BUILT_INS.iter().copied()
+            .filter(|a| login_store(a).is_none())
             .collect();
-        assert_eq!(have, vec!["claude", "codex"]);
+        assert!(
+            missing.is_empty(),
+            "no measured login store for: {missing:?}. Point the agent's candidate variable at an \
+             empty dir and see whether it loses its login (docs/plans/agent-credentials.md), then \
+             add a row to `login_store`. Do NOT guess: an unmeasured agent must stay None.",
+        );
     }
 
     #[test]
-    fn the_measured_boundaries_do_not_fit_this_tables_shape() {
-        // `config_relocation_env` returns a bare var name, which can only ever
-        // mean "this var IS the config dir". Three of the measured boundaries
-        // mean something else, so adding them here as plain names would be
-        // WRONG rather than merely incomplete:
+    fn docker_only_ever_sees_the_shape_it_can_actually_honour() {
+        // Docker sets this variable to the CONTAINER PATH it mounted, so only
+        // "the variable is the config dir" is safe. A ParentDir would make the
+        // agent write one level below the mount (into the throwaway layer) and
+        // an XdgRoot would redirect unrelated tools inside the container.
         //
-        //   gemini / agy   GEMINI_CLI_HOME is a PARENT; the agent appends
-        //                  `.gemini`, so setting it to the store path puts the
-        //                  config one level deeper than the caller expects.
-        //   opencode       XDG_DATA_HOME is a generic root other tools read,
-        //                  and opencode's own dir hangs off it.
-        //   muse           XDG_CONFIG_HOME moves the metadata INDEX; the
-        //                  secret is in the OS keychain, so relocating the var
-        //                  does not by itself give a second live account.
-        //
-        // Documented as a test so the next person to "just add gemini" here
-        // fails instead of shipping a subtly wrong path.
-        for agent in ["agy", "opencode", "muse", "pi", "grok", "copilot"] {
-            assert!(
-                config_relocation_env(agent).is_none(),
-                "{agent} was added to config_relocation_env as a plain var name. \
-                 Its boundary is not a config dir (see docs/plans/agent-credentials.md); \
-                 the table has to carry the SHAPE before this agent can be listed.",
+        // This is the guard that replaced an earlier one asserting those
+        // agents were absent from the table entirely. They are present now,
+        // with shapes; what must stay true is which shapes reach Docker.
+        for a in BUILT_INS {
+            let via_shape = matches!(login_store(a), Some(LoginStore::ConfigDir { .. }));
+            assert_eq!(
+                config_relocation_env(a).is_some(), via_shape,
+                "{a}: config_relocation_env must be exactly the ConfigDir agents",
             );
         }
+        assert_eq!(config_relocation_env("claude"), Some("CLAUDE_CONFIG_DIR"));
+        assert_eq!(config_relocation_env("codex"), Some("CODEX_HOME"));
+        assert_eq!(config_relocation_env("copilot"), Some("COPILOT_HOME"));
+        // The three that would be WRONG as a plain variable name.
+        assert_eq!(config_relocation_env("agy"), None, "GEMINI_CLI_HOME is a parent, not a config dir");
+        assert_eq!(config_relocation_env("grok"), None,
+            "GROK_HOME moves grok's login, but its binary lives in that tree: mounting over it in \
+             Docker shadows the binary and the agent vanishes");
+        assert_eq!(config_relocation_env("opencode"), None, "XDG_DATA_HOME is a generic root");
+        assert_eq!(config_relocation_env("muse"), None, "XDG_CONFIG_HOME is a generic root");
+        assert_eq!(config_relocation_env("pi"), None, "pi has no dedicated variable at all");
+    }
+
+    #[test]
+    fn each_shape_points_the_agent_at_the_store_the_way_that_agent_expects() {
+        let store = Path::new("/data/logins/claude/work");
+        assert_eq!(login_env("claude", store), vec![("CLAUDE_CONFIG_DIR".to_string(), "/data/logins/claude/work".to_string())]);
+        assert_eq!(login_env("codex", store), vec![("CODEX_HOME".to_string(), "/data/logins/claude/work".to_string())]);
+        assert_eq!(login_env("copilot", store), vec![("COPILOT_HOME".to_string(), "/data/logins/claude/work".to_string())]);
+        // Relocatable for a LOGIN even though Docker cannot mount it.
+        assert_eq!(login_env("grok", store), vec![("GROK_HOME".to_string(), "/data/logins/claude/work".to_string())]);
+        // The parent shape still gets the STORE, not the config dir: the agent
+        // is the one that appends. Passing `<store>/.gemini` here would nest.
+        assert_eq!(login_env("agy", store), vec![("GEMINI_CLI_HOME".to_string(), "/data/logins/claude/work".to_string())]);
+        assert_eq!(login_env("opencode", store), vec![("XDG_DATA_HOME".to_string(), "/data/logins/claude/work".to_string())]);
+        assert_eq!(login_env("muse", store), vec![("XDG_CONFIG_HOME".to_string(), "/data/logins/claude/work".to_string())]);
+        assert_eq!(login_env("pi", store), vec![("HOME".to_string(), "/data/logins/claude/work".to_string())]);
+        // An unmeasured agent gets NOTHING, which is the caller's signal that
+        // it cannot hold a second account.
+        assert!(login_env("some-unmapped-cli", store).is_empty());
+    }
+
+    #[test]
+    fn the_config_dir_is_where_the_agent_puts_it_not_where_we_pointed_it() {
+        // The gemini trap, made explicit: reporting an identity or symlinking
+        // shared settings has to look at the dir the agent WRITES, which for
+        // three of the shapes is a level below the store.
+        let store = Path::new("/s");
+        assert_eq!(login_config_dir("claude", store).unwrap(), Path::new("/s"));
+        assert_eq!(login_config_dir("agy", store).unwrap(), Path::new("/s/.gemini"));
+        assert_eq!(login_config_dir("opencode", store).unwrap(), Path::new("/s/opencode"));
+        assert_eq!(login_config_dir("muse", store).unwrap(), Path::new("/s/muse"));
+        assert_eq!(login_config_dir("pi", store).unwrap(), Path::new("/s/.pi"));
+        assert_eq!(login_config_dir("some-unmapped-cli", store), None);
+    }
+
+    #[test]
+    fn the_agents_whose_variable_is_broader_than_themselves_are_known() {
+        // XdgRoot redirects a variable other tools in the same environment
+        // read, so the UI has to say so rather than present it as agent-local.
+        // Listed here so adding one is a deliberate act with a UI consequence.
+        let broad: Vec<&str> = BUILT_INS.iter().copied()
+            .filter(|a| matches!(login_store(a), Some(LoginStore::XdgRoot { .. })))
+            .collect();
+        assert_eq!(broad, vec!["opencode", "muse"]);
+
+        // HomeOnly is broader still: the store has to be a home-shaped dir.
+        let home_only: Vec<&str> = BUILT_INS.iter().copied()
+            .filter(|a| matches!(login_store(a), Some(LoginStore::HomeOnly { .. })))
+            .collect();
+        assert_eq!(home_only, vec!["pi"]);
+    }
+
+    #[test]
+    fn grok_relocates_its_login_but_is_never_a_docker_mount() {
+        // Two facts that look like one. The measurement says GROK_HOME moves
+        // the login; the binary living in the same tree says the directory
+        // cannot be mounted over. Conflating them is how the Docker mount
+        // silently breaks, so they are separate variants and both are pinned.
+        assert!(matches!(login_store("grok"), Some(LoginStore::SelfHostingDir { env: "GROK_HOME" })));
+        assert!(!login_env("grok", Path::new("/s")).is_empty(), "grok CAN hold a second account");
+        assert_eq!(config_relocation_env("grok"), None, "and Docker must still decline it");
+        assert!(!crate::docker::persist_offerable("grok"),
+            "docker's own refusal has to agree with this table");
+    }
+
+    #[test]
+    fn the_probe_covers_every_agent_with_a_measured_login_store() {
+        // `login_store` is a table of MEASUREMENTS of other people's software,
+        // so it goes stale silently when an agent ships a change: the switcher
+        // keeps "working", every test here keeps passing, and two accounts
+        // quietly share one credential. `make login-probe` is what catches
+        // that, by pointing each variable at an empty dir against the REAL
+        // CLI, and it can only catch it for agents it knows about.
+        //
+        // So this fails when an agent gains a store and the probe is not
+        // taught to check it. Cross-file guard, same idea as cspGuard.test.ts.
+        let probe = include_str!("../../scripts/login-probe.mjs");
+        // The probe keys on the BINARY name; the table keys on the agent id,
+        // and the Gemini-family agents run `gemini`.
+        fn binary_for(id: &str) -> &str { match id {
+            "agy" | "antigravity" => "gemini",
+            other => other,
+        } }
+        let missing: Vec<&str> = BUILT_INS.iter().copied()
+            .filter(|id| login_store(id).is_some())
+            .filter(|id| !probe.contains(&format!("id: \"{}\"", binary_for(id))))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "scripts/login-probe.mjs does not check: {missing:?}. An agent with a measured login \
+             store but no probe row is one whose table entry can rot unnoticed. Add a row with the \
+             variable and a read-only command that reveals whether it is signed in.",
+        );
+
+        // And the reverse: a probe row for an agent the table does not know is
+        // checking something nothing uses.
+        for id in BUILT_INS.iter().filter(|i| login_store(i).is_some()) {
+            let bin = binary_for(id);
+            assert!(probe.contains(&format!("id: \"{bin}\"")), "{bin} vanished from the probe");
+        }
+    }
+
+    #[test]
+    fn a_clone_resolves_its_base_agents_shape() {
+        // A clone of claude runs the claude binary and keeps claude's layout,
+        // which is what `extends` is for. The switcher must not treat a clone
+        // as an unmeasured agent.
+        assert_eq!(login_store("claude"), login_store("claude"));
+        assert!(login_store("next-claude").is_none(),
+            "a clone id is not a base id; callers resolve it through docker::base_agent_id first");
     }
 
     #[test]
