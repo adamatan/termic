@@ -20,9 +20,18 @@ pub(crate) static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// rather than re-deriving the path.
 pub(crate) fn with_scratch_data_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
     let dir = tempfile::tempdir().unwrap();
-    let prev = std::env::var("TERMIC_DATA_DIR").ok();
+    // LOCK FIRST, then read what we are replacing.
+    //
+    // Reading `prev` before taking the lock meant capturing whatever ANOTHER
+    // test had set while it held it. On exit this restored that value: a
+    // scratch directory belonging to a test that had already finished and
+    // deleted it. Every later test then resolved into a path that no longer
+    // existed, which is why the suite failed roughly one run in four, in a
+    // different test each time and never in isolation.
+    //
     // SAFETY: every test that touches this var takes DATA_DIR_LOCK above.
     let _g = DATA_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("TERMIC_DATA_DIR").ok();
     unsafe { std::env::set_var("TERMIC_DATA_DIR", dir.path()) };
     let out = f(dir.path());
     match prev {
