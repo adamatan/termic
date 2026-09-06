@@ -1,6 +1,11 @@
 {
   "versions": [
     {
+      "version": "1.3.0",
+      "date": "2026-09-06",
+      "summary": "Profiles, and several logins per agent with a switcher that moves a running task."
+    },
+    {
       "version": "1.2.3",
       "date": "2026-09-04",
       "summary": "Muse Code, Codex self-reporting, and plan usage in the task footer."

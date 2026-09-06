@@ -4,6 +4,51 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
+## [1.3.0] - 2026-09-06
+
+Profiles, and several logins per agent with a switcher that moves a running task.
+
+### Features
+- **Profiles.** A fully separate instance of Termic with its own window,
+  projects, tasks and settings, so work and personal can be open on two
+  monitors at once and neither can see the other's work. Each one carries an
+  accent colour (or none) and its name in the title bar, and the profiles you
+  had open when you quit are the ones that come back. Turning profiles off
+  keeps every byte: the app returns to one window and nothing is deleted.
+  Settings, Profiles. ([#280](https://github.com/simion/termic/issues/280))
+- **Several logins per agent.** Add a second Claude or Codex account, choose
+  which one a task runs as, and switch a task that is mid-conversation without
+  losing it: the switch restarts the agent, and the conversation resumes on the
+  other account. Termic never sees a credential. It creates an empty directory
+  and runs the agent's own login in it, and everything that is not the
+  credential (your settings, skills, commands, prompts and history) is shared
+  back to your main config by symlink, so a second account is a second login
+  and not a second setup. Works sandboxed and in Docker. Settings, Agents.
+  ([#278](https://github.com/simion/termic/issues/278))
+- **Switch accounts by yourself, at the limit.** Off by default, one checkbox
+  per agent in the usage popover. When the account in use passes 95% of a
+  rolling window, Termic moves the task to an account that has room, restarts
+  it and sends "continue", so a task that hits a wall at 3am is still working
+  at 4am. It only ever moves to an account it has seen headroom on, and it
+  says what it did.
+- **What an agent has cost you.** The usage popover now carries the dollars
+  spent on the current account since Termic launched, from Claude's own
+  reporting. An account with no subscription, where percentages mean nothing,
+  shows the figure on the footer chip itself.
+- **Add several repositories in one sweep.** The project picker scans for
+  checkouts and lets you tick the ones you want, instead of one dialog per
+  repository.
+- **The running version is in Settings**, bottom left of the rail. Click it
+  for the release notes.
+
+### Bug fixes
+- The plan usage chip no longer sits blank with nothing to explain it. Termic
+  reads Claude's usage off the status line it installs, so a project or a
+  status line of your own that already owns that slot silently took the feed
+  away. The chip now names what is holding the slot and where, and offers a
+  prompt you can hand to the agent that owns the script.
+  ([#277](https://github.com/simion/termic/issues/277))
+
 ## [1.2.3] - 2026-09-04
 
 Muse Code, Codex self-reporting, and plan usage in the task footer.
