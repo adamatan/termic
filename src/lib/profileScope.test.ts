@@ -85,27 +85,6 @@ describe("profileScope", () => {
   });
 });
 
-describe("monogram", () => {
-  it("uses ONE letter for a one-word name, not the first two", async () => {
-    // "PE" and "WO" read like ticker symbols. Every browser's profile
-    // switcher uses a single initial, and the screenshot is what caught it.
-    const { monogram } = await import("@/components/sidebar/ProfileStrip");
-    expect(monogram("Personal")).toBe("P");
-    expect(monogram("Work")).toBe("W");
-  });
-
-  it("uses one letter per word for a multi-word name, capped at two", async () => {
-    const { monogram } = await import("@/components/sidebar/ProfileStrip");
-    expect(monogram("Side Project")).toBe("SP");
-    expect(monogram("a b c")).toBe("AB");
-  });
-
-  it("never renders empty", async () => {
-    const { monogram } = await import("@/components/sidebar/ProfileStrip");
-    expect(monogram("   ")).toBe("?");
-    expect(monogram("")).toBe("?");
-  });
-});
 
 describe("profile accents", () => {
   it("resolves a palette key to its theme token", async () => {
@@ -137,5 +116,71 @@ describe("profile accents", () => {
     expect(isHexAccent("#abc")).toBe(true);
     expect(isHexAccent("blue")).toBe(false);
     expect(isHexAccent("#abcd")).toBe(false);
+  });
+});
+
+describe("currentSetupSummary", () => {
+  it("names both counts, so the panel is unmistakably YOUR setup", async () => {
+    const { currentSetupSummary } = await import("@/lib/profileScope");
+    expect(currentSetupSummary(4, 12)).toBe("Its 4 projects and 12 tasks stay exactly where they are.");
+  });
+
+  it("does not say '1 projects'", async () => {
+    const { currentSetupSummary } = await import("@/lib/profileScope");
+    expect(currentSetupSummary(1, 1)).toBe("Its 1 project and 1 task stay exactly where they are.");
+  });
+
+  it("drops the half that is zero rather than counting nothing", async () => {
+    // "3 projects and 0 tasks" reads as a warning about the zero.
+    const { currentSetupSummary } = await import("@/lib/profileScope");
+    expect(currentSetupSummary(3, 0)).toBe("Its 3 projects stay exactly where they are.");
+    expect(currentSetupSummary(0, 2)).toBe("Its 2 tasks stay exactly where they are.");
+  });
+
+  it("says something else entirely on a fresh install", async () => {
+    // Counting nothing reads as a bug, and there is nothing to reassure
+    // someone about when they have not made anything yet.
+    const { currentSetupSummary } = await import("@/lib/profileScope");
+    expect(currentSetupSummary(0, 0)).toBe("Everything you set up from now on stays in it.");
+  });
+});
+
+describe("shouldCloseProfileWindow", () => {
+  it("closes the window when it is empty and another is open", async () => {
+    const { shouldCloseProfileWindow } = await import("@/lib/profileScope");
+    expect(shouldCloseProfileWindow({ hasActiveTask: false, openWindows: 2 })).toBe(true);
+  });
+
+  it("never closes the LAST window", async () => {
+    // That is a quit, not a window close, and it belongs to the close-action
+    // setting and to Cmd+Q. Escalating a tab-close key into a quit is how
+    // someone loses the agents they had running.
+    const { shouldCloseProfileWindow } = await import("@/lib/profileScope");
+    expect(shouldCloseProfileWindow({ hasActiveTask: false, openWindows: 1 })).toBe(false);
+    expect(shouldCloseProfileWindow({ hasActiveTask: false, openWindows: 0 })).toBe(false);
+  });
+
+  it("leaves the shortcut to the task while one is open", async () => {
+    // Cmd+W closes the innermost thing. With a task on screen that is a tab,
+    // and taking the window instead would close work the user can see.
+    const { shouldCloseProfileWindow } = await import("@/lib/profileScope");
+    expect(shouldCloseProfileWindow({ hasActiveTask: true, openWindows: 3 })).toBe(false);
+  });
+});
+
+describe("slugWorthShowing", () => {
+  it("hides a slug that is just the name lowercased", async () => {
+    // "Personal" above "personal" reads as a bug, not as information.
+    const { slugWorthShowing } = await import("@/lib/profileScope");
+    expect(slugWorthShowing("Personal", "personal")).toBe(false);
+    expect(slugWorthShowing("  Work  ", "work")).toBe(false);
+  });
+
+  it("shows one the user could not have guessed", async () => {
+    // These are the cases the slug exists for: it names the folder on disk.
+    const { slugWorthShowing } = await import("@/lib/profileScope");
+    expect(slugWorthShowing("Side Project", "side-project")).toBe(true);
+    expect(slugWorthShowing("Work", "work-2")).toBe(true);
+    expect(slugWorthShowing("Ünïcode", "unicode")).toBe(true);
   });
 });

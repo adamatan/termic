@@ -92,7 +92,11 @@ export function Settings() {
           active={tab === "prompts"} onClick={() => openSettings("prompts")} />
         <RailItem icon={<Keyboard className="h-4 w-4" />} label="Shortcuts" tabId="shortcuts"
           active={tab === "shortcuts"} onClick={() => openSettings("shortcuts")} />
-        <RailItem icon={<UsersRound className="h-4 w-4" />} label="Profiles" tabId="profiles"
+        {/* Experimental in the sense docs/ui.md defines: off by default because
+            we are not yet confident in it, with a stated way out (Profiles
+            can be turned off, keeping every byte of data). Both halves of
+            this release qualify, and both are dormant until you opt in. */}
+        <RailItem icon={<UsersRound className="h-4 w-4" />} label="Profiles" badge="Exp" tabId="profiles"
           active={tab === "profiles"} onClick={() => openSettings("profiles")} />
 
         <RailDivider />

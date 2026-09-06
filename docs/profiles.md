@@ -60,14 +60,14 @@ because a task's profile is its project's.
 unlinked again when the last one goes. Its ABSENCE is the "this feature does not
 exist yet" state, not a missing file to heal:
 
-- No strip in the sidebar, no name, no color. The footer's profile button is the
+- No chip in the title bar, no name, no color. The footer's profile button is the
   whole surface, and it opens Settings to Profiles.
 - Every path resolves exactly as it did before profiles existed.
 - `localStorage` keys are unprefixed (see below).
 
 Creating the FIRST profile also adopts the install that already exists, in the
 same write: that is the moment the current setup becomes "a profile" and it
-needs a name then, or the strip reads "Default" forever. Both entries land
+needs a name then, or the chip reads "Default" forever. Both entries land
 together, so the registry is never seen naming one of two profiles.
 
 ## Data layout
@@ -120,6 +120,29 @@ token, while a worktree under `~/termic` must stay readable by the agent.
 Nesting the denied dir inside the worktrees tree would put an allow and a deny
 in one subtree.
 
+## Where the profile shows
+
+In the TITLE BAR, as a chip: accent tile, name in clear, and every profile
+action behind it (switch, new, manage). It began in the sidebar footer and
+moved up for three reasons that point the same way:
+
+- the bar already carries the profile's accent as a wash from the left edge
+  (`profileWashCss`), so the name sits INSIDE its own colour rather than being
+  a second, disconnected use of it;
+- the top-left is where the eye lands on a window, which is the entire job of a
+  control that answers "which profile is this";
+- it is present in every window whatever else is open, and the sidebar can be
+  collapsed away.
+
+The prior art is JetBrains, which puts the project name in this position over
+this tint. The wash is deliberately weak and gone by the first third: the bar
+carries the breadcrumb and the toolbar, and a solid accent behind them fights
+every glyph on it.
+
+The theme picker moved the other way, down to the sidebar footer, to make room.
+It is a set-once preference and belongs with the other set-once affordances
+rather than on the bar you drive agents from.
+
 ## Windows
 
 One window per profile, 1:1, and switching IS opening a window. `profile_open`
@@ -129,6 +152,21 @@ that is one action, which is why the popover does not distinguish them.
 `build_profile_window` is the single builder for every profile, extracted from
 `setup` so the root window and a second profile's window cannot drift: same size
 clamp, same cursor-monitor placement, same restore, same close behaviour.
+
+**Every profile window needs a Tauri capability, and the label is how it gets
+one.** Capabilities are scoped by window LABEL, and a window matching no entry
+gets NO permissions at all, `core:event` included. A profile window then cannot
+listen for events, so every PTY spawn in it fails with `event.listen not
+allowed on window "profile-work"` and the window is inert.
+
+`capabilities/default.json` therefore lists `profile-*` alongside `main`. This
+shipped broken and is the sharpest example of why the root label matters: the
+root profile keeps `main`, so the FIRST window worked and only the second one
+was dead, which is the half nobody exercises until a real profile exists.
+Nothing in the type system connects `window_label()` to a JSON file, so
+`every_profile_window_is_covered_by_a_tauri_capability` (profiles.rs) is the
+connection, derived from the real label builder and mutation-checked against
+the file as it shipped.
 
 **The root profile keeps the literal `main` label.** `tauri-plugin-window-state`
 keys saved frames by label, so a pre-profiles install must find its geometry
@@ -213,6 +251,20 @@ recreated profile with the same slug inherits a dead one's state.
 
 ## Deleting, and backing out
 
+**An open window is not a precondition.** Deleting closes it. It used to
+refuse ("close the profile's window before deleting it"), which was a chore
+invented for the user: they had just confirmed a dialog stating exactly what
+would be removed, and the window they were sent to find might be on another
+Space or another monitor. Worse, the banner saying so did not re-check, so
+closing the window left the dialog still insisting it was open.
+
+The dialog warns instead: the window closes and anything running in it stops.
+
+What IS still refused is deleting the profile whose window is making the
+request, and that is not a chore but an impossibility: it pulls the data dir
+out from under the dialog that asked. Same rule `profile_close` already has.
+
+
 These are two different operations and conflating them is a trap:
 
 **`profile_delete`** is destructive and is REFUSED while the profile's window is
@@ -245,7 +297,7 @@ information the user would otherwise have to open the profile to find.
 ## The CLI
 
 `--profile <name>` is global on every verb, matching a slug OR a display name
-case-insensitively: the user sees the name in the strip and the slug on disk and
+case-insensitively: the user sees the name in the title bar and the slug on disk and
 should not have to know which one the flag wants.
 
 An unknown name is a `BadRequest` naming the profiles that do exist, **never a
@@ -301,6 +353,32 @@ knowing before changing them:
   checkout, leaves no dangling registration in the parent repo, and writes its
   backup first. Both that and the deep-link resolver were mutation-checked,
   not trusted: breaking each one fails its test.
+
+## Linux
+
+`profiles.rs` contains no platform-specific code at all. Directories, slugs and
+the registry are the whole model, and Tauri's multi-window API is
+cross-platform, so nothing about profiles is macOS-shaped. The verification was
+an audit of every `#[cfg]` in the paths profiles touch plus a real test run.
+
+What IS macOS-only, and correctly gated:
+
+- The Dock icon and `ActivationPolicy::Accessory` behind windowless mode. Linux
+  has no Dock, so the setting reduces to hiding and restoring windows.
+- Cursor-monitor placement and the window frame clamp, which use the same
+  Tauri APIs on both platforms.
+
+One Linux bug came out of the audit and is fixed: **the window close handler
+was entirely inside `#[cfg(target_os = "macos")]`**, so on Linux
+`Profile::open_at_quit` was never CLEARED when the user closed a window. Launch
+restore would then reopen a profile the user had deliberately closed, and keep
+doing it. A non-macOS handler now clears the flag; the macOS one additionally
+does the activation-policy work that has no Linux equivalent.
+
+`cargo test --workspace --lib` runs green on ubuntu 24.04, profile tests
+included. See [agent-accounts.md](agent-accounts.md#linux) for the two
+container-environment failures that are not Linux failures, and for the Linux
+side of agent logins.
 
 ## Known gaps
 

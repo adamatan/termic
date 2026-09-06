@@ -1,6 +1,7 @@
 // Left sidebar: traffic-light spacer, toggle, primary nav, projects tree, footer.
 // Two layout flavors: full (220px) vs compact (56px, icon-only with tooltips).
 
+import { ThemePicker } from "@/components/ThemePicker";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type FocusEvent as ReactFocusEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { logWorkState } from "@/lib/workStateLog";
@@ -9,7 +10,7 @@ import { usePrefs } from "@/store/prefs";
 import { Button } from "@/components/ui/Button";
 import { Tip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
-import { LayoutGrid, History, FolderPlus, Settings, Plus, Archive, Layers, Moon, Cog, MoreVertical, GitBranch, GitBranchPlus, FolderGit2, ChevronRight, ChevronDown, Bell, Bug, Mail, Zap, X, Pencil, Copy, ChevronsDownUp, ChevronsUpDown, Check, AudioWaveform, Radio, SquareChevronRight, CircleStop, Trash2, Folder, FolderMinus, FolderOpen, Megaphone, Keyboard, GitPullRequest, GitPullRequestDraft, GitPullRequestClosed, GitMerge, Activity, Waypoints, Square, Play, UsersRound } from "lucide-react";
+import { LayoutGrid, History, FolderPlus, Settings, Plus, Archive, Layers, Moon, Cog, MoreVertical, GitBranch, GitBranchPlus, FolderGit2, ChevronRight, ChevronDown, Bell, Bug, Mail, Zap, X, Pencil, Copy, ChevronsDownUp, ChevronsUpDown, Check, AudioWaveform, Radio, SquareChevronRight, CircleStop, Trash2, Folder, FolderMinus, FolderOpen, Megaphone, Keyboard, GitPullRequest, GitPullRequestDraft, GitPullRequestClosed, GitMerge, Activity, Waypoints, Square, Play } from "lucide-react";
 import { DropdownRoot, DropdownTrigger, DropdownMenu, DropdownItem, DropdownSeparator, DropdownLabel, DropdownSub, DropdownSubTrigger, DropdownSubContent } from "@/components/ui/Dropdown";
 import { ContextMenuRoot, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuLabel, ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent } from "@/components/ui/ContextMenu";
 import { ProjectActionsMenuItems } from "./ProjectActionsMenuItems";
@@ -39,8 +40,7 @@ import { effectiveSandboxMode, isSandboxEnforced, isTaskCaged } from "@/lib/type
 import { SandboxIcon, SANDBOX_VISUALS, DockerSandboxIcon } from "@/components/SandboxIcon";
 import { TaskLocationIcon } from "@/components/TaskLocationIcon";
 import { useTaskLabel } from "@/lib/taskLabel";
-import { ProfileStrip, useProfilesSync } from "@/components/sidebar/ProfileStrip";
-import { useProfiles } from "@/store/profiles";
+import { useProfilesSync } from "@/components/ProfileChip";
 import { ACCENTS, accentCss } from "@/lib/accents";
 
 /** Pick a default name for a freshly-created task (repo-root OR worktree).
@@ -85,7 +85,6 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
   // GH #280: keeps this window's registry view fresh, and decides whether the
   // strip exists at all.
   useProfilesSync();
-  const hasProfiles = useProfiles(s => s.profiles.length > 0);
   const projects = useApp(s => s.projects);
   const sidebarWidth = useApp(s => s.sidebarWidth);
   const setSidebarWidth = useApp(s => s.setSidebarWidth);
@@ -1836,7 +1835,6 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
 
         {/* The profile indicator, above the footer and below the project
             list. Renders nothing until a profile exists. */}
-        <ProfileStrip compact={compact} />
 
         {/* Footer */}
         <div className={cn(
@@ -1851,6 +1849,11 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
               opens the user's default mail client. Compact mode is
               flex-col, so left/right ordering collapses into a top/bottom
               stack. */}
+          {/* Theme, first in the row. It came down from the title bar when the
+              profile chip took that space: it is a set-once preference, not a
+              thing you reach for while driving an agent, and this footer is
+              where the other set-once affordances already live. */}
+          <ThemePicker />
           <Tip content="Report a bug">
             <Button size="icon" variant="icon" onClick={() =>
               openIssue("Bug: ", "What happened:\n\n\nSteps to reproduce:\n\n\nTermic version: ")
@@ -1884,32 +1887,21 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
               <Activity className={iconSize(compact)} />
             </Button>
           </Tip>
-          {/* Right cluster: profiles, then Settings rightmost. Settings sits
-              at the absolute edge so the gear is exactly where users
-              reflexively reach for it (same position as macOS preferences in
-              most apps). ml-auto on the first right-cluster item pushes both.
+          {/* Settings, rightmost, at the absolute edge: the gear is exactly
+              where users reflexively reach for it (same position as macOS
+              preferences in most apps). `ml-auto` pushes it there.
 
-              "Add project" USED to sit here and was removed with profiles
-              (GH #280): it duplicated the button in the PROJECTS header,
-              which is where the action belongs, next to the list it acts on.
-
-              The profile button is the whole surface while the feature is
-              dormant. Once a profile exists the strip above carries the
-              identity, so this stays as the way into managing them. */}
-          <Tip content={hasProfiles ? "Manage profiles" : "Profiles"}>
-            <Button
-              size="icon"
-              variant="icon"
-              data-testid="footer-profiles"
-              className={compact ? undefined : "ml-auto"}
-              onClick={() => openSettings("profiles")}
-            >
-              <UsersRound className={iconSize(compact)} />
+              The PROFILE control that used to sit beside it moved to the title
+              bar with the rest of the profile UI (GH #280). "Add project" was
+              removed earlier for a different reason: it duplicated the button
+              in the PROJECTS header, which is where the action belongs, next
+              to the list it acts on. */}
+          <Tip content="Settings (⌘,)">
+            <Button size="icon" variant="icon" className={compact ? undefined : "ml-auto"}
+                    onClick={() => openSettings()}>
+              <Settings className={iconSize(compact)} />
             </Button>
           </Tip>
-          <Tip content="Settings (⌘,)"><Button size="icon" variant="icon" onClick={() => openSettings()}>
-            <Settings className={iconSize(compact)} />
-          </Button></Tip>
         </div>
       </div>
 

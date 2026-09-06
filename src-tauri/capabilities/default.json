@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window. NOTE core:window:allow-close: it lets the webview close its own window, which now routes through the close prompt instead of quitting. Its only in-tree caller is the e2e suite, which has to exercise the REAL CloseRequested path because WebDriver cannot click the native traffic light. Deliberate, not accidental: the user can already close the window, and Rust intercepts the request either way.",
-  "windows": ["main"],
+  "description": "Capability for the main window AND every profile window. `profile-*` is not decoration: capabilities are scoped by window LABEL, and a window that matches nothing here gets NO permissions at all, including core:event. A profile window then cannot listen for events, so every PTY spawn in it failed with `event.listen not allowed on window \"profile-work\"` and the window was inert (GH #280). The root profile keeps the literal `main` label, which is why the bug only ever appeared in the second window. NOTE core:window:allow-close: it lets the webview close its own window, which now routes through the close prompt instead of quitting. Its only in-tree caller is the e2e suite, which has to exercise the REAL CloseRequested path because WebDriver cannot click the native traffic light. Deliberate, not accidental: the user can already close the window, and Rust intercepts the request either way.",
+  "windows": ["main", "profile-*"],
   "permissions": [
     "core:default",
     "core:webview:allow-set-webview-zoom",

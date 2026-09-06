@@ -78,14 +78,14 @@ describe("profiles", () => {
     if (existsSync(registryPath)) rmSync(registryPath, { force: true });
   });
 
-  it("shows no strip at all until a profile exists", async () => {
+  it("shows no profile chip at all until a profile exists", async () => {
     // The whole "this feature does not exist yet" contract: someone who never
-    // makes a profile never sees a strip, a name, or a color.
+    // makes a profile never sees a chip, a name, or a color.
     await browser.execute(() => window.__termic!.useProfiles.getState().refresh());
     await browser.waitUntil(
       async () => await browser.execute(() =>
-        document.querySelectorAll('[data-testid="profile-strip"]').length === 0),
-      { timeoutMsg: "the profile strip rendered on a dormant install" },
+        document.querySelectorAll('[data-testid="profile-chip"]').length === 0),
+      { timeoutMsg: "the profile chip rendered on a dormant install" },
     );
     // The footer's entry point IS there, though: it is the whole surface
     // until the first profile is created.
@@ -120,7 +120,7 @@ describe("profiles", () => {
   it("creates the first profile through the wizard, naming the existing one too", async () => {
     // Driven through the real dialog: the FIRST create is the moment the
     // current setup becomes "a profile", so the wizard has to ask for both
-    // names or the strip reads Default forever.
+    // names or the chip reads Default forever.
     await browser.execute(() => window.__termic!.useUI.getState().openNewProfile());
     await waitVisible('[data-testid="new-profile-dialog"]');
     await waitVisible('[data-testid="existing-profile-name"]');
@@ -177,20 +177,20 @@ describe("profiles", () => {
     expect(view.current).toBe("personal");
   });
 
-  it("shows the strip with the profile name in clear once profiles exist", async () => {
+  it("shows the chip in the title bar with the profile name in clear", async () => {
     await browser.execute(() => window.__termic!.useProfiles.getState().refresh());
-    await waitVisible('[data-testid="profile-strip"]');
+    await waitVisible('[data-testid="profile-chip"]');
     const text = await browser.execute(() =>
-      document.querySelector('[data-testid="profile-strip"]')?.textContent?.trim(),
+      document.querySelector('[data-testid="profile-chip"]')?.textContent?.trim(),
     );
     // The NAME, not the slug and not an icon: it is what tells you which
     // window you are typing into.
     expect(text).toContain("Personal");
-    await snap("profiles-strip");
+    await snap("profiles-chip");
   });
 
-  it("lists every profile in the strip popover", async () => {
-    await clickWhenVisible('[data-testid="profile-strip"]');
+  it("lists every profile in the chip popover", async () => {
+    await clickWhenVisible('[data-testid="profile-chip"]');
     await waitVisible('[data-testid="profile-row-work"]');
     await waitVisible('[data-testid="profile-row-personal"]');
     await snap("profiles-06-switcher.png");
@@ -282,8 +282,8 @@ describe("profiles", () => {
         { timeout: 30_000, timeoutMsg: "the profile window never booted" },
       );
       await browser.waitUntil(async () => await browser.execute(
-        () => !!document.querySelector('[data-testid="profile-strip"]')),
-        { timeout: 20_000, timeoutMsg: "the profile window never rendered its strip" },
+        () => !!document.querySelector('[data-testid="profile-chip"]')),
+        { timeout: 20_000, timeoutMsg: "the profile window never rendered its chip" },
       );
 
       const other = await browser.execute(async () => {
@@ -293,14 +293,14 @@ describe("profiles", () => {
         return {
           current: view.current,
           projects: (await t.invoke("projects_list")).map((p: any) => p.name),
-          strip: document.querySelector('[data-testid="profile-strip"]')?.textContent?.trim(),
+          chip: document.querySelector('[data-testid="profile-chip"]')?.textContent?.trim(),
         };
       });
 
       // It knows which profile it is, and it cannot see the other's work.
       expect(other.current).toBe("work");
       expect(other.projects).toEqual([]);
-      expect(other.strip).toContain(expectedName);
+      expect(other.chip).toContain(expectedName);
     } finally {
       await browser.switchToWindow(main);
     }
@@ -432,18 +432,22 @@ describe("profiles", () => {
     expect(err).toContain("its own close button");
   });
 
-  it("refuses to delete a profile whose window is open", async () => {
-    // A precondition the user can act on, not a race to handle: it means no
-    // PTY is running under the profile at the moment of deletion, so live
-    // agents are never killed behind their back. This window IS the root
-    // profile's, so deleting it must be refused.
+  it("refuses to delete the profile you are driving from", async () => {
+    // An open window is no longer a precondition: the delete closes it, and
+    // the dialog warns that anything running in it stops. Making the user go
+    // and find a window that may be on another Space was a chore we invented,
+    // and the "close it first" banner did not even refresh when they did.
+    //
+    // THIS window is the root profile's, and deleting the profile you are
+    // driving from is not a chore but an impossibility: it pulls the data dir
+    // out from under the dialog that asked.
     const err = await browser.execute(async () => {
       try {
         await window.__termic!.invoke("profile_delete", { slug: "personal", deleteWorktrees: false });
         return null;
       } catch (e) { return String(e); }
     });
-    expect(err).toContain("close the profile's window");
+    expect(err).toContain("switch to another profile");
   });
 
   it("reports what a delete would touch before confirming it", async () => {
@@ -477,8 +481,8 @@ describe("profiles", () => {
     await resetToDormant();
     await browser.waitUntil(
       async () => await browser.execute(() =>
-        document.querySelectorAll('[data-testid="profile-strip"]').length === 0),
-      { timeoutMsg: "the strip survived deleting every profile" },
+        document.querySelectorAll('[data-testid="profile-chip"]').length === 0),
+      { timeoutMsg: "the chip survived deleting every profile" },
     );
     await waitVisible('[data-testid="footer-profiles"]');
     expect(existsSync(registryPath)).toBe(false);

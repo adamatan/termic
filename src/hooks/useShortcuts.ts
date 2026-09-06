@@ -28,6 +28,9 @@ import { usePrefs, APPEARANCE_DEFAULTS } from "@/store/prefs";
 import { useNavHistory } from "@/store/navHistory";
 import { trackDoubleShift, NO_TAPS, type TapState } from "@/lib/doubleTap";
 import { requestCloseTab, requestClosePaneTab } from "@/lib/closeTab";
+import { shouldCloseProfileWindow } from "@/lib/profileScope";
+import { windowCloseIfNotLast } from "@/lib/ipc";
+import { useProfiles } from "@/store/profiles";
 import { focusMainTab, focusPaneTab } from "@/lib/tabFocus";
 import { jumpToNextWaiting } from "@/lib/waitingAgents";
 import { newScratchTab } from "@/lib/scratchTabs";
@@ -662,6 +665,25 @@ export function useShortcuts() {
             }
             const mainTab = activeTabId ? tabs.find(t => t.id === activeTabId) : undefined;
             if (mainTab?.preview) requestCloseTab(taskId, mainTab.id);
+            return;
+          }
+          // Nothing left in this window to close, so the window IS the
+          // innermost thing: close the profile, the way the last tab takes a
+          // browser window with it. Never the LAST window, which would be a
+          // quit rather than a close (see `shouldCloseProfileWindow`).
+          //
+          // Rust owns the last-window check and closes through the ordinary
+          // CloseRequested path, which is what destroys a non-root profile
+          // window, clears `open_at_quit` so launch restore does not bring it
+          // back, and rebuilds the tray. The rule here is only "is this window
+          // empty enough for the shortcut to mean the window"; being wrong
+          // about the WINDOW COUNT would mean quitting the app by accident,
+          // and this store can be a moment stale after a sibling closes.
+          if (shouldCloseProfileWindow({
+            hasActiveTask: !!taskId,
+            openWindows: useProfiles.getState().profiles.filter(p => p.open).length,
+          })) {
+            void windowCloseIfNotLast().catch(() => {});
           }
           return;
         }

@@ -10,7 +10,7 @@
 // wizard and Settings both render this row and a drift between them would be
 // two pickers that look like different features.
 
-import { ACCENTS, isHexAccent } from "@/lib/accents";
+import { ACCENTS, ACCENT_NONE, isHexAccent, profileAccentCss } from "@/lib/accents";
 import { cn } from "@/lib/utils";
 
 /** A sensible starting point when the user opens the custom picker having
@@ -30,6 +30,27 @@ export function AccentDots({ value, onChange, idPrefix }: {
   const custom = isHexAccent(value);
   return (
     <div className="flex items-center gap-1">
+      {/* NO COLOUR, first in the row. A real choice rather than the absence of
+          one: a single-profile install, or anyone who finds the title-bar wash
+          noisy, needs a way to say so. Drawn as an outlined dot, so it reads
+          as an option in the same row rather than as a missing swatch. */}
+      <button
+        type="button"
+        aria-label="No colour"
+        aria-pressed={value === ACCENT_NONE}
+        data-testid={`${idPrefix}-accent-none`}
+        onClick={() => onChange(ACCENT_NONE)}
+        className="rounded-full p-1 hover:bg-[var(--color-bg-2)]"
+        title="No colour"
+      >
+        <span
+          className={cn(
+            "block h-4 w-4 rounded-full border border-dashed border-[var(--color-fg-faint)]",
+            value === ACCENT_NONE
+              && "ring-1 ring-[var(--color-fg)] ring-offset-1 ring-offset-[var(--color-bg-1)]",
+          )}
+        />
+      </button>
       {ACCENTS.map(a => (
         <button
           key={a.key}
@@ -81,5 +102,24 @@ export function AccentDots({ value, onChange, idPrefix }: {
         />
       </label>
     </div>
+  );
+}
+
+/** One profile's colour, as a dot.
+ *
+ *  Replaced a square tile carrying the name's first letter. The letter was
+ *  redundant everywhere it appeared: the full name is always right next to it,
+ *  and a monogram of a one-word name is just that word's first character. It
+ *  also read as an avatar, which invited the question of whose account it was.
+ *  The dot is the same shape the accent PICKER uses, so the thing you choose
+ *  and the thing you then see are visibly the same object.
+ */
+export function ProfileDot({ accent, className }: { accent: string | undefined; className?: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn("h-2.5 w-2.5 shrink-0 rounded-full", className)}
+      style={{ backgroundColor: profileAccentCss(accent) }}
+    />
   );
 }

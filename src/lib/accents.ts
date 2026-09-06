@@ -36,8 +36,66 @@ export const accentCss = (key: string | undefined): string | undefined =>
 export const isHexAccent = (v: string | undefined): boolean =>
   !!v && /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(v);
 
-/** Profiles always render an accent (the strip is tinted by it), so they need
- *  a fallback where groups fall back to "no styling". */
+/** The stored value meaning "no colour at all".
+ *
+ *  A real choice, not the absence of one: someone running a single profile, or
+ *  who finds the title-bar wash noisy, needs a way to say so, and an empty
+ *  string would be indistinguishable from a profile written before accents
+ *  existed (which should still get its default). */
+export const ACCENT_NONE = "none";
+
+/** Profiles always render SOMETHING in the dot (the row would jump if one
+ *  entry had no dot), so they need a fallback where groups fall back to "no
+ *  styling". `none` uses the same neutral, which is what makes it read as
+ *  "no colour" rather than as a colour nobody would choose. */
 export const PROFILE_ACCENT_FALLBACK = "var(--color-fg-faint)";
 export const profileAccentCss = (key: string | undefined): string =>
   (isHexAccent(key) ? key : accentCss(key)) ?? PROFILE_ACCENT_FALLBACK;
+
+/** How far across the title bar the accent wash reaches before it is gone. */
+export const WASH_END_PERCENT = 35;
+/** How strong the accent is at the very left edge.
+ *
+ *  Bracketed by eye against PyCharm, from both sides: 22 read as invisible
+ *  beside it, 45 and then 30 both read as too much against the breadcrumb.
+ *  This sits just above the floor, which is where it wanted to be: the wash is
+ *  meant to be noticed peripherally, not looked at. */
+export const WASH_ALPHA_PERCENT = 25;
+/** ...and at the midpoint, so the falloff is a curve rather than a ramp. */
+export const WASH_MID_PERCENT = 9;
+
+/**
+ * The profile's accent, washed in from the left edge of the title bar and gone
+ * by the first third (GH #280).
+ *
+ * `undefined` when there is no profile to colour, which is the dormant install
+ * and most users: the bar then renders exactly as it always did, with no
+ * background image at all.
+ *
+ * A GRADIENT rather than a fill, and a weak one. The bar carries the
+ * breadcrumb and the whole toolbar, so a solid accent behind them fights every
+ * glyph on it; the fade also puts the colour where the eye already lands on a
+ * window, next to the traffic lights. The prior art is JetBrains, which tints
+ * this exact strip per project.
+ *
+ * `color-mix` rather than an 8-digit hex, because an accent can be either a
+ * theme `var(...)` or a user-typed hex and only `color-mix` handles both
+ * without parsing the colour ourselves.
+ */
+export const profileWashCss = (key: string | undefined, hasProfile: boolean): string | undefined => {
+  if (!hasProfile) return undefined;
+  // Opted OUT: no wash at all, not a grey one. A neutral gradient still reads
+  // as a tint and still costs the breadcrumb contrast, which is the whole
+  // thing the user asked to be rid of.
+  if (key === ACCENT_NONE) return undefined;
+  const c = profileAccentCss(key);
+  // THREE stops, not two. A straight ramp to transparent reads as a smear;
+  // holding most of the colour through the first quarter and then falling away
+  // is what makes it read as a tint ON the bar, which is the effect JetBrains
+  // gets. Measured against PyCharm side by side: the first version was too
+  // faint to see at all next to it.
+  return `linear-gradient(to right, `
+    + `color-mix(in srgb, ${c} ${WASH_ALPHA_PERCENT}%, transparent) 0%, `
+    + `color-mix(in srgb, ${c} ${WASH_MID_PERCENT}%, transparent) 25%, `
+    + `transparent ${WASH_END_PERCENT}%)`;
+};

@@ -128,3 +128,20 @@ user's rebind across both renames.
 ⇧⌘L is what the agent-first editors converged on for this action (Cursor's "Add selection to Chat", VS Code Copilot's "Add Selection to Chat"; Zed uses ⌘>), and it sits next to termic's own ⌘L "focus main agent".
 
 It does not send anything. It opens the review-comment composer (`dispatchSelectionComment` in `reviewCommentsExt.ts`) on the selected lines — the same surface the diff pane uses, so editor remarks queue in the `reviewComments` store alongside diff ones and go to the agent as ONE batch from the pending-comments bar. The pointer route is the gutter icon that appears next to a selection (the diff's labelled pill stays on the diff, see [ui.md](ui.md#inline-review-comments-two-surfaces)). Both paths land in the same place; neither writes to a PTY on its own.
+
+## ⌘W on an empty window closes the profile
+
+`close-tab` closes the innermost thing there is to close, and when a window has
+no task open the window itself is that thing. That is the browser convention
+(a tab, then the last tab takes the window with it).
+
+**Never the last window.** Closing that one is a QUIT, not a close: it is
+governed by the close-action setting (menu bar / quit / ask) and by ⌘Q.
+Escalating a tab-close key into a quit is how someone loses the agents they had
+running, so ⌘W is a no-op there.
+
+The check is split on purpose. `shouldCloseProfileWindow` (`lib/profileScope`)
+decides only whether this window is empty enough for the shortcut to mean the
+window; **Rust owns the window count**, in `window_close_if_not_last`. The
+frontend learns about a sibling closing through an event, so its count can be a
+moment stale, and being wrong in that direction quits the app.

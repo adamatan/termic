@@ -296,6 +296,53 @@ mod tests {
         }
     }
 
+    /// Does a capability `windows` entry cover this label? Only the trailing
+    /// `*` form is implemented, which is the only form the file uses.
+    fn glob_covers(pattern: &str, label: &str) -> bool {
+        match pattern.strip_suffix('*') {
+            Some(prefix) => label.starts_with(prefix),
+            None => pattern == label,
+        }
+    }
+
+    #[test]
+    fn every_profile_window_is_covered_by_a_tauri_capability() {
+        // Capabilities are scoped by window LABEL, and a window matching no
+        // entry gets NO permissions at all, `core:event` included. A profile
+        // window then cannot listen for events, so every PTY spawn in it dies
+        // with `event.listen not allowed on window "profile-work"` and the
+        // window is inert.
+        //
+        // It shipped that way because the root profile keeps the literal
+        // `main` label: the first window worked, and only the SECOND one was
+        // broken, which is the half of the feature nobody exercises until a
+        // real profile exists. Nothing in the type system connects
+        // `window_label()` to a JSON file, so this test is the connection.
+        let raw = include_str!("../capabilities/default.json");
+        let cap: serde_json::Value = serde_json::from_str(raw).expect("default.json parses");
+        let windows: Vec<String> = cap["windows"]
+            .as_array()
+            .expect("capability lists windows")
+            .iter()
+            .map(|w| w.as_str().unwrap_or_default().to_string())
+            .collect();
+
+        // Derived from the real label builder, so renaming the scheme fails
+        // here rather than silently at runtime in a window nobody tested.
+        for slug in ["work", "personal", "a-very-long-profile-name-2"] {
+            let label = ProfileId::Slug(slug.into()).window_label();
+            assert!(
+                windows.iter().any(|p| glob_covers(p, &label)),
+                "no capability window pattern covers {label:?} (have {windows:?}). \
+                 A profile window with no capability gets no permissions at all, \
+                 so it cannot listen for events and every spawn in it fails.",
+            );
+        }
+        // ...and the root window, which is the one that always worked.
+        let root = ProfileId::Root.window_label();
+        assert!(windows.iter().any(|p| glob_covers(p, &root)), "root window {root:?} uncovered");
+    }
+
     #[test]
     fn window_label_round_trips_and_root_keeps_main() {
         assert_eq!(ProfileId::Root.window_label(), "main");

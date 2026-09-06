@@ -7,6 +7,9 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useApp, useActiveTask } from "@/store/app";
+import { useProfiles } from "@/store/profiles";
+import { profileWashCss } from "@/lib/accents";
+import { ProfileChip } from "@/components/ProfileChip";
 import { Button } from "@/components/ui/Button";
 import { Tip } from "@/components/ui/Tooltip";
 import * as HoverCard from "@radix-ui/react-hover-card";
@@ -45,6 +48,13 @@ const TRAFFIC_LIGHT_WIDTH = 84;
 
 export function UnifiedBar() {
   const agents = useApp(s => s.agents);
+  // The profile's accent as a wash across the left of the bar (GH #280).
+  // Selected as the finished CSS string so this bar re-renders only when the
+  // colour actually changes, not on every profile-store touch.
+  const profileWash = useProfiles(s => {
+    const me = s.profiles.find(p => p.slug === s.current);
+    return profileWashCss(me?.accent, s.profiles.length > 0);
+  });
   const compact = useApp(s => s.compactSidebar);
   const toggleCompact = useApp(s => s.toggleCompactSidebar);
   const toggleRP = useApp(s => s.toggleRightPanel);
@@ -103,12 +113,26 @@ export function UnifiedBar() {
         // macOS convention: double-click title bar zooms the window.
         getCurrentWindow().toggleMaximize().catch(() => {});
       }}
-      className="flex h-11 shrink-0 items-center gap-1 border-b border-[var(--color-border-soft)] bg-[var(--color-bg-1)] px-2"
+      className="relative flex h-11 shrink-0 items-center gap-1 border-b border-[var(--color-border-soft)] bg-[var(--color-bg-1)] px-2"
       style={{
         // px-2 (8px) already pads the left in full-screen; only reserve the
         // wide traffic-light gap when the lights are actually there.
         paddingLeft: isFullscreen ? undefined : TRAFFIC_LIGHT_WIDTH,
         WebkitAppRegion: "drag",
+        // The profile's accent, washed in from the left and gone by the first
+        // third (GH #280). Backed by a real product: JetBrains tints this
+        // exact strip per project, and it works because the bar is the one
+        // surface always on screen in EVERY window, so "which profile is this"
+        // is answered by peripheral vision rather than by reading a name.
+        //
+        // A gradient rather than a fill: the bar carries the breadcrumb and
+        // the toolbar, and a solid accent behind them fights the text. The
+        // fade also puts the colour where the eye already goes on a window
+        // (top-left, next to the traffic lights).
+        //
+        // Painted here rather than as an overlay child so nothing has to be
+        // excluded from the drag region.
+        backgroundImage: profileWash,
       } as any}
     >
       {/* Sidebar toggle + theme cycler */}
@@ -134,12 +158,13 @@ export function UnifiedBar() {
             <PanelLeft className="h-[18px] w-[18px]" />
           </Button>
         </Tip>
-        {/* Theme picker — Radix dropdown opens on hover (and click).
-            Three explicit options, never silently cycles. */}
-        <ThemePicker themeMode={themeMode} setThemeMode={setThemeMode} Icon={ThemeIcon} />
         {/* Self-update pill — only renders when an update is actually
             available. Sits next to the theme picker so it's findable
             but not intrusive. */}
+        {/* The profile, in the accent wash this bar already carries. Renders
+            nothing until profiles exist, so a dormant install sees the bar it
+            has always seen. */}
+        <ProfileChip />
         <UpdaterBanner />
         {/* Waiting-agents pill (issue #56): appears only when an agent needs
             you, jumps to the next on click. Sits with the other status pills
@@ -356,163 +381,3 @@ export function UnifiedBar() {
   );
 }
 
-/** Every row in the theme dropdown. Icons sit flush against the padding:
- *  a leading checkmark column (even a transparent one) indents every label
- *  to pay for the one active row, so the tick moved to the trailing edge
- *  where it only takes space when it exists. */
-const THEME_ROW =
-  "flex w-full cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[13.5px] text-[var(--color-fg)] whitespace-nowrap hover:bg-[var(--color-hover)]";
-/** The tick alone is easy to miss at 14px, so the active row also tints its
- *  icon + label. Two signals, no extra layout. */
-const THEME_ROW_ACTIVE = "font-medium text-[var(--color-accent)]";
-
-/** Theme picker — uses Radix HoverCard, which is purpose-built for "hover
- *  to reveal a panel". Handles cursor transit between trigger and content,
- *  open/close timing, and pointer leave/enter race conditions internally —
- *  the hand-rolled DropdownMenu + setTimeout approach flickered. */
-function ThemePicker({
-  themeMode, setThemeMode, Icon,
-}: {
-  /** The user's selection. The `auto` value drives the small "A"
-   *  badge overlay so the user can tell their pick is "follow OS"
-   *  rather than an explicit light/dark. Espresso + Solarized are
-   *  dark-family palettes that the OS can't infer; they only ever
-   *  come from an explicit dropdown pick. */
-  themeMode: import("@/store/prefs").ThemeMode;
-  setThemeMode: (m: import("@/store/prefs").ThemeMode) => void;
-  /** Already resolved to Sun/Moon by the caller — when in auto mode
-   *  this reflects the OS theme (not a generic Monitor icon). */
-  Icon: typeof Sun;
-}) {
-  type Item = { id: import("@/store/prefs").ThemeMode; label: string; icon: typeof Sun };
-  const items: Item[] = [
-    // "System" = follow OS prefers-color-scheme. Stored as `auto` for backward
-    // compatibility with existing localStorage values.
-    { id: "auto",      label: "System",         icon: Monitor },
-    { id: "light",     label: "Light",          icon: Sun },
-    { id: "claude",    label: "Claude",         icon: Moon },
-    { id: "dark",      label: "Dark+",          icon: Code2 },
-    { id: "solarized", label: "Solarized Dark", icon: Sunrise },
-    { id: "cobalt",    label: "Cobalt",         icon: Droplet },
-    { id: "matrix",    label: "Matrix",         icon: Binary },
-    { id: "rosepine",  label: "Rosé Pine",      icon: Flower2 },
-  ];
-  // Plain DOM dropdown — Radix HoverCard's pointer-tracking kept
-  // closing on item click (the theme-change re-render storm triggers
-  // pointer-out detection somewhere internally). Manual implementation
-  // gives us absolute control: opens on trigger hover, stays open until
-  // outside click or cursor leaves the WHOLE region (trigger + content)
-  // for closeDelayMs. Item clicks never close it — user can cycle
-  // through System / Light / Dark to compare freely.
-  const [open, setOpen] = useState(false);
-  const closeTimerRef = useRef<number | null>(null);
-  const wrapperRef = useRef<HTMLDivElement>(null);
-  // Custom theme files (~/.config/termic/themes/*.json). Refetched on every
-  // trigger hover — that's the "hot reload": edit file, reopen picker.
-  const customThemes = usePrefs(s => s.customThemes);
-  const cancelClose = () => {
-    if (closeTimerRef.current) { window.clearTimeout(closeTimerRef.current); closeTimerRef.current = null; }
-  };
-  const scheduleClose = () => {
-    cancelClose();
-    closeTimerRef.current = window.setTimeout(() => setOpen(false), 200);
-  };
-  // Outside click closes immediately.
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (!wrapperRef.current?.contains(e.target as Node)) setOpen(false);
-    };
-    window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
-  }, [open]);
-  return (
-    <div
-      ref={wrapperRef}
-      className="relative"
-      onMouseEnter={() => {
-        cancelClose(); setOpen(true);
-        void usePrefs.getState().loadCustomThemes();
-      }}
-      onMouseLeave={scheduleClose}
-    >
-      <Button size="icon" variant="icon" onClick={() => setOpen(v => !v)}>
-        <span className="relative inline-flex h-[18px] w-[18px] items-center justify-center">
-          <Icon className="h-[18px] w-[18px]" />
-          {themeMode === "auto" && (
-            // Tiny "A" badge in the bottom-right corner to signal that
-            // the visible Sun/Moon is the OS-resolved theme, not an
-            // explicit user choice. Outline matches button bg so it
-            // reads as a sticker on top of the icon, not part of it.
-            <span
-              className="absolute -bottom-1 -right-1 flex h-[10px] w-[10px] items-center justify-center rounded-full bg-[var(--color-accent)] text-[7px] font-bold leading-none text-[var(--color-accent-fg)] ring-1 ring-[var(--color-bg)]"
-              aria-label="auto"
-            >A</span>
-          )}
-        </span>
-      </Button>
-      {open && (
-        <div
-          className={cn(
-            "absolute left-0 top-full z-50 mt-1 min-w-[170px] rounded-md border border-[var(--color-border)] bg-[var(--color-bg-1)] p-1 shadow-xl",
-          )}
-        >
-          {items.map(it => {
-            const Ic = it.icon;
-            const active = it.id === themeMode;
-            return (
-              <button
-                key={it.id}
-                onClick={() => setThemeMode(it.id)}
-                className={cn(THEME_ROW, active && THEME_ROW_ACTIVE)}
-              >
-                <Ic className={cn("h-4 w-4 shrink-0", active ? "text-[var(--color-accent)]" : "text-[var(--color-fg-dim)]")} />
-                <span>{it.label}</span>
-                {active && <Check className="ml-auto h-3.5 w-3.5 shrink-0 text-[var(--color-accent)]" />}
-              </button>
-            );
-          })}
-          {customThemes.length > 0 && (
-            <div className="my-1 border-t border-[var(--color-border-soft)]" />
-          )}
-          {customThemes.map(t => {
-            const active = t.id === themeMode;
-            return (
-              <button
-                key={t.id}
-                onClick={() => setThemeMode(t.id)}
-                className={cn(THEME_ROW, active && THEME_ROW_ACTIVE)}
-              >
-                <Palette className={cn("h-4 w-4 shrink-0", active ? "text-[var(--color-accent)]" : "text-[var(--color-fg-dim)]")} />
-                <span className="truncate">{t.name}</span>
-                {active && <Check className="ml-auto h-3.5 w-3.5 shrink-0 text-[var(--color-accent)]" />}
-              </button>
-            );
-          })}
-          <div className="my-1 border-t border-[var(--color-border-soft)]" />
-          {/* The discovery affordance when no theme files exist yet: the
-              folder ships a README + a copyable example. Label names the
-              concept, title says what clicking does (the icon alone carries
-              too little). */}
-          <button
-            title="Open the themes folder"
-            onClick={() => { themesDir().then(openPath).catch(() => {}); }}
-            className={THEME_ROW}
-          >
-            <FolderOpen className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
-            <span>Custom themes</span>
-          </button>
-          {/* One-time tip: agent CLIs persist their own theme. We set
-              COLORFGBG on spawn so most TUIs auto-pick, but claude /
-              gemini / codex also expose a `/theme` slash command that
-              writes to ~/.claude / ~/.gemini / ~/.codex - persists
-              across launches. Surfacing this here so users discover it
-              the first time they switch themes. */}
-          <div className="mt-1 border-t border-[var(--color-border-soft)] px-2 py-1.5 text-[11.5px] leading-snug text-[var(--color-fg-faint)]">
-            Tip: run <span className="mono text-[var(--color-fg-dim)]">/theme</span> inside claude / codex / gemini once to match. The setting persists.
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}

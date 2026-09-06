@@ -25,8 +25,10 @@ import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { profileCreate, profileOpen, profileSeededTasksPath } from "@/lib/ipc";
 import { profileAccentCss } from "@/lib/accents";
-import { AccentDots } from "@/components/ui/AccentDots";
-import { monogram } from "@/components/sidebar/ProfileStrip";
+import { AccentDots, ProfileDot } from "@/components/ui/AccentDots";
+import { profileWashCss } from "@/lib/accents";
+import { currentSetupSummary } from "@/lib/profileScope";
+import { useApp } from "@/store/app";
 import { cn } from "@/lib/utils";
 
 
@@ -59,12 +61,18 @@ export function NewProfileDialog() {
   // Asked, never derived. The dialog states this path as a fact ("Leave empty
   // for ..."), and a second copy of slugify plus a hardcoded app dir made it
   // wrong in dev builds and liable to drift in release ones.
+  // What the current setup holds, named in the panel that asks you to name it.
+  const projectCount = useApp(s => s.projects.length);
+  const taskCount = useApp(s => s.tasks.filter(t => !t.archived).length);
   const [seededPath, setSeededPath] = useState("");
   useEffect(() => {
-    const n = name.trim();
-    if (!n) { setSeededPath(""); return; }
     let live = true;
-    void profileSeededTasksPath(n)
+    // Asked with the PLACEHOLDER before anything is typed, so the field states
+    // its default from the moment the dialog opens rather than staying blank
+    // until the user happens to fill the name above it. Still asked, never
+    // derived: a second copy of slugify plus a hardcoded app dir is what made
+    // this wrong in dev builds before.
+    void profileSeededTasksPath(name.trim() || "Work")
       .then(([, path]) => { if (live) setSeededPath(path); })
       .catch(() => { /* preview only: an empty placeholder beats a wrong one */ });
     return () => { live = false; };
@@ -99,22 +107,43 @@ export function NewProfileDialog() {
       open={open}
       onOpenChange={setOpen}
       title="New profile"
-      description="A profile is its own window, with its own projects, tasks, settings and agents."
+      // No description on the FIRST run: the panel below already explains what
+      // is about to happen, and a header that repeats it reads as crowded
+      // before the user has read either.
+      description={isFirst ? undefined : "Its own window, projects, tasks and settings."}
       className="max-w-lg"
+      // Radix restores focus to the trigger when a dialog closes, and the
+      // trigger is in the window we are about to navigate AWAY from. Left
+      // alone, that restore lands after `profile_open` has focused the new
+      // window and quietly pulls the user back to the old one.
+      onCloseAutoFocus={e => e.preventDefault()}
     >
       <div className="flex flex-col gap-4" data-testid="new-profile-dialog">
         {isFirst && (
           <div className="rounded-lg border border-[var(--color-border-soft)] bg-[var(--color-bg-2)] p-3">
-            <div className="mb-2 text-[12.5px] text-[var(--color-fg-dim)]">
-              Your current setup becomes a profile too. Give it a name so you
-              can tell the two windows apart.
+            {/* Labelled, and labelled the SAME WAY as the new profile below,
+                because the two inputs are a pair and the top one is the
+                surprise: nobody opening "New profile" expects to be asked to
+                name something that already exists. */}
+            <div className="mb-1.5 flex items-center gap-2">
+              <label className="text-[12.5px] font-medium">Your current setup</label>
+              {/* The badge does the work a sentence could not: "this window"
+                  in prose reads as chrome, in a pill it reads as a label ON
+                  the thing in front of you. */}
+              <span className="rounded-[4px] bg-[var(--color-accent-deep)]/20 px-1.5 py-px text-[10px] font-semibold uppercase tracking-wide text-[var(--color-accent)]">
+                This window
+              </span>
+            </div>
+            <div className="mb-2 text-[12.5px] leading-relaxed text-[var(--color-fg-dim)]">
+              {/* Real counts, because they are what makes this unmistakably
+                  the user's OWN setup rather than a second empty form. They
+                  are also exactly the things people fear a new profile will
+                  move. */}
+              {currentSetupSummary(projectCount, taskCount)} Give it a name so
+              you can tell the two windows apart.
             </div>
             <div className="flex items-center gap-2">
-              <span
-                aria-hidden
-                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[10px] font-semibold text-white"
-                style={{ backgroundColor: profileAccentCss(existingAccent) }}
-              >{monogram(existingName || "?")}</span>
+              <ProfileDot accent={existingAccent} />
               <Input
                 value={existingName}
                 onChange={e => setExistingName(e.target.value)}
@@ -123,18 +152,17 @@ export function NewProfileDialog() {
                 className="flex-1"
               />
             </div>
-            <div className="mt-2"><AccentDots value={existingAccent} onChange={setExistingAccent} idPrefix="existing" /></div>
+              <div className="mt-2"><AccentDots value={existingAccent} onChange={setExistingAccent} idPrefix="existing" /></div>
+            <TitleBarPreview name={existingName} accent={existingAccent} />
           </div>
         )}
 
         <div>
-          <label className="mb-1.5 block text-[12.5px] font-medium">Name</label>
+          <label className="mb-1.5 block text-[12.5px] font-medium">
+            {isFirst ? "The new profile" : "Name"}
+          </label>
           <div className="flex items-center gap-2">
-            <span
-              aria-hidden
-              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[10px] font-semibold text-white"
-              style={{ backgroundColor: profileAccentCss(accent) }}
-            >{monogram(name || "?")}</span>
+            <ProfileDot accent={accent} />
             <Input
               autoFocus
               value={name}
@@ -146,6 +174,7 @@ export function NewProfileDialog() {
             />
           </div>
           <div className="mt-2"><AccentDots value={accent} onChange={setAccent} idPrefix="new" /></div>
+          <TitleBarPreview name={name} accent={accent} />
         </div>
 
         <div>
@@ -158,7 +187,9 @@ export function NewProfileDialog() {
           />
           <p className="mt-1 text-[11.5px] text-[var(--color-fg-faint)]">
             Where this profile's worktrees are created.
-            {seededPath && <> Leave empty for <code className="mono">{seededPath}</code>.</>}
+            {seededPath
+              ? <> Leave empty for <code className="mono">{seededPath}</code>.</>
+              : <> Leave empty to use the default.</>}
           </p>
         </div>
 
@@ -176,5 +207,37 @@ export function NewProfileDialog() {
         </div>
       </div>
     </AppDialog>
+  );
+}
+
+/** What the title bar will look like, painted by the SAME function that paints
+ *  the real one (`profileWashCss`).
+ *
+ *  Reused rather than approximated on purpose: a mock drawn with its own
+ *  gradient would drift from the bar the moment either changed, and then the
+ *  dialog would be quietly lying about the thing it is previewing. Picking an
+ *  accent is otherwise a guess, because the wash is deliberately faint and the
+ *  dots show the colour at full strength. */
+function TitleBarPreview({ name, accent }: { name: string; accent: string }) {
+  return (
+    <div
+      aria-hidden
+      className="mt-2 flex h-8 items-center gap-2 overflow-hidden rounded-md border border-[var(--color-border-soft)] bg-[var(--color-bg-1)] px-2"
+      style={{ backgroundImage: profileWashCss(accent, true) }}
+    >
+      {/* The traffic lights, so the strip reads as a window rather than as a
+          coloured box. Grey, not the real red/amber/green: this is about the
+          accent, and three saturated dots beside it would be the loudest thing
+          in the dialog. */}
+      <span className="flex shrink-0 gap-1">
+        {[0, 1, 2].map(i => (
+          <span key={i} className="h-2 w-2 rounded-full bg-[var(--color-fg-faint)] opacity-40" />
+        ))}
+      </span>
+      <ProfileDot accent={accent} />
+      <span className="min-w-0 truncate text-[12px] font-medium text-[var(--color-fg)]">
+        {name.trim() || "Untitled"}
+      </span>
+    </div>
   );
 }

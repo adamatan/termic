@@ -91,8 +91,11 @@ export function DeleteProfileDialog() {
   const open = slug !== null;
   // The checkbox is load-bearing only in the one case it describes.
   const needsAck = deleteWorktrees && (preview?.dirty ?? 0) > 0;
-  const blocked = preview?.windowOpen ?? false;
-  const canDelete = !!preview && !busy && !blocked && (!needsAck || acked);
+  // NOT a blocker any more: the delete closes the window itself. Kept only as
+  // a warning, because "your window disappears and whatever was running in it
+  // stops" is worth knowing before pressing a red button.
+  const windowOpen = preview?.windowOpen ?? false;
+  const canDelete = !!preview && !busy && (!needsAck || acked);
 
   const run = async () => {
     if (!slug || !canDelete) return;
@@ -123,32 +126,13 @@ export function DeleteProfileDialog() {
           <div className="text-[13px] text-[var(--color-fg-dim)]">Checking what this profile owns...</div>
         )}
 
-        {blocked && (
+        {windowOpen && (
           <div className="flex gap-2 rounded-lg border border-[var(--color-warning)] p-3 text-[12.5px]">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[var(--color-warning)]" />
-            <div className="flex min-w-0 flex-col items-start gap-2">
-              <span>
-                This profile's window is open. Close it first. Deleting it while
-                agents are running in it would kill them without asking.
-              </span>
-              {/* Offering the button rather than only the instruction: the
-                  window may be on another Space or another monitor, and
-                  "go find it" is a poor thing to ask. */}
-              <Button
-                size="sm"
-                variant="ghost"
-                data-testid="delete-profile-close-window"
-                onClick={() => {
-                  if (!slug) return;
-                  void profileClose(slug)
-                    .then(() => profileDeletePreview(slug))
-                    .then(setPreview)
-                    .catch(e => setErr(String(e)));
-                }}
-              >
-                Close its window
-              </Button>
-            </div>
+            <span>
+              This profile's window is open. Deleting closes it, and anything
+              running in it stops.
+            </span>
           </div>
         )}
 

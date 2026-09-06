@@ -70,3 +70,67 @@ export function purgeProfileKeys(slug: string): void {
     // delete, which is worse.
   }
 }
+
+/**
+ * What the CURRENT setup holds, for the panel that asks you to name it
+ * (GH #280).
+ *
+ * The New profile dialog asks for two names, and the first one surprises
+ * people: nobody opening "New profile" expects to be asked to name something
+ * that already exists. Labels alone were not enough ("This window" still reads
+ * as chrome), so the panel states what is in it. Real counts the user
+ * recognises are the thing that makes it unmistakably THEIR setup rather than
+ * a second empty form.
+ *
+ * Reads as reassurance too: these are the things people are afraid a new
+ * profile will move.
+ */
+export function currentSetupSummary(projects: number, tasks: number): string {
+  const p = projects === 1 ? "1 project" : `${projects} projects`;
+  const t = tasks === 1 ? "1 task" : `${tasks} tasks`;
+  if (projects === 0 && tasks === 0) {
+    // A brand-new install. Counting nothing would read as a bug, and the
+    // reassurance is meaningless when there is nothing to reassure about.
+    return "Everything you set up from now on stays in it.";
+  }
+  if (tasks === 0) return `Its ${p} stay exactly where they are.`;
+  if (projects === 0) return `Its ${t} stay exactly where they are.`;
+  return `Its ${p} and ${t} stay exactly where they are.`;
+}
+
+/**
+ * Should ⌘W close this profile's WINDOW (GH #280)?
+ *
+ * ⌘W closes the innermost thing there is to close, and when a window has
+ * nothing left in it the window itself is that thing. This is the browser
+ * convention (a tab, then the last tab takes the window with it), and the
+ * reason it needs a rule at all is the LAST window.
+ *
+ * Closing the last one is not "close a window", it is "quit", and quitting is
+ * governed by the close-action setting (menu bar / quit / ask) and by ⌘Q.
+ * Escalating a tab-close key into a quit is the kind of surprise that loses
+ * someone's running agents, so ⌘W stays a no-op there and the red button and
+ * ⌘Q keep that job.
+ */
+export function shouldCloseProfileWindow(args: {
+  /** Is a task open in this window? ⌘W belongs to the task while there is one. */
+  hasActiveTask: boolean;
+  /** How many profile windows are open right now, this one included. */
+  openWindows: number;
+}): boolean {
+  if (args.hasActiveTask) return false;
+  return args.openWindows > 1;
+}
+
+/**
+ * Is this profile's slug worth printing under its name?
+ *
+ * The slug names the folders on disk, so it is genuinely useful when it
+ * DIFFERS from what you would guess: "Side Project" lives in `side-project`,
+ * and a second "Work" lives in `work-2`. When it is just the name lowercased
+ * it says nothing, and a row reading "Personal" above "personal" looks like a
+ * bug rather than like information.
+ */
+export function slugWorthShowing(name: string, slug: string): boolean {
+  return slug !== name.trim().toLowerCase();
+}
