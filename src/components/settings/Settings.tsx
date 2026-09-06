@@ -4,6 +4,8 @@
 
 import { useEffect, useState } from "react";
 import { useApp } from "@/store/app";
+import { useUI } from "@/store/ui";
+import { useUpdate } from "@/store/update";
 import { Button } from "@/components/ui/Button";
 import { X, Palette, FolderGit2, Settings as SettingsIcon, Keyboard, Terminal, Layers, Library, ListTodo, Bell, ShieldCheck, SquareTerminal, Container, UsersRound } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -71,6 +73,11 @@ export function Settings() {
           </Button>
         </div>
 
+        {/* The rail scrolls, the version footer does not. Without this the
+            footer is the first thing pushed off the bottom, and a machine with
+            a dozen projects is exactly where you want to read a version
+            number off the screen. */}
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         {/* Rail order is: the pages you open by choice, then the ones you set
             once, then the perimeter. Hairlines mark the three bands; they get
             no uppercase labels (PROJECTS earns one only because it is a
@@ -136,6 +143,9 @@ export function Settings() {
             />
           );
         })}
+        </div>
+
+        <RailFooterVersion />
       </aside>
 
       {/* Right pane */}
@@ -161,6 +171,31 @@ export function Settings() {
           )}
         </div>
       </section>
+    </div>
+  );
+}
+
+/** The running version, bottom left.
+ *
+ *  Reads `useUpdate`, which `App` initialises at boot, so it is already
+ *  resolved by the time anyone opens settings. It stays empty outside Tauri
+ *  (`getVersion()` is the only source), and an empty footer is better than one
+ *  reading "Termic". Clicking opens the changelog: the number and the notes
+ *  for it are the same question, and the dialog renders at z-50 over this
+ *  overlay's z-40. */
+function RailFooterVersion() {
+  const version = useUpdate(s => s.currentVersion);
+  if (!version) return null;
+  return (
+    <div className="mt-2 shrink-0 border-t border-[var(--color-border-soft)] pt-2">
+      <button
+        data-testid="settings-version"
+        onClick={() => useUI.getState().openChangelog()}
+        title="View the changelog"
+        className="w-full rounded-md px-2.5 py-1.5 text-left text-[11.5px] tabular-nums text-[var(--color-fg-faint)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg-dim)]"
+      >
+        Termic {version}
+      </button>
     </div>
   );
 }

@@ -381,6 +381,26 @@ describe("settings rail", () => {
     await snap("settings-rail.png");
   });
 
+  // The version footer. It reads `useUpdate.currentVersion`, which resolves
+  // asynchronously from `getVersion()` at boot, so the failure this catches is
+  // a footer that renders "Termic " with nothing after it, or one pushed off
+  // the bottom by a long project list.
+  it("prints the running version at the foot of the rail", async () => {
+    await waitForAppShell();
+    // The store resolves it asynchronously, so wait for the text rather than
+    // reading once. The regex is the assertion: "Termic " on its own is the
+    // bug, and it is what an unresolved read renders.
+    await browser.waitUntil(
+      async () =>
+        /^Termic \d+\.\d+\.\d+/.test(
+          await browser.execute(
+            () => document.querySelector('[data-testid="settings-version"]')?.textContent ?? "",
+          ),
+        ),
+      { timeout: 8_000, timeoutMsg: "the settings rail never printed a version" },
+    );
+  });
+
   // A rail entry whose tab id has no route in Settings.tsx renders an empty
   // pane: the click "works", the page is blank. Walk the rail from the DOM
   // (not a hard-coded list) so a future entry is covered the day it is added.
