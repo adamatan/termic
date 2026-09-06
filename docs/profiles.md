@@ -4,9 +4,9 @@ One termic, several fully separate instances. A **profile** owns its own
 projects, tasks, settings and agent registry, and lives in its own window; two
 profiles can be open on two monitors at once and neither can see the other's
 work. Shipped in phase 1 of [#280](https://github.com/simion/termic/issues/280);
-phase 2 (a separate account per profile for each agent) is
-[#278](https://github.com/simion/termic/issues/278) and
-[docs/plans/agent-credentials.md](plans/agent-credentials.md).
+phase 2, a separate account per agent, shipped as
+[#278](https://github.com/simion/termic/issues/278) and is documented in
+[docs/agent-accounts.md](agent-accounts.md).
 
 ## The one rule everything follows
 
@@ -329,9 +329,10 @@ install serves every profile.
 
 Profile creation must NOT offer to relocate a config dir. That is the one action
 that would hand a new profile a logged-out agent, and it is not how the second
-account arrives: phase 2 does that, by giving each profile its own agent config
-dir holding the credential and symlinking settings, skills, commands and history
-back to the primary. See [plans/agent-credentials.md](plans/agent-credentials.md).
+account arrives: the account switcher does that, by giving each account its own
+agent config dir holding the credential and symlinking settings, skills,
+commands and history back to the primary. See
+[docs/agent-accounts.md](agent-accounts.md).
 
 ## Where the hard parts are tested
 

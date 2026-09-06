@@ -4,10 +4,11 @@ A per-provider usage readout in the task footer: how much of the subscription's
 rolling limits the currently shown account has spent. Requested in GH #277 by a
 user who moved from Orca and misses it.
 
-**A proof of concept is IN THE TREE and works.** This is still an idea, not a
-plan: nobody has decided it should ship, and the open questions at the bottom
-are product calls rather than engineering ones. What is built is described here
-so that decision can be made against something real instead of a sketch.
+**The chip SHIPPED in 1.2.3**, and 1.3.0 added the running cost and the
+per-account split. What is still an idea is the bottom half of this file: the
+open questions are product calls nobody has made, and none of them blocked the
+part that shipped. The comparison above them is kept because the rejected
+options are the expensive part to re-derive, not because the decision is open.
 
 Everything now TRUE OF THE APP has moved to the reference docs, which are the
 ones to trust: the claude status line, its three measurements and the

@@ -399,6 +399,52 @@ directory; the CLI token and `projects.json` are siblings and stay denied. See
 [gotchas.md](gotchas.md) "A rendered sandbox rule can be inert" for why the
 test asserts byte offsets rather than `contains`.
 
+## Prior art, researched 2026-09-05
+
+Every one of these ships today. Between them they have already answered most
+of the open questions in the original draft of this doc.
+
+| Project | Switch mechanism | Parallel accounts | Notes |
+|---|---|---|---|
+| [claude-swap](https://github.com/realiti4/claude-swap) | Keychain slot swap | yes, via per-session `CLAUDE_CONFIG_DIR` | Ships BOTH mechanisms because neither alone does everything. Holds claude's own credential locks while writing so a swap never interleaves with a refresh. `--share-history` symlinks `projects/` + `history.jsonl` so all accounts see one history. |
+| [claude-account-switcher](https://github.com/Symbioose/claude-account-switcher) | Keychain: backs accounts up under `claude-switcher:{email}`, restores into `Claude Code-credentials`, and updates `~/.claude.json` | no | Confirms the two-halves rule independently. Codex: whole `~/.codex/auth.json` backed up per email, restored at `0600`, requires `cli_auth_credentials_store = "file"`. Auto-switch at 100%, same provider only, off by default. |
+| [claude-multi](https://github.com/Chamanrajragu/claude-multi) | per-account `CLAUDE_CONFIG_DIR` | yes | The closest analogue to termic (a desktop app). On a limit error it reads the reset time, marks a cooldown, COPIES the transcript to the next account and re-issues the interrupted instruction with `--resume`. |
+| [ccswitch](https://github.com/vyshnavsdeepak/ccswitch) | Keychain via `security(1)` | no | Restart required, per its own docs. |
+| [codex-accounts](https://github.com/omarhoumz/codex-accounts) | SYMLINKS `~/.codex/auth.json` at the account's own file | yes, via `CODEX_HOME` | The symlink is the elegant part: codex refreshes the token in place, so the write lands in the account's own file and nothing goes stale. `config.toml` stays shared by symlink. |
+| [codex-multi-auth](https://github.com/ndycode/codex-multi-auth) | wrapper binary, routing state under `~/.codex/multi-auth/` | n/a | Health probes, quota cache, cooldown on repeated 5xx bursts. |
+
+Two things worth stealing outright:
+
+- **codex-accounts' symlink.** For codex, termic needs no env var and no
+  vault: point `~/.codex/auth.json` at the selected account's file and let
+  codex's own in-place refresh write through to it. Decision 1 is satisfied,
+  sessions stay in `~/.codex`, and the staleness problem does not exist.
+  Requires `cli_auth_credentials_store = "file"` so the credential is not in
+  the OS keyring.
+- **claude-swap's credential lock cooperation.** It takes claude's own lock
+  while writing so a swap can never interleave with a token refresh. That is
+  the shape to copy, and it replaces the "hold a lock past exec" idea an
+  earlier draft of this doc had.
+
+(Its `--share-history` symlinking of `projects/` and `history.jsonl` is
+noted only for the record: it exists to undo the damage of per-account config
+dirs, which this plan does not create.)
+
+## What Anthropic actually bans
+
+Worth stating explicitly, since this ships in a public product. Anthropic's
+position, as reported by its own Claude Code team, is that holding several
+Max accounts is NOT a terms violation. What draws suspensions is routing
+subscription OAuth tokens through third-party clients and relay servers that
+impersonate the official client.
+
+The architecture Anthropic has publicly accepted is the one where each
+account authenticates through the official OAuth flow and the official
+binary does the talking, isolated per `CLAUDE_CONFIG_DIR` (a variable
+documented in Anthropic's own environment reference). termic running the
+real `claude` binary keeps it on the right side of that line either way,
+since termic never speaks to the API itself. The config-dir isolation this ships is literally that blessed pattern; lifting a token blob out of the Keychain and planting it elsewhere, which termic does NOT do, is the part no vendor has blessed. A product risk to weigh, not a legal opinion.
+
 ## Known gaps
 
 - **copilot and muse get no switcher, deliberately.** copilot keys its libsecret

@@ -180,7 +180,7 @@ pub fn resolve_agent(agents: &[crate::Agent], id: &str) -> Option<crate::Agent> 
 /// agent moves its credential, the fix is one row here, not a new impl.
 ///
 /// Every variant exists because an agent measured that way; there is no
-/// speculative shape. See docs/plans/agent-credentials.md for the
+/// speculative shape. See docs/agent-accounts.md for the
 /// measurements, and `login_store` below for which agent is which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginStore {

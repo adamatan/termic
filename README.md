@@ -406,35 +406,6 @@ specs and get an issue at the same time. That is the whole promotion path:
 
 - **Mobile app.** ([#165](https://github.com/simion/termic/issues/165)) A
   companion app for checking on and steering tasks while away from the Mac.
-- **MCP server endpoint, phases B1 and B2.** A scoped control plane an agent
-  can call without being handed a terminal. Phase A (the stateless endpoint,
-  the settings surface, one-click client setup) shipped in 1.0.0; the per-task
-  bearer token that answers which task is calling and what it may do is what is
-  left, and the 2026-07-28 spec revision reopened enough of the design that it
-  is an idea again rather than a plan.
-  [docs/ideas/mcp.md](docs/ideas/mcp.md).
-- **Intentional agent-driven orchestration.** The plumbing already ships:
-  an agent can spawn a task with `--wait`, prompt another, read its result
-  and branch on the exit code. What is missing is intent, and an opinion
-  about shape (fan out, queue behind, supervisor and workers).
-  [docs/ideas/agent-orchestration.md](docs/ideas/agent-orchestration.md).
-- **Windows support, then Windows prebuilts.** Linux AppImage CI is live;
-  the Windows MSI is the matching matrix entry, and it depends on the app
-  compiling on Windows at all. The audit in
-  [docs/ideas/windows.md](docs/ideas/windows.md) is a prediction: nothing in
-  it has been built on Windows yet.
-- **Profiles.** ([#280](https://github.com/simion/termic/issues/280)) A fully
-  isolated instance with its own window, projects, tasks and settings, so work
-  and personal stay in separate windows on separate monitors.
-  [docs/profiles.md](docs/profiles.md).
-- **Several accounts per agent.**
-  ([#278](https://github.com/simion/termic/issues/278)) Add both subscriptions
-  once, pick which one a profile uses, and switch a running task to the other
-  when the first one hits its limit, without losing the conversation.
-  [docs/plans/agent-credentials.md](docs/plans/agent-credentials.md).
-- **Ambient agent status.** A Dock tile, or a strip beside the Dock, showing
-  what every agent is doing without bringing the window forward.
-  [docs/ideas/dock-widget.md](docs/ideas/dock-widget.md).
 - **Import Warp and Ghostty themes.** Termic has a native JSON theme format,
   but two large theme ecosystems already exist and neither is ours. Scan
   both directories, translate, and let people pick from the library they
@@ -459,6 +430,42 @@ specs and get an issue at the same time. That is the whole promotion path:
   [stars](https://github.com/simion/termic/stargazers) are the realistic
   lane, and at 225 the same PR gets reopened.
 
+
+### Ideas
+
+- **Windows support, then Windows prebuilts.** Linux AppImage CI is live;
+  the Windows MSI is the matching matrix entry, and it depends on the app
+  compiling on Windows at all. The audit in
+  [docs/ideas/windows.md](docs/ideas/windows.md) is a prediction: nothing in
+  it has been built on Windows yet.
+- **MCP server endpoint, phases B1 and B2.** A scoped control plane an agent
+  can call without being handed a terminal. Phase A (the stateless endpoint,
+  the settings surface, one-click client setup) shipped in 1.0.0; the per-task
+  bearer token that answers which task is calling and what it may do is what is
+  left, and the 2026-07-28 spec revision reopened enough of the design that it
+  is an idea again rather than a plan.
+  [docs/ideas/mcp.md](docs/ideas/mcp.md).
+- **Intentional agent-driven orchestration.** The plumbing already ships:
+  an agent can spawn a task with `--wait`, prompt another, read its result
+  and branch on the exit code. What is missing is intent, and an opinion
+  about shape (fan out, queue behind, supervisor and workers).
+  [docs/ideas/agent-orchestration.md](docs/ideas/agent-orchestration.md).
+- **Ambient agent status.** A Dock tile, or a strip beside the Dock, showing
+  what every agent is doing without bringing the window forward.
+  [docs/ideas/dock-widget.md](docs/ideas/dock-widget.md).
+- **Fixing a language server that answers badly.** Code intelligence ships,
+  but when a server picks the wrong interpreter or indexes the wrong root
+  there is nothing to turn. What the knobs should be, and which of them a
+  user should ever see, is undecided.
+  [docs/ideas/lsp-tuning.md](docs/ideas/lsp-tuning.md).
+- **Pointing at a new feature, once.** A shipped control nobody can find is
+  not shipped. A tip that fires once after an upgrade, next to the thing it
+  is about, is the missing rung between a changelog line and a 16px button.
+  [docs/ideas/feature-tips.md](docs/ideas/feature-tips.md).
+- **The rest of the usage footer.** The chip ships, and the questions it
+  left open did not: what to show before an agent has taken its first turn,
+  and whether the status line slot is the right thing to occupy at all.
+  [docs/ideas/usage-footer.md](docs/ideas/usage-footer.md).
 
 
 ---
