@@ -32,10 +32,14 @@ From the #278 thread. These are decisions.
    dir carries ONLY the credential and identity: everything else is
    symlinked back to `~/.claude`, so no setting is ever duplicated. See "The
    profile dir is a symlink farm".
-3. **An account is added once, then assigned.** A profile's set is a
-   selection out of a single global list, not a fresh login per profile.
-   Re-entering the same account per profile was rejected explicitly: it is
-   tedious, and the copies drift so one profile ends up on a stale token.
+3. **An account is added once per REALM, and shared by name.** Revised
+   2026-09-06: the store is keyed by the account's name
+   (`logins/<agent>/<name>/`), so two profiles using the same name resolve to
+   the same directory and the second is already signed in. Re-entering the
+   same account per profile stays rejected, for the reason it always was: the
+   copies drift and one profile ends up on a stale token. What DOES require a
+   second sign-in is the other realm, because Docker never reads the host's
+   config dir. See "Where it lives, and how a login is keyed".
 4. **Optional auto-switch when a limit is reached**, and **the rotation pool
    is per profile**. A work profile rotates among work accounts and never
    falls back to a personal one, because that mixes billing and defeats the
@@ -46,6 +50,163 @@ From the #278 thread. These are decisions.
    switch happens. Picking the account with the most headroom is a bonus
    over "the next one that is not maxed out"; the latter already solves the
    pain.
+
+## The shape of the feature: an account switcher, nothing wider
+
+Directed 2026-09-06. This ships as a **credentials / account switcher**. The
+only noun the user or the code models is a LOGIN. Config-dir relocation is the
+private mechanism that realises one, and it must not surface as a concept, a
+setting, or an abstraction anyone can reach.
+
+That distinction is easy to lose, because the mechanism is genuinely general:
+every agent is isolated by pointing an env var at a directory, and it would be
+a short step to ship "per-agent environment overlays" and call accounts a use
+case. **Do not.** A generic config switcher is a bigger surface, a worse
+explanation, and it invites states nobody designed (half-shared dirs, an
+account pointing at a path the user typed). termic already has the general
+thing for people who want it, in agent CLONES with their own `env` map.
+
+Concretely, in scope:
+
+- add an account, remove an account, list accounts, choose the default
+- see which account a session is running on, and switch a live one
+
+Concretely NOT in scope, and each of these is a way the feature would drift:
+
+- any UI naming a directory, a path or an env var
+- adopting an existing config dir as an account
+- exporting, backing up or importing a credential
+- per-account settings, models, or anything that is not a login
+
+### The rule that makes it small: termic never handles a secret
+
+Adding an account creates an EMPTY store and runs **the agent's own login
+command** inside it. The agent then writes its own credential wherever it
+likes, file or keychain, exactly as it does normally. Removing an account runs
+the agent's own logout and drops the store.
+
+termic never reads, copies, seeds or writes a credential. That is what the
+earlier draft got wrong: it contemplated staging `.credentials.json` and
+writing Keychain items directly, which is the part that carried the access
+prompts, the lock-interleaving worry, and most of the ToS exposure. None of
+that is needed to switch accounts, so none of it should be built.
+
+It also collapses the per-agent difference to two facts: where to point the
+agent, and what its login command is called. An agent nobody has mapped in
+detail still works if it has a relocation variable.
+
+## Where it lives, and how a login is keyed
+
+Directed 2026-09-06.
+
+**Accounts hang off the AGENT, not a global Accounts page.** Adding a second
+login is a per-agent decision, so the surface is the agent's own card in
+Settings -> Agents: a row directly under the card header (icon, name, id,
+`extends` badge) and above the command fields. "Who is this signed in as" reads
+before "how does it run", and there is no separate page to find.
+
+**The credential set is defined once per agent.** The list of account names and
+which one is default live on the agent entry, so they are profile-scoped for
+free: `settings.agents[]` is already per profile after phase 1, and a work
+profile naming a different default is the whole point.
+
+### The store is keyed by NAME, and that is what shares a login
+
+```
+<data>/logins/<agent>/<name>/               the host login
+<data>/docker-agents/<agent>/<name>/        the Docker login
+```
+
+No generated ids. The name IS the key, and the sharing falls out of it: two
+profiles that both use an account called "Work" resolve to the same directory,
+so the second one is already signed in. Nothing selects, syncs or copies a
+credential; they simply address the same path.
+
+**Two realms means two logins, and that is expected rather than a gap.** Docker
+mode deliberately never touches the host's real config dir (`docker-agents/` is
+termic-owned, pinned by `the_docker_login_dir_is_termic_owned_never_the_real_home`),
+so a login performed on the host is not visible inside a container and vice
+versa. A user signs in once per realm, and each realm then shares that login
+across every profile. Presenting this as one account with two sign-in states is
+honest; presenting it as one login that mysteriously does not work in Docker is
+not.
+
+### The name is frozen at creation, for a measured reason
+
+Keying on the name means the name is a path, and for claude the path is
+load-bearing beyond the filesystem: its Keychain service is
+`Claude Code-credentials-<sha256(config_dir)[..8]>`. Rename the account, the
+directory moves, the hash changes, and the credential can no longer be found.
+The user is silently logged out of an account that is still perfectly valid.
+
+So renaming is not offered. Remove and add, which is honest about what it costs
+(one sign-in) instead of hiding a logout behind an edit. This is the same rule
+as a profile's slug, arrived at from a different direction: both are names that
+key a directory something else is derived from.
+
+Names are slugified the same way profile slugs are (lowercase, filesystem-safe,
+deduped), for the same reason: they become a path segment.
+
+### Three surfaces, and which one discovers what
+
+**The usage popover is the primary discovery vector**, and it is the best one
+available because of WHEN it is open: a user clicks the usage chip when they
+are near a limit, which is the exact moment a second account becomes
+interesting. It gets a row: **"Add a different set of credentials..."**, opening
+Settings at that agent's card.
+
+`UsageChip` already anticipates this. Its icon comment says "two DIFFERENT
+agents are told apart right here... two accounts of the SAME agent are told
+apart in the popover", and its `agentId` prop is documented as "the agent ENTRY
+id (a clone keeps its own), which is the account key". That clone-as-account-key
+is precisely the workaround this feature replaces, so the popover becomes the
+account surface it was already described as, and the key becomes
+(agent, account) instead of the entry id.
+
+It also already solves the realm problem: the `docker` prop exists because a
+caged codex "logs in INSIDE the container, so its quota belongs to the config
+dir termic mounts there, not to the host's `~/.codex`. Reporting the host's
+would put another account's number under this task's name." That is the same
+two-realm rule this document arrived at separately, already implemented.
+
+**But it cannot be the only vector.** The chip renders `null` until an account
+has actually reported, deliberately, so that an agent with no usage feed costs
+the footer nothing. Today only claude (status line) and codex (app-server)
+report, so six of the eight built-ins never show it at all.
+
+| Surface | Job | Covers |
+|---|---|---|
+| Usage popover row | discovery at the moment of need | claude, codex |
+| Row at the top of the agent's card | discovery and management | all eight |
+| Account pill, appears at 2+ | see which account, switch it | all eight |
+
+### Why the pill is not always visible
+
+Tempting, and it was considered: a permanently visible pill would make the
+feature obvious. It founders on naming.
+
+Before a second credential set exists there is no account concept at all. The
+user has "whatever claude is logged into" and has never named it, so an
+always-visible pill has to invent a label for it. Calling it "Default" is
+exactly the trap profiles avoided: the strip there does not exist until the
+first profile is created, and creating it NAMES the existing install in the
+same step.
+
+Accounts take the same answer for the same reason. The pill appears when the
+second credential set is added, and that flow names the existing login at the
+same moment ("your current login" becomes "Personal", or whatever the user
+calls it). Nothing is ever labelled with a name the user did not choose, and
+the footer costs no width for the single-login case, which is the
+overwhelmingly common one and the case `UsageChip`'s own self-hiding rule was
+written for.
+
+### What a profile actually owns
+
+Not logins. It owns the list of account names offered for an agent and which is
+default. An account named in a profile that has never been signed in on this
+machine is a legitimate state and must read as "not signed in" rather than
+fail: that is exactly what a second machine, or the Docker realm before its
+first login, looks like.
 
 ## What is measured
 
@@ -285,45 +446,146 @@ Two things worth stealing outright:
 noted only for the record: it exists to undo the damage of per-account config
 dirs, which this plan does not create.)
 
-## Auto-switch
+## Reaching the limit: offer, and optionally act
+
+Directed 2026-09-06: BOTH must exist. An offer in the popover when the limit is
+reached or close, and an opt-in that switches without asking.
 
 The detection half already ships. `merge_statusline`
 (`src-tauri/src/agent_hooks.rs`) claims claude's `statusLine` slot when it is
 free or already ours, and claude pipes `rate_limits` (`five_hour` and
 `seven_day`, each `used_percentage` plus `resets_at`) into it on every turn.
-`src/lib/agentUsage.ts` parses the feed off the OSC channel, and the codex
-half comes typed from `codex app-server` over JSON-RPC. "Which account has
-headroom" is answerable today for the two agents that matter most.
+`src/lib/agentUsage.ts` parses that off the OSC channel; the codex half comes
+typed from `codex app-server`.
 
-Recommended shape:
+### Session or weekly is already answered
 
-- **Offer by default, auto behind an explicit opt-in.** Auto-switching
-  mid-turn discards in-flight work, and a false positive burns the second
-  account's quota too, which is the one thing the feature exists to protect.
-- **Order the pool by headroom** when usage is known, falling back to the
-  first entry that is not maxed. Both are cheap; the data is already there.
-- **Never leave the profile's pool.** If every account in it is maxed, say so
-  and wait for the earliest reset rather than reaching for one belonging to
-  another profile. The per-profile config dir makes this structural: a
-  rotation can only write its own profile's credential store.
+`drivingWindow()` returns whichever window is CLOSEST TO ITS LIMIT, not
+whichever is shorter, precisely so "30% of five hours next to 95% of the week"
+reads as a warning. The switch trigger reads the driver, so it needs no new
+logic and cannot be fooled by a fresh session window on a spent week.
 
-## Per agent, because only claude is a Keychain
+### The threshold is a THIRD band, above the chip's own
 
-| Agent | Credential lives in | Identity lives in | Swap in place |
+`USAGE_WARN_PERCENT` is 70 and `USAGE_CRITICAL_PERCENT` is 90, and the chip
+already turns red at 90. Hanging the switch offer on `critical` would make it
+fire constantly and be trained away within a day. It needs its own band above
+that: 95 by default, with 98 and "only when actually blocked" as the other
+choices.
+
+### Offering and acting are different mechanics, not one feature with a flag
+
+They fire at different moments and cost different things, which is the reason
+to build both rather than treat auto as offer-without-the-dialog:
+
+| | Fires | In-flight work | Recovery |
 |---|---|---|---|
-| claude | Keychain item, service keyed by config dir hash | `$CONFIG/.claude.json` `oauthAccount` | yes, both halves |
-| codex | `$CODEX_HOME/auth.json` | same file | yes, file write |
-| grok | `$GROK_HOME/auth.json`, keyed `provider::id` | same file | yes, already models several accounts |
-| agy / gemini | `$DIR/oauth_creds.json` + `google_accounts.json` | `google_accounts.json` is literally `{active, old[]}` | yes, already models several |
-| opencode | SQLite `credential` table | `account` table, has an `active` column | row update, real work |
-| pi | `~/.pi/agent/auth.json` | unknown | out of scope for v1 |
-| copilot | untested, not installed on the measuring machine | unknown | unknown |
+| **Offer** (near the limit, e.g. 95%) | at the next TURN BOUNDARY, never mid-turn | nothing is lost: the user is not blocked yet | none needed, the switch is clean |
+| **Act** (limit reached) | after the turn has already failed | already lost | switch, then resume the session |
 
-So the swap is a per-agent descriptor, not one mechanism: where the
-credential lives, how to write it, and where the matching identity lives.
-Three of these (grok, gemini, opencode) already carry several accounts
-internally and expose an active flag, so driving their own switch may be
-cheaper and safer than writing their stores. Not investigated.
+A proactive switch must wait for the boundary, because there is nothing to
+recover and interrupting a working turn to avoid a limit the user has not hit
+is strictly worse than doing nothing. A reactive one happens after a failure,
+where there is nothing left to lose. Auto-switching mid-turn on a THRESHOLD is
+the one combination to refuse.
+
+### The setting is per agent, like the credentials it switches
+
+Accounts hang off the agent entry, so the threshold does too, and is
+profile-scoped by the same inheritance. A work profile can auto-switch
+aggressively while a personal one asks every time.
+
+### Six of the eight agents cannot have this, and the UI must not pretend
+
+Proactive switching needs a usage feed, and only claude and codex have one:
+`UsageChip` renders nothing for the rest, and there is no number to threshold.
+For those six the only honest trigger is the agent failing, and detecting THAT
+means pattern-matching agent output, which is fragile enough that it should not
+be the thing a promise rests on.
+
+So: offer and auto for claude and codex, and no setting shown on an agent that
+cannot honour it. An auto-switch toggle that silently never fires is worse than
+its absence.
+
+**Manual switching is universal and first-class, not the fallback for the six.**
+Every agent gets multiple credential sets and a ONE-CLICK switch: the pill lists
+the accounts, clicking one switches to it. No submenu, no confirmation, no trip
+through Settings. Auto-switching is a convenience layered on top for the two
+agents that can measure themselves; the manual path is the feature, and it is
+the same interaction on all eight.
+
+That ordering matters for the build: the switch has to work by hand for
+everything before any threshold logic exists, which is why P4 (switch a live
+tab) precedes P5 (auto) and does not depend on it.
+
+### Still true from the first pass
+
+- **Auto behind an explicit opt-in**, off by default. A false positive burns
+  the second account's quota too, which is the thing the feature exists to
+  protect.
+- **Order the pool by headroom** when usage is known, falling back to the first
+  entry that is not maxed.
+- **Never leave the profile's pool.** If every account in it is maxed, say so
+  and name the earliest `resets_at` rather than reaching for an account
+  belonging to another profile.
+
+## Per agent: all eight built-ins, measured 2026-09-06
+
+All eight, copilot included (installed for this pass). Method unchanged: point
+the candidate variable at an empty dir and see whether the CLI loses its login.
+
+| Agent | Credential | Isolation boundary (measured) | Two live at once |
+|---|---|---|---|
+| claude | macOS Keychain, service `Claude Code-credentials-<sha256(dir)[..8]>` | `CLAUDE_CONFIG_DIR`, whole dir | **yes**, the hash keys a separate slot per dir |
+| codex | `$CODEX_HOME/auth.json` | `CODEX_HOME`, whole dir | yes, plain file |
+| copilot | under `$COPILOT_HOME` (default `~/.copilot`) | `COPILOT_HOME`, whole dir. **Also `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, which take precedence over stored credentials** | yes, by either route |
+| agy / gemini | `$DIR/oauth_creds.json` + `google_accounts.json` (`{active, old[]}`) | `GEMINI_CLI_HOME`, a PARENT: it appends `.gemini` | yes, plain files |
+| grok | `$GROK_HOME/auth.json`, keyed `<issuer>::<uuid>`, one entry per account carrying both halves | `GROK_HOME`. Auth follows it; the BINARY and bundled skills do not | yes, plain file |
+| opencode | `$XDG_DATA_HOME/opencode/auth.json` + SQLite | `XDG_DATA_HOME` only, a generic root other tools read too | yes, but the variable is broader than the agent |
+| pi | `~/.pi/agent/auth.json`, keyed by provider, `accountId` beside `access`/`refresh`/`expires` | **`HOME` override only.** No dedicated variable exists | yes, plain file |
+| muse | **OS keychain.** `~/.config/muse/auth.json` is the INDEX (`storage: "keychain"`, plus `mechanism`, `obtained_via`, `user_email`); no secret is in the file | `XDG_CONFIG_HOME` moves the index, which is enough to isolate | **unresolved**, see below |
+
+### Not one of the eight exposes an account switch
+
+The first pass hoped the agents that model several accounts internally would
+expose a switch worth driving. Measured, they do not:
+
+- `claude auth` is `login` / `logout` / `status`.
+- `grok` has `login` / `logout`, no switch, though its `auth.json` is keyed per
+  account and holds several.
+- `opencode auth` is `list` / `login` / `logout`.
+- `pi auth` is read-only introspection (`print-api-key`, `print-bearer-token`,
+  `check`); it refreshes an expired OAuth credential but selects nothing.
+- gemini has no account flag, though `google_accounts.json` is literally
+  `{"active": <string>, "old": []}`.
+
+"Models several accounts" means the FILE FORMAT holds several. No CLI picks
+between them. So relocation is the mechanism for every agent, and the tier that
+would have avoided it does not exist. Worth stating plainly, because it is the
+one thing a reader would otherwise assume from the file formats.
+
+### muse is the open question
+
+Its metadata file says `storage: "keychain"` and carries no secret, so the
+credential is in the OS keychain like claude's. But no item under a muse-ish
+service name appears in `login.keychain-db`, which claude's four
+`Claude Code-credentials-<hash>` items do, so muse is likely using the
+data-protection keychain that `security(1)` cannot enumerate the same way.
+
+**What is unresolved is whether that item is keyed per config dir.** If it is,
+muse behaves like claude and two accounts can be live at once. If it is one
+fixed item, muse can only ever switch serially, however many config dirs exist.
+Relocating `XDG_CONFIG_HOME` isolates the INDEX, which is not the same thing.
+Decide this by measurement before promising muse parallel accounts.
+
+### copilot is the easy one, and the only true credentials-only case
+
+`COPILOT_GITHUB_TOKEN` (or `GH_TOKEN` / `GITHUB_TOKEN`) takes precedence over
+whatever is stored, and a GitHub token is long-lived. That is a real
+credentials-only swap with no directory involved, and it is exactly what
+`CLAUDE_CODE_OAUTH_TOKEN` failed to be for claude (inference-only, no refresh).
+Documented rather than measured here: the account it would authenticate is the
+maintainer's, so a real login was not performed.
 
 ## Keychain access: answered, with a catch
 
@@ -369,6 +631,80 @@ since termic never speaks to the API itself. But note that option 2 above is
 literally the blessed pattern, while lifting the token blob out of the
 Keychain and planting it elsewhere is the part no vendor has blessed. That
 is a product risk to weigh, not a legal opinion.
+
+## Macro plan
+
+Five layers, and only the middle one is a noun anyone outside the module says.
+
+**L1. `LoginStore`, private.** How to point one agent at one store. Six shapes,
+all measured, and the list is closed by what the fleet actually does:
+
+```
+ConfigDir { env }              claude, codex, copilot, grok
+ParentDir { env, suffix }      gemini / agy   (the var is a PARENT: it appends .gemini)
+XdgData   { env }              opencode       (generic root, shared with other tools)
+XdgConfig { env }              muse           (moves the index; see the open question)
+HomeOnly                       pi             (no dedicated var; HOME override, measured)
+TokenVar  { vars }             copilot        (GH token takes precedence, no dir at all)
+```
+
+This extends `agent_dirs`, which already resolves *dedicated var -> HOME
+override -> default*. Two shapes it cannot express today are the parent
+semantics and the token route. No UI, no account model: a pure function from
+(agent, store path) to an env overlay, with a unit test per shape.
+
+**L2. `Account`, the only public noun.**
+
+```
+Account { id, agent_id, label, identity (cached), added_at, last_used_at }
+```
+
+Note what is absent: no path, no env, no credential, no config dir. Where the
+login lives is derived from the id by L1, never stored. Accounts belong to a
+PROFILE, which is what makes the rotation pool per profile without a second
+mechanism.
+
+**L3. Verbs, all of them login verbs.** `account_add` creates an empty store
+and spawns the agent's own login command in a PTY (termic already spawns PTYs;
+this is one without a task). `account_remove` runs the agent's own logout, then
+drops the store. Plus list, set-default. There is deliberately no verb that
+takes a path.
+
+**L4. Spawn integration.** `pty_spawn` already composes an env overlay for an
+agent entry. It gains one line: the selected account's overlay from L1. This is
+the whole runtime cost of the feature.
+
+**L5. Non-duplication.** For the agents whose store is a whole config dir, the
+new dir gets symlinks back to the primary for settings, instructions, skills,
+commands and history, so a second account does not fork the user's setup. This
+is invisible: the user never learns a directory exists.
+
+### Order, and what each step is worth alone
+
+| | Step | Ships what |
+|---|---|---|
+| P0 | Measure muse's keychain keying | decides parallel vs serial for one agent; blocks promising either |
+| P1 | L1 tables + resolution | nothing user-visible, fully unit-tested |
+| P2 | L2 + L3: accounts, add / remove / list | a user can hold two logins for an agent |
+| P3 | L4 + "signed in as" in the UI | new tasks and tabs run on a chosen account |
+| P4 | Switch a LIVE tab and resume | the actual #278 ask |
+| P5 | Auto-switch on limit (optional) | the convenience on top |
+
+P4 is the point of the feature and P1 to P3 exist to make it possible, so the
+plan is not done at P3 even though P3 demos well.
+
+### Known rough edges, carried forward rather than discovered later
+
+- **opencode** rides `XDG_DATA_HOME`, which other tools in the same shell read.
+  Setting it for an agent spawn is broader than the agent, and the UI should
+  say so rather than pretend it is agent-local.
+- **pi** has only a `HOME` override, so its store has to be a home-shaped
+  directory with enough in it that the agent does not misbehave for reasons
+  unrelated to login.
+- **muse** is unresolved (P0).
+- **copilot** can go the token route with no directory at all, which is
+  cheaper, but it is a different auth path from `copilot login`. Decide whether
+  consistency with the other seven is worth more than skipping the directory.
 
 ## Open, in the order that decides the design
 

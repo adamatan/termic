@@ -1918,6 +1918,81 @@ mod tests {
         assert!(cfg_mount.host.ends_with("docker-agents/next-claude"), "{}", cfg_mount.host);
     }
 
+    // ── the Docker credential realm, for the account switcher (GH #278) ──
+    //
+    // Docker mode keeps agent logins somewhere COMPLETELY separate from the
+    // host: `<data>/docker-agents/<agent-id>`, bind-mounted at the container's
+    // config dir. So an account switcher has two storage realms, not one, and
+    // these pin what the Docker one actually does today rather than what the
+    // design assumes about it.
+
+    #[test]
+    fn a_docker_login_is_keyed_by_agent_id_and_nothing_else() {
+        // THE GAP. Two accounts of the SAME agent resolve to one host dir, so
+        // in Docker mode they would share a login however the host side is
+        // arranged. Whatever the switcher stores an account under, this level
+        // has to grow it.
+        with_scratch_data_dir(|| {
+            assert_eq!(agent_config_host_dir("claude"), agent_config_host_dir("claude"));
+            assert_ne!(agent_config_host_dir("claude"), agent_config_host_dir("next-claude"));
+        });
+    }
+
+    #[test]
+    fn the_docker_login_dir_is_termic_owned_never_the_real_home() {
+        // Full isolation from the OS agent is the point: a Docker task must
+        // never read or write the user's real ~/.claude.
+        with_scratch_data_dir(|| {
+            let d = agent_config_host_dir("claude");
+            assert!(d.to_string_lossy().contains("docker-agents"), "{}", d.display());
+            let home = std::env::var("HOME").unwrap_or_default();
+            assert!(!d.starts_with(format!("{home}/.claude")), "{}", d.display());
+        });
+    }
+
+    #[test]
+    fn every_relocating_agent_gets_its_own_docker_dir_and_relocation_var() {
+        // The switcher's Docker half only works for agents whose config dir
+        // can be mounted AND pointed at. This walks the built-ins rather than
+        // asserting claude alone, so an agent added later shows up here.
+        with_scratch_data_dir(|| {
+            for (agent, container) in [
+                ("claude", "/root/.claude"),
+                ("codex", "/root/.codex"),
+            ] {
+                let task = stub_task("t-realm", "/tmp/termic-docker-test-does-not-exist");
+                let env = std::collections::HashMap::new();
+                let spec = build_spec(&task, agent, "img", &task.path, vec![], &env,
+                    &[], false, &[], &[], "pty-realm00001", agent, &[]);
+                let m = spec.mounts.iter().find(|m| m.container == container)
+                    .unwrap_or_else(|| panic!("{agent}: no config mount at {container}"));
+                assert!(m.host.contains(&format!("docker-agents/{agent}")), "{agent}: {}", m.host);
+                let var = crate::agent_dirs::config_relocation_env(agent)
+                    .unwrap_or_else(|| panic!("{agent} should relocate"));
+                assert!(spec.env.iter().any(|(k, v)| k == var && v == container),
+                    "{agent}: {var} must point at the mount or the login lands in the throwaway layer");
+            }
+        });
+    }
+
+    #[test]
+    fn an_agent_with_no_relocation_var_still_gets_its_dir_mounted() {
+        // gemini-family and opencode have no relocation var, so the mount
+        // alone has to carry the login: the agent writes to its default path
+        // and that path IS the mount. Worth pinning, because it is the case
+        // where the switcher cannot lean on an env var at all.
+        with_scratch_data_dir(|| {
+            let task = stub_task("t-noreloc", "/tmp/termic-docker-test-does-not-exist");
+            let env = std::collections::HashMap::new();
+            let spec = build_spec(&task, "agy", "img", &task.path, vec![], &env,
+                &[], false, &[], &[], "pty-noreloc0001", "agy", &[]);
+            let m = spec.mounts.iter().find(|m| m.container == "/root/.gemini")
+                .expect("agy's primary config dir must be mounted");
+            assert!(m.host.contains("docker-agents/agy"), "{}", m.host);
+            assert!(crate::agent_dirs::config_relocation_env("agy").is_none());
+        });
+    }
+
     /// Point `global_dir()` at a scratch profile for the duration of a test.
     /// `build_spec` CREATES the agent config dir now, and `global_dir()` in a
     /// test otherwise resolves to the developer's REAL profile - so without

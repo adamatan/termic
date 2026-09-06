@@ -256,6 +256,81 @@ mod instance_dir_tests {
     }
     const HOME: &str = "/Users/u";
 
+    // ── what the account switcher can and cannot express today (GH #278) ──
+    //
+    // The host realm's counterpart to docker.rs's realm tests. Measured
+    // 2026-09-06: every built-in has SOME way to isolate a login, but only two
+    // of them are expressible through this module, so these pin the gap rather
+    // than the wish.
+
+    #[test]
+    fn only_two_agents_have_a_relocation_var_today() {
+        // The switcher needs one per agent. Six of the eight built-ins return
+        // None here, so on the host they currently have no login isolation at
+        // all, whatever their CLI supports.
+        let have: Vec<&str> = ["claude", "codex", "copilot", "agy", "grok", "opencode", "pi", "muse"]
+            .into_iter()
+            .filter(|a| config_relocation_env(a).is_some())
+            .collect();
+        assert_eq!(have, vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn the_measured_boundaries_do_not_fit_this_tables_shape() {
+        // `config_relocation_env` returns a bare var name, which can only ever
+        // mean "this var IS the config dir". Three of the measured boundaries
+        // mean something else, so adding them here as plain names would be
+        // WRONG rather than merely incomplete:
+        //
+        //   gemini / agy   GEMINI_CLI_HOME is a PARENT; the agent appends
+        //                  `.gemini`, so setting it to the store path puts the
+        //                  config one level deeper than the caller expects.
+        //   opencode       XDG_DATA_HOME is a generic root other tools read,
+        //                  and opencode's own dir hangs off it.
+        //   muse           XDG_CONFIG_HOME moves the metadata INDEX; the
+        //                  secret is in the OS keychain, so relocating the var
+        //                  does not by itself give a second live account.
+        //
+        // Documented as a test so the next person to "just add gemini" here
+        // fails instead of shipping a subtly wrong path.
+        for agent in ["agy", "opencode", "muse", "pi", "grok", "copilot"] {
+            assert!(
+                config_relocation_env(agent).is_none(),
+                "{agent} was added to config_relocation_env as a plain var name. \
+                 Its boundary is not a config dir (see docs/plans/agent-credentials.md); \
+                 the table has to carry the SHAPE before this agent can be listed.",
+            );
+        }
+    }
+
+    #[test]
+    fn a_login_is_isolated_per_agent_entry_not_per_account() {
+        // The symmetrical gap to docker.rs's
+        // `a_docker_login_is_keyed_by_agent_id_and_nothing_else`: on the host
+        // too, the only thing that separates two logins today is a different
+        // agent ENTRY. That is the clone workaround, and it is what the
+        // account switcher replaces.
+        let plain = vec![agent("claude", None, &[])];
+        let cloned = vec![
+            agent("claude", None, &[]),
+            agent("next-claude", Some("claude"), &[("CLAUDE_CONFIG_DIR", "~/.next-claude")]),
+        ];
+        assert_eq!(
+            instance_config_dir(&plain, "claude", Path::new(HOME)),
+            Some(PathBuf::from("/Users/u/.claude")),
+        );
+        assert_eq!(
+            instance_config_dir(&cloned, "next-claude", Path::new(HOME)),
+            Some(PathBuf::from("/Users/u/.next-claude")),
+        );
+        // Two ACCOUNTS of the same entry are indistinguishable: there is
+        // nowhere to say which one is meant.
+        assert_eq!(
+            instance_config_dir(&cloned, "claude", Path::new(HOME)),
+            instance_config_dir(&cloned, "claude", Path::new(HOME)),
+        );
+    }
+
     #[test]
     fn a_plain_agent_uses_its_own_default_dir() {
         let agents = vec![agent("claude", None, &[])];
