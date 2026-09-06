@@ -205,6 +205,23 @@ Lower-value or high-setup items left for later; the patterns to do them are all 
 - **File create/rename/delete via context menu, file-tree reveal** — need Radix context-menu driving (flaky, no clean IPC). Binary previews are no longer on this list: image preview is covered by `files.e2e.ts`, PDF preview by `editor.e2e.ts` (which builds a tiny valid PDF inline rather than committing a fixture).
 - **Prompts management, keybindings editor** — config-file editing, low value.
 
+**Profiles: two live windows side by side (GH #280).** `profiles.e2e.ts`
+asserts isolation through the app's own IPC, not through two real windows,
+because the suite launches ONE window per spec file and reuses it: a second
+one leaks into every spec that runs afterwards, and the handle-count
+assertions in this spec are what caught that when `profile_open` first left
+its window behind. `profile_open` and `profile_close` ARE covered end to end
+(a window really is created and really is closed); what is not covered is two
+windows rendering disjoint sidebars at the same instant. The Rust side of that
+isolation is covered instead, by `load_all_sees_every_profile_and_load_in_sees_exactly_one`
+and the tag round-trip tests.
+
+**Profiles: the tray merge and the emit broadcast fallback.**
+`merged_tray_attention` and `emit_scoped`'s fallback both need an `AppHandle`,
+which cannot be constructed off a running app. Their inputs are unit-tested
+(`task_id_in_topic`, `window_for_task`, the memo invalidation); the merge
+itself is not. Worth an e2e case if the tray ever grows a second bug.
+
 ## Environment-limited (not robustly testable here)
 
 These are intentionally NOT covered by written specs — asserting them would be flaky or impossible in the occluded-window / embedded-WebDriver setup. Left as manual checks.

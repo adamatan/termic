@@ -4179,6 +4179,23 @@ fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool) -> R
         return Err("close the profile's window before deleting it".into());
     }
 
+    delete_profile_data(&g, &mut reg, &id, slug, delete_worktrees)
+}
+
+/// Everything a profile delete DOES, once the window precondition has passed.
+///
+/// Split out so the destructive half is testable without an `AppHandle`: this
+/// is the code that runs `git worktree remove --force` against the user's own
+/// repository, and an untested `--force` is how someone's uncommitted work
+/// disappears. See the tests in this file, which drive it against a real repo
+/// with a real worktree.
+fn delete_profile_data(
+    g: &Path,
+    reg: &mut profiles::Registry,
+    id: &ProfileId,
+    slug: &str,
+    delete_worktrees: bool,
+) -> Result<(), String> {
     // Back up the metadata FIRST, following the task migration's precedent. A
     // few JSON files, so it costs nothing and makes the cheap half of a
     // mistake recoverable. Worktrees are NOT backed up: they are large, and
@@ -4186,7 +4203,7 @@ fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool) -> R
     let stamp = chrono::Utc::now().to_rfc3339().replace(':', "-");
     let backup = g.join("backups").join(format!("pre-profile-delete-{slug}-{stamp}"));
     let _ = fs::create_dir_all(&backup);
-    let src = profiles::profile_dir(&g, &id);
+    let src = profiles::profile_dir(g, id);
     for f in ["settings.json", "projects.json"] {
         let _ = fs::copy(src.join(f), backup.join(f));
     }
@@ -4198,7 +4215,7 @@ fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool) -> R
     }
 
     if delete_worktrees {
-        for t in load_tasks_in(&id) {
+        for t in load_tasks_in(id) {
             // `is_main_checkout` points at the user's live repository, which
             // termic did not create and must not remove. Same reason archive
             // already skips `git worktree remove` for them.
@@ -4252,7 +4269,7 @@ fn profile_delete_sync(app: &AppHandle, slug: &str, delete_worktrees: bool) -> R
     // Deleting the LAST profile removes profiles.json entirely and returns the
     // app to its pre-profiles shape (save_registry does the unlink), which is
     // the property that makes trying the feature cheap.
-    profiles::save_registry(&g, &reg).map_err(|e| e.to_string())?;
+    profiles::save_registry(g, reg).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -19540,6 +19557,16 @@ static PENDING_DEEP_LINKS: parking_lot::Mutex<Vec<(String, String)>> =
 /// living in several profiles and the only sensible answer for a link naming
 /// no project at all.
 fn deep_link_target(app: &AppHandle, url: &str) -> String {
+    deep_link_project_label(url).unwrap_or_else(|| most_recent_profile_label(app))
+}
+
+/// The window label a `termic://` URL names through its `project` parameter,
+/// or `None` when it names none or names one nobody has.
+///
+/// Split from [`deep_link_target`] so it is testable: the fallback needs an
+/// `AppHandle` to ask which window is frontmost, and everything interesting
+/// about the routing happens before that.
+fn deep_link_project_label(url: &str) -> Option<String> {
     let project = url
         .split_once('?')
         .map(|(_, q)| q)
@@ -19547,13 +19574,14 @@ fn deep_link_target(app: &AppHandle, url: &str) -> String {
         .flat_map(|q| q.split('&'))
         .find_map(|kv| kv.strip_prefix("project="))
         .map(|v| percent_decode_loose(&v.replace('+', " ")));
-    if let Some(name) = project.as_deref().filter(|n| !n.is_empty()) {
+    let name = project.as_deref().map(str::trim).filter(|n| !n.is_empty())?;
+    {
         let hits: Vec<Project> = load_projects_all()
             .into_iter()
             .filter(|p| p.name.eq_ignore_ascii_case(name) || p.id == name)
             .collect();
         if hits.len() == 1 {
-            return hits[0].profile.window_label();
+            return Some(hits[0].profile.window_label());
         }
         if hits.len() > 1 {
             // The same project in several profiles: Chrome's rule, most
@@ -19575,11 +19603,11 @@ fn deep_link_target(app: &AppHandle, url: &str) -> String {
                 }
             }
             if let Some((_, label)) = best {
-                return label;
+                return Some(label);
             }
         }
     }
-    most_recent_profile_label(app)
+    None
 }
 
 /// Minimal `%XX` decoding, enough for a project name in a query string. Not a
@@ -19680,14 +19708,20 @@ pub(crate) fn queue_deep_link(app: &AppHandle, url: &str) {
 /// existed is picked up by the boot read instead of being lost.
 #[tauri::command]
 fn deep_link_take_pending(window: tauri::Window) -> Vec<String> {
-    // Drain only what is addressed to THIS window. The old `mem::take` handed
-    // the whole queue to whichever webview asked first, which with several
-    // profiles up meant one window swallowing another profile's links.
+    drain_deep_links_for(window.label())
+}
+
+/// Drain only what is addressed to THIS window.
+///
+/// The old implementation was a `std::mem::take` of the whole queue, which
+/// with one window was the single-reader property that made double-handling
+/// impossible, and with several is one profile eating another's links. Split
+/// from the command so the draining rule is testable without a window.
+fn drain_deep_links_for(label: &str) -> Vec<String> {
     let mut q = PENDING_DEEP_LINKS.lock();
-    let label = window.label().to_string();
     let mut mine = Vec::new();
     q.retain(|(target, url)| {
-        if *target == label {
+        if target == label {
             mine.push(url.clone());
             false
         } else {
@@ -20869,26 +20903,6 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_link_naming_a_project_is_queued_for_that_projects_window() {
-        with_scratch_data_dir(|data| {
-            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
-            crate::save_projects_in(&ProfileId::Root, &[a_project("p1", ProfileId::Root)]).unwrap();
-            let mut home = a_project("p2", ProfileId::Slug("home".into()));
-            home.name = "Side Project".into();
-            crate::save_projects_in(&ProfileId::Slug("home".into()), &[home]).unwrap();
-
-            // Resolution is by name (what a termic:// link carries), case
-            // insensitively, and `+`/%XX decoded.
-            let hits: Vec<String> = crate::load_projects_all()
-                .into_iter()
-                .filter(|p| p.name.eq_ignore_ascii_case("side project"))
-                .map(|p| p.profile.window_label())
-                .collect();
-            assert_eq!(hits, vec!["profile-home"]);
-        });
-    }
-
-    #[test]
     fn a_project_name_in_a_link_is_decoded_before_it_is_matched() {
         assert_eq!(crate::percent_decode_loose("Side%20Project"), "Side Project");
         assert_eq!(crate::percent_decode_loose("caf%C3%A9"), "café");
@@ -21030,6 +21044,232 @@ mod tests {
             assert_eq!(crate::load_settings_in(&ProfileId::Root).sandbox_default_rw_paths, vec!["/root/only"]);
             assert_eq!(crate::load_settings_in(&home).sandbox_default_rw_paths, vec!["/home/only"]);
         });
+    }
+
+    // ───── deleting a profile that actually OWNS worktrees ─────
+    //
+    // Every earlier delete test ran against zero tasks, so `git worktree
+    // remove --force` had never executed. That is the most destructive code
+    // in the feature, run against the USER'S OWN repository, so these drive
+    // it against a real repo with a real worktree.
+
+    /// A profile holding one worktree task, and one main-checkout task.
+    ///
+    /// The worktree gets its OWN tempdir rather than a sibling of the repo:
+    /// `repo.parent()` is the shared system temp root, so every test using
+    /// this fixture would race on one `wt-a` path and the second one in would
+    /// fail `git worktree add` on a directory the first left behind.
+    fn profile_with_worktrees(data: &std::path::Path)
+        -> (tempfile::TempDir, tempfile::TempDir, ProfileId, std::path::PathBuf, std::path::PathBuf)
+    {
+        let wt_dir = tempdir().unwrap();
+        let repo_dir = tempdir().unwrap();
+        let repo = repo_dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+
+        let mut reg = Registry::default();
+        crate::registry_add_profile(&mut reg, "Work", "orange", Some("Personal"), None).unwrap();
+        crate::profiles::save_registry(data, &reg).unwrap();
+        let id = ProfileId::Slug("work".into());
+
+        let wt = wt_dir.path().join("wt-a");
+        git_worktree_add(&repo, &wt, "task-a");
+
+        let mut proj = a_project("p1", id.clone());
+        proj.root_path = repo.to_string_lossy().into_owned();
+        crate::save_projects_in(&id, &[proj]).unwrap();
+
+        let mut t = a_task("t-wt", id.clone());
+        t.path = wt.to_string_lossy().into_owned();
+        crate::save_task(&t).unwrap();
+
+        // A main-checkout task points at the user's LIVE repo. It must never
+        // be removed, in either scope.
+        let mut m = a_task("t-main", id.clone());
+        m.path = repo.to_string_lossy().into_owned();
+        m.is_main_checkout = true;
+        crate::save_task(&m).unwrap();
+
+        (repo_dir, wt_dir, id, repo, wt)
+    }
+
+    #[test]
+    fn keeping_the_worktrees_leaves_every_one_of_them_on_disk() {
+        with_scratch_data_dir(|data| {
+            let (_rd, _wd, id, repo, wt) = profile_with_worktrees(data);
+            let mut reg = crate::profiles_registry();
+            crate::delete_profile_data(data, &mut reg, &id, "work", false).unwrap();
+
+            assert!(wt.exists(), "the keep scope removed a worktree");
+            assert!(repo.exists(), "the keep scope touched the user's repo");
+            // The profile's own metadata IS gone.
+            assert!(!data.join("profiles/work").exists());
+            assert!(crate::profiles_registry().get("work").is_none());
+        });
+    }
+
+    #[test]
+    fn deleting_the_worktrees_removes_them_through_git_and_spares_the_checkout() {
+        with_scratch_data_dir(|data| {
+            let (_rd, _wd, id, repo, wt) = profile_with_worktrees(data);
+            assert!(wt.exists());
+            let mut reg = crate::profiles_registry();
+            crate::delete_profile_data(data, &mut reg, &id, "work", true).unwrap();
+
+            assert!(!wt.exists(), "the worktree survived the delete");
+            // `is_main_checkout` points at the user's live repository, which
+            // termic did not create and must not remove.
+            assert!(repo.exists(), "the user's own checkout was deleted");
+            assert!(repo.join(".git").exists(), "the repo lost its .git");
+        });
+    }
+
+    #[test]
+    fn a_deleted_worktree_leaves_no_dangling_registration_in_the_parent_repo() {
+        // The reason this goes through `git worktree remove --force` rather
+        // than remove_dir_all: a blind recursive delete leaves the parent repo
+        // listing a worktree that is not there until someone runs `git
+        // worktree prune`, and the parent repo is the user's own.
+        with_scratch_data_dir(|data| {
+            let (_rd, _wd, id, repo, _wt) = profile_with_worktrees(data);
+            let mut reg = crate::profiles_registry();
+            crate::delete_profile_data(data, &mut reg, &id, "work", true).unwrap();
+
+            let listed = crate::git(&["worktree", "list", "--porcelain"], &repo).unwrap();
+            assert!(!listed.contains("wt-a"), "dangling registration left behind:\n{listed}");
+        });
+    }
+
+    #[test]
+    fn a_delete_backs_up_the_metadata_before_removing_it() {
+        // Cheap insurance the task migration set the precedent for: a few JSON
+        // files, so the recoverable half of a mistake stays recoverable.
+        with_scratch_data_dir(|data| {
+            let (_rd, _wd, id, _repo, _wt) = profile_with_worktrees(data);
+            let mut reg = crate::profiles_registry();
+            crate::delete_profile_data(data, &mut reg, &id, "work", false).unwrap();
+
+            let backups = data.join("backups");
+            let mut found = None;
+            for e in std::fs::read_dir(&backups).unwrap().flatten() {
+                if e.file_name().to_string_lossy().starts_with("pre-profile-delete-work-") {
+                    found = Some(e.path());
+                }
+            }
+            let dir = found.expect("no backup was written");
+            assert!(dir.join("projects.json").exists(), "projects.json was not backed up");
+            assert!(dir.join("tasks/t-wt.json").exists(), "the task records were not backed up");
+        });
+    }
+
+    #[test]
+    fn deleting_the_root_profile_takes_its_four_entries_and_nothing_global() {
+        // The asymmetry: the root profile's data IS the app data dir, so the
+        // delete has to be surgical rather than a directory removal.
+        with_scratch_data_dir(|data| {
+            let mut reg = Registry::default();
+            crate::registry_add_profile(&mut reg, "Work", "orange", Some("Personal"), None).unwrap();
+            crate::profiles::save_registry(data, &reg).unwrap();
+
+            crate::save_task(&a_task("t1", ProfileId::Root)).unwrap();
+            crate::save_projects_in(&ProfileId::Root, &[a_project("p1", ProfileId::Root)]).unwrap();
+            crate::save_settings_in(&ProfileId::Root, &crate::load_settings_in(&ProfileId::Root)).unwrap();
+            std::fs::create_dir_all(data.join("docker-agents/claude")).unwrap();
+
+            let mut reg = crate::profiles_registry();
+            assert_eq!(reg.root_slug.as_deref(), Some("personal"));
+            crate::delete_profile_data(data, &mut reg, &ProfileId::Root, "personal", false).unwrap();
+
+            // The four entries it owned are gone...
+            for gone in ["settings.json", "projects.json", "tasks", "scratch"] {
+                assert!(!data.join(gone).exists(), "{gone} survived the root delete");
+            }
+            // ...and everything genuinely global stayed.
+            assert!(data.join("docker-agents/claude").exists(), "a global dir was deleted");
+            assert!(data.join("profiles.json").exists(), "the registry was deleted");
+            // root_slug clears; nothing is promoted, nothing moves.
+            let after = crate::profiles_registry();
+            assert!(after.root_slug.is_none());
+            assert!(after.get("personal").is_none());
+            assert!(after.get("work").is_some());
+        });
+    }
+
+    // ───── deep links: the routing, and the drain that used to swallow ─────
+
+    #[test]
+    fn a_deep_link_routes_to_the_window_owning_the_project_it_names() {
+        // Drives the REAL resolver. The earlier test for this reimplemented
+        // the filter inline and asserted against its own copy, so it would
+        // have passed with the resolver deleted.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::save_projects_in(&ProfileId::Root, &[a_project("p1", ProfileId::Root)]).unwrap();
+            let mut home = a_project("p2", ProfileId::Slug("home".into()));
+            home.name = "Side Project".into();
+            crate::save_projects_in(&ProfileId::Slug("home".into()), &[home]).unwrap();
+
+            let f = crate::deep_link_project_label;
+            assert_eq!(f("termic://new?project=p1").as_deref(), Some("main"));
+            // By NAME, case-insensitively, and percent/plus decoded, because
+            // that is what a link out of a ticket tracker actually carries.
+            assert_eq!(f("termic://new?project=Side%20Project").as_deref(), Some("profile-home"));
+            assert_eq!(f("termic://new?project=side+project").as_deref(), Some("profile-home"));
+            assert_eq!(f("termic://open?name=x&project=SIDE%20PROJECT").as_deref(), Some("profile-home"));
+        });
+    }
+
+    #[test]
+    fn a_deep_link_naming_no_project_or_an_unknown_one_defers_to_the_caller() {
+        // `None` means "fall back to the most recently focused window". It
+        // must NOT invent a profile, which is the same rule find_project
+        // follows for an unknown project.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::save_projects_in(&ProfileId::Root, &[a_project("p1", ProfileId::Root)]).unwrap();
+
+            let f = crate::deep_link_project_label;
+            assert_eq!(f("termic://new"), None);
+            assert_eq!(f("termic://new?name=x"), None);
+            assert_eq!(f("termic://new?project="), None);
+            assert_eq!(f("termic://new?project=%20"), None);
+            assert_eq!(f("termic://new?project=nobody-has-this"), None);
+        });
+    }
+
+    #[test]
+    fn draining_deep_links_hands_each_window_only_its_own() {
+        // The race the keyed queue exists for: `mem::take` gave the whole
+        // queue to whichever webview asked first, so one profile swallowed
+        // another's links.
+        crate::PENDING_DEEP_LINKS.lock().clear();
+        {
+            let mut q = crate::PENDING_DEEP_LINKS.lock();
+            q.push(("main".into(), "termic://new?project=a".into()));
+            q.push(("profile-home".into(), "termic://new?project=b".into()));
+            q.push(("main".into(), "termic://open?task=c".into()));
+        }
+
+        let home = crate::drain_deep_links_for("profile-home");
+        assert_eq!(home, vec!["termic://new?project=b"]);
+
+        // The other window's links are STILL THERE afterwards.
+        let main = crate::drain_deep_links_for("main");
+        assert_eq!(main, vec!["termic://new?project=a", "termic://open?task=c"]);
+
+        // And draining is exhaustive: nothing is handed out twice.
+        assert!(crate::drain_deep_links_for("main").is_empty());
+        assert!(crate::PENDING_DEEP_LINKS.lock().is_empty());
+    }
+
+    #[test]
+    fn draining_for_a_window_with_nothing_queued_takes_nothing_from_anyone() {
+        crate::PENDING_DEEP_LINKS.lock().clear();
+        crate::PENDING_DEEP_LINKS.lock().push(("main".into(), "termic://new".into()));
+        assert!(crate::drain_deep_links_for("profile-ghost").is_empty());
+        assert_eq!(crate::PENDING_DEEP_LINKS.lock().len(), 1, "another window's link was consumed");
+        crate::PENDING_DEEP_LINKS.lock().clear();
     }
 
     #[test]
