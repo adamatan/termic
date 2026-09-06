@@ -164,7 +164,10 @@ export function MessageQueueButton({ taskId, compact = false, className, preferT
               )}
             >
               <MessageSquarePlus className={cn("h-3.5 w-3.5 shrink-0 text-[var(--color-accent)]", queueRunning && "animate-pulse")} />
-              <span className="tabular-nums">
+              {/* The COUNT survives the collapse, the words do not: "3
+                  queued" is a number you are watching, "Queue messages" is a
+                  label for a button whose icon already says it. */}
+              <span className={cn("tabular-nums", !showBadge && "@max-[680px]:hidden")}>
                 {showBadge ? `${queuedCount} queued` : "Queue messages"}
               </span>
             </button>

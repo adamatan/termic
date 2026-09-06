@@ -7,6 +7,8 @@ import { useApp } from "@/store/app";
 import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
+import { bulkAddSummary, pathsToAdd, type BulkAddResult } from "@/lib/bulkAdd";
+import { Checkbox } from "@/components/ui/Checkbox";
 import { projectAdd, projectAddMulti, discoverRepos, discoveryDismiss, settingsLoad, pathIsGitRepo } from "@/lib/ipc";
 import type { DiscoveredRepo, Project, ProjectMember } from "@/lib/types";
 import { Folder, FolderPlus, Layers, RotateCcw, X } from "lucide-react";
@@ -53,6 +55,10 @@ export function NewProjectDialog() {
   // browse / add flows can `await` the user's decision inline.
   const [confirm, setConfirm] = useState<{ kind: ConfirmKind; resolve: (ok: boolean) => void } | null>(null);
   const [discovered, setDiscovered] = useState<DiscoveredRepo[]>([]);
+  // Checked rows in the discovered list. A set of PATHS, which is the only
+  // stable identity a discovered repo has: the list is refetched after every
+  // add, so an index or an object reference would go stale under the user.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [reposDir, setReposDir] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -139,6 +145,47 @@ export function NewProjectDialog() {
       }
       if (p === path) close();
     } catch (e) { setErr(String(e)); } finally { setBusy(false); }
+  }
+
+  /** Add every checked repo, in one sweep.
+   *
+   *  Sequential rather than parallel: each add writes `projects.json`, and a
+   *  concurrent burst would have several writers racing over one file. Ten
+   *  repos is a second of work, and the ordering also makes the result list
+   *  read in the order the user sees the rows.
+   *
+   *  One failure never stops the rest. "Already added" is the likely one and
+   *  it says nothing about the other nine; the summary names what landed and
+   *  what did not, and the failures stay checked so a retry is one click.
+   */
+  async function addSelected() {
+    const paths = pathsToAdd(selected, discovered.filter(r => !r.dismissed));
+    if (paths.length === 0) return;
+    setBusy(true); setErr(null);
+    const results: BulkAddResult[] = [];
+    for (const p of paths) {
+      const name = discovered.find(r => r.path === p)?.name ?? p;
+      try {
+        const proj = await projectAdd(p, false);
+        setProjectCollapsed(proj.id, false);
+        results.push({ path: p, name: proj.name });
+      } catch (e) {
+        results.push({ path: p, name, error: String(e).replace(/^Error:\s*/, "") });
+      }
+    }
+    await loadAll();
+    const summary = bulkAddSummary(results);
+    pushToast(summary.text, summary.ok ? "success" : "error");
+    // Keep the ones that failed checked: they are the retry, and unchecking
+    // them would make the user find them again in a list that just shrank.
+    const stillFailing = new Set(results.filter(r => r.error).map(r => r.path));
+    setSelected(stillFailing);
+    if (reposDir) {
+      const repos = await discoverRepos(reposDir).catch(() => []);
+      setDiscovered(repos.filter(r => !r.already_added));
+    }
+    setBusy(false);
+    if (summary.ok) close();
   }
 
   // Hide a discovered repo from the picker (or restore it). Optimistic:
@@ -464,8 +511,23 @@ export function NewProjectDialog() {
           : visible;
         return (
         <div className="mb-3">
-          <div className="mb-1.5 flex items-baseline justify-between text-[11.5px] uppercase tracking-wider text-[var(--color-fg-dim)]">
-            <span>Discovered repos</span>
+          <div className="mb-1.5 flex items-center justify-between text-[11.5px] uppercase tracking-wider text-[var(--color-fg-dim)]">
+            <span className="flex items-center gap-2">
+              {/* Select-all over the FILTERED rows, not every discovered repo:
+                  the filter is how you narrow to the set you want, so ticking
+                  this must mean "these", not "all fifty". */}
+              <Checkbox
+                checked={filtered.length > 0 && filtered.every(r => selected.has(r.path))}
+                onChange={next => setSelected(prev => {
+                  const s = new Set(prev);
+                  for (const r of filtered) next ? s.add(r.path) : s.delete(r.path);
+                  return s;
+                })}
+                aria-label="Select all discovered repos"
+                data-testid="discovered-select-all"
+              />
+              <span>Discovered repos</span>
+            </span>
             <span className="font-mono normal-case text-[11.5px] text-[var(--color-fg-faint)]">
               {q ? `${filtered.length} of ${visible.length}` : visible.length} in {reposDir}
             </span>
@@ -490,15 +552,46 @@ export function NewProjectDialog() {
                 No repos match "{filter}".
               </div>
             ) : filtered.map(r => (
-              <div key={r.path} className="group flex w-full items-center">
-                <button onClick={() => { setPath(r.path); setNonGit(false); }} disabled={busy}
-                  className={cn(
-                    "flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-[14px] hover:bg-[var(--color-hover)] disabled:opacity-50",
-                    path === r.path && "bg-[var(--color-accent-deep)]/10",
-                  )}
+              // The ROW is the surface: tint and hover live here, not on the
+              // label button, so the checkbox sits INSIDE the selected
+              // background instead of beside a highlight that starts hard
+              // against it.
+              <div
+                key={r.path}
+                className={cn(
+                  "group flex w-full items-center gap-2.5 px-3",
+                  selected.has(r.path) && "bg-[var(--color-accent-deep)]/10",
+                  !busy && "hover:bg-[var(--color-hover)]",
+                )}
+              >
+                <span className="shrink-0">
+                  <Checkbox
+                    checked={selected.has(r.path)}
+                    onChange={next => setSelected(prev => {
+                      const s = new Set(prev);
+                      next ? s.add(r.path) : s.delete(r.path);
+                      return s;
+                    })}
+                    aria-label={`Select ${r.name}`}
+                    data-testid={`discovered-check-${r.name}`}
+                  />
+                </span>
+                {/* The row body TICKS the box rather than filling in the path
+                    field below. One list, one meaning: with checkboxes on
+                    screen, a click that did something else would be a second
+                    selection model in the same three inches. The manual field
+                    is still there for a path that was never discovered. */}
+                <button
+                  onClick={() => setSelected(prev => {
+                    const s = new Set(prev);
+                    s.has(r.path) ? s.delete(r.path) : s.add(r.path);
+                    return s;
+                  })}
+                  disabled={busy}
+                  className="flex min-w-0 flex-1 items-center gap-2 py-2 text-left text-[14px] disabled:opacity-50"
                   title={r.path}
                 >
-                  <Folder className={cn("h-4 w-4 shrink-0", path === r.path ? "text-[var(--color-accent)]" : "text-[var(--color-fg-faint)]")} />
+                  <Folder className={cn("h-4 w-4 shrink-0", selected.has(r.path) ? "text-[var(--color-accent)]" : "text-[var(--color-fg-faint)]")} />
                   <span className="shrink-0 truncate">{r.name}</span>
                   {/* Full path, faded, right-aligned. dir=rtl truncates from the
                       LEFT so the meaningful tail (…/repo) stays readable. */}
@@ -508,15 +601,12 @@ export function NewProjectDialog() {
                   >
                     {r.path}
                   </span>
-                  {path === r.path && (
-                    <span className="shrink-0 text-[11.5px] uppercase tracking-wider text-[var(--color-accent)] opacity-70">Selected</span>
-                  )}
                 </button>
                 <button
                   onClick={() => dismissRepo(r.path, true)}
                   title="Hide from discovery"
                   aria-label={`Hide ${r.name} from discovery`}
-                  className="mr-1 shrink-0 rounded p-1 text-[var(--color-fg-faint)] opacity-0 hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)] focus-visible:opacity-100 group-hover:opacity-100"
+                  className="shrink-0 rounded p-1 text-[var(--color-fg-faint)] opacity-0 hover:bg-[var(--color-bg-2)] hover:text-[var(--color-fg)] focus-visible:opacity-100 group-hover:opacity-100"
                 >
                   <X className="h-3.5 w-3.5" />
                 </button>
@@ -586,9 +676,21 @@ export function NewProjectDialog() {
 
       <div className="mt-2 flex justify-end gap-2">
         <Button variant="ghost" onClick={close}>Cancel</Button>
-        <Button variant="primary" disabled={!path || busy} onClick={handleAdd}>
-          <FolderPlus className="h-4 w-4" /> Add
-        </Button>
+        {/* One button, two jobs, and the label says which: ticked rows are the
+            sweep, and the manual field is the fallback for a path discovery
+            never offered. Showing both at once would leave the user guessing
+            which one their click uses. */}
+        {selected.size > 0 ? (
+          <Button variant="primary" disabled={busy} onClick={() => void addSelected()}
+                  data-testid="add-selected-projects">
+            <FolderPlus className="h-4 w-4" />
+            {busy ? "Adding..." : `Add ${selected.size} ${selected.size === 1 ? "project" : "projects"}`}
+          </Button>
+        ) : (
+          <Button variant="primary" disabled={!path || busy} onClick={handleAdd}>
+            <FolderPlus className="h-4 w-4" /> Add
+          </Button>
+        )}
       </div>
       </>
       )}

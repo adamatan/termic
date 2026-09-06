@@ -127,7 +127,13 @@ export function AppDialog({ open, onOpenChange, title, description, className, h
                 <div
                   data-tauri-drag-region
                   style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
-                  className="cursor-grab active:cursor-grabbing select-none"
+                  // Always spaced from the body. The container's `gap-2` is
+                  // 8px, which is a paragraph gap, not a header gap: with a
+                  // description the title, the description and the first field
+                  // label ran together as three lines of the same block. The
+                  // strip owns its own separation rather than each caller
+                  // remembering to add it.
+                  className="mb-3 cursor-grab active:cursor-grabbing select-none"
                 >
                   {/* pr-6 clears the absolutely-positioned close button. It
                       sits on the ROW, not the title, so title actions clear it
