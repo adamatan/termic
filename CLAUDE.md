@@ -59,6 +59,14 @@ change, their pass is the check and this is wasted time. But when you build a
 UI from scratch with nobody in the loop, shipping it unseen means nobody has
 ever looked at it, and green suites do not fill that hole.
 
+**On a large feature, ASK first.** It costs a rebuild and a capture run per
+pass, so on anything sizeable ask whether they want the visual check before
+spending it - the answer turns entirely on whether they are about to open the
+app themselves. Small unattended UI changes do not need the question; just do
+it.
+
+The screenshots go in the chat. Do not publish them as an artifact.
+
 So: drive it with the e2e suite, `snap()` each state, and READ THE IMAGES BACK.
 Not the ad-hoc bridge (see ## What NOT to do) - a written spec, so the states
 you captured stay covered afterwards. Capturing them is usually a reason to
