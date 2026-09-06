@@ -281,6 +281,27 @@ account arrives: phase 2 does that, by giving each profile its own agent config
 dir holding the credential and symlinking settings, skills, commands and history
 back to the primary. See [plans/agent-credentials.md](plans/agent-credentials.md).
 
+## Where the hard parts are tested
+
+Two things about profiles cannot be tested the obvious way, and both are worth
+knowing before changing them:
+
+- **The tray merge and the emit fallback take no `AppHandle`.** They were
+  untestable while they did (an `AppHandle` cannot be built off a running app),
+  so the decisions are split into `merge_tray_rows` and `emit_target`. That
+  puts them under `cargo test --workspace --lib`, which is the REQUIRED CI
+  check, rather than the macOS-only e2e job. What is pinned: every window's
+  rows survive the merge, registry order holds so the menu does not reshuffle
+  between rebuilds, a profile heading appears only when there is more than one,
+  a window the registry does not know still contributes its rows, and an
+  unresolvable task event broadcasts rather than reaching nobody.
+- **The destructive delete runs against a real repo.** `delete_profile_data`
+  is split from the window precondition so `git worktree remove --force` can
+  be driven against a real worktree: it removes the worktree, spares the main
+  checkout, leaves no dangling registration in the parent repo, and writes its
+  backup first. Both that and the deep-link resolver were mutation-checked,
+  not trusted: breaking each one fails its test.
+
 ## Known gaps
 
 - **The perf budget multiplies.** N profile windows is N webviews, N WebGL

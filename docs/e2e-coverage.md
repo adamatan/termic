@@ -175,7 +175,7 @@ until `make e2e` is green and this file reflects it.
 | ✅ Activity monitor | The sidebar footer button opens a SECOND window (its own `activity.html` entry, found by polling the WebDriver handles: a new webview is listed before its document loads); a live agent appears under its project and task; Termic's own processes get their own group and do NOT double-count the agents' subtrees (every PTY is our child, so the app row's stop-set is the invariant); a row reports a real CPU percentage even though the harness window is permanently `document.hidden`, which is the occluded-window back-off working; Pause halts sampling and resume restarts it; re-opening focuses the existing window instead of spawning a second; closing the window drops the sampling session and a fresh one is grantable; every column header sorts (default CPU desc, a new column starts biggest-first except Name which starts A-to-Z, the previous column lets go) and the PID column renders real pids. Grouping / sorting / formatting are unit-tested in `src/lib/activityGroups.test.ts`, the sampler math + FFI in `procmon.rs` tests | `activity.e2e.ts` |
 
 | ✅ Start from an issue (GH #21/#22) | The fixture's local bare remote resolves as NOT a forge, so `project_forge_issues` reports `unsupported-remote` rather than an empty list, and `buildIssuePrompt` composes context + deferred thread + library instructions; the route in is exercised end to end (palette row → shared project picker flagged `issue` → the SAME New Task dialog with its issue column open beside the form → the non-forge explanation → "blank task instead" drops the column and keeps the dialog). Picking a real issue needs a real forge, so the prompt auto-fill it triggers is unit-tested in `src/lib/issuePrompt.test.ts`. | `git.e2e.ts` |
-| ✅ Profiles (GH #280) | The dormant contract first: no strip renders until a profile exists, and the footer's profile button is the whole surface. Creating the first profile ADOPTS the install that already exists (both entries, one write) and the existing one owns the root data dir, so nothing moves; the strip then carries the name in clear and the popover lists every profile. Isolation is asserted through the app's own IPC rather than by driving two windows (the suite reuses one window per file): the seeded `fixture-repo` belongs to the root profile and the new one starts empty, seeded under `profiles/<slug>/tasks`. A rename never moves the slug. `profile_open` really does create a second WebDriver window. Delete is REFUSED while the profile's window is open, which is why backing out of the feature needs its own door: `profiles_disable` returns the app to its pre-profiles shape keeping every byte of data, and is itself refused while more than one profile exists. The delete dialog is driven for real, and asserts the PAINTED border colour moves with the selection, not just `aria-checked`: `transition-colors` froze it in WKWebView (docs/gotchas.md) while every attribute assertion stayed green. `profile_close` is the door the spec uses to hand the suite back its one window, and it refuses to close the window it is called from. Launch restore is compiled out under `feature = "e2e"`, since the suite asserts on window-handle counts | `profiles.e2e.ts` |
+| ✅ Profiles (GH #280) | The dormant contract first: no strip renders until a profile exists, and the footer's profile button is the whole surface. Creating the first profile ADOPTS the install that already exists (both entries, one write) and the existing one owns the root data dir, so nothing moves; the strip then carries the name in clear and the popover lists every profile. Isolation is asserted through the app's own IPC rather than by driving two windows (the suite reuses one window per file): the seeded `fixture-repo` belongs to the root profile and the new one starts empty, seeded under `profiles/<slug>/tasks`. A rename never moves the slug. `profile_open` really does create a second WebDriver window. Delete is REFUSED while the profile's window is open, which is why backing out of the feature needs its own door: `profiles_disable` returns the app to its pre-profiles shape keeping every byte of data, and is itself refused while more than one profile exists. Two REAL windows are open at once and asserted disjoint (the second knows its own slug, renders its own name, and sees an empty project list while the first still holds `fixture-repo`). The delete dialog is driven for real, and asserts the PAINTED border colour moves with the selection, not just `aria-checked`: `transition-colors` froze it in WKWebView (docs/gotchas.md) while every attribute assertion stayed green. `profile_close` is the door the spec uses to hand the suite back its one window, and it refuses to close the window it is called from. Launch restore is compiled out under `feature = "e2e"`, since the suite asserts on window-handle counts | `profiles.e2e.ts` |
 
 ## CLI control plane (Phase 1/2)
 
@@ -205,22 +205,26 @@ Lower-value or high-setup items left for later; the patterns to do them are all 
 - **File create/rename/delete via context menu, file-tree reveal** — need Radix context-menu driving (flaky, no clean IPC). Binary previews are no longer on this list: image preview is covered by `files.e2e.ts`, PDF preview by `editor.e2e.ts` (which builds a tiny valid PDF inline rather than committing a fixture).
 - **Prompts management, keybindings editor** — config-file editing, low value.
 
-**Profiles: two live windows side by side (GH #280).** `profiles.e2e.ts`
-asserts isolation through the app's own IPC, not through two real windows,
-because the suite launches ONE window per spec file and reuses it: a second
-one leaks into every spec that runs afterwards, and the handle-count
-assertions in this spec are what caught that when `profile_open` first left
-its window behind. `profile_open` and `profile_close` ARE covered end to end
-(a window really is created and really is closed); what is not covered is two
-windows rendering disjoint sidebars at the same instant. The Rust side of that
-isolation is covered instead, by `load_all_sees_every_profile_and_load_in_sees_exactly_one`
-and the tag round-trip tests.
+**Profiles: two live windows (GH #280) is COVERED, and here is how it stays
+reliable.** `profiles.e2e.ts` opens the second profile's window, switches to
+it, and asserts it knows its own slug, renders its own name in the strip, and
+sees an EMPTY project list while the first window still holds `fixture-repo` at
+the same moment. Three things keep that from poisoning the rest of the suite,
+and all three are load-bearing:
 
-**Profiles: the tray merge and the emit broadcast fallback.**
-`merged_tray_attention` and `emit_scoped`'s fallback both need an `AppHandle`,
-which cannot be constructed off a running app. Their inputs are unit-tested
-(`task_id_in_topic`, `window_for_task`, the memo invalidation); the merge
-itself is not. Worth an e2e case if the tray ever grows a second bug.
+- The switch is wrapped in `try/finally`. WebDriver stays pointed at whatever
+  window it last switched to, so an assertion that throws while focused on the
+  second one would leave every later case in the file driving a window that is
+  about to be destroyed.
+- It waits for `window.__termic` AND for the strip to render, not for the
+  handle. A new webview is listed before its document is ready.
+- It closes through `profile_close`, the app's own door, rather than
+  `browser.closeWindow()`, which leaves the session with no current window and
+  raced under the full parallel suite (it passed run alone and failed run with
+  the other 17).
+
+Launch restore is compiled out under `feature = "e2e"` so no window appears
+that the spec did not ask for.
 
 ## Environment-limited (not robustly testable here)
 

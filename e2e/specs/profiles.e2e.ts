@@ -247,6 +247,79 @@ describe("profiles", () => {
     expect(after.hint).toContain("profiles/work/tasks");
   });
 
+  it("shows each window only its own profile's projects, with both live", async () => {
+    // The claim the whole feature rests on, asserted with TWO REAL WINDOWS
+    // rather than through one window's IPC. The seeded fixture-repo belongs to
+    // the profile that owns the root; the new one was created empty.
+    //
+    // try/finally is not decoration: WebDriver stays pointed at whatever
+    // window it last switched to, so an assertion that throws while focused on
+    // the second one would leave every later case in this file driving a
+    // window that is about to be destroyed. The suite must be handed back its
+    // own window whatever happens here.
+    const main = await browser.getWindowHandle();
+    const before = await browser.getWindowHandles();
+    // Read the expected name rather than hardcoding it: an earlier case in
+    // this file renames this profile, and a literal here would pass or fail
+    // on the ORDER of the cases rather than on the behaviour.
+    const expectedName = await browser.execute(async () => {
+      const v = await window.__termic!.invoke("profiles_list");
+      return (v.profiles as any[]).find(p => p.slug === "work").name as string;
+    });
+    await browser.execute(async () => { await window.__termic!.invoke("profile_open", { slug: "work" }); });
+    await browser.waitUntil(
+      async () => (await browser.getWindowHandles()).length > before.length,
+      { timeout: 25_000, timeoutMsg: "profile_open did not create a window" },
+    );
+    const extra = (await browser.getWindowHandles()).find(h => !before.includes(h))!;
+
+    try {
+      await browser.switchToWindow(extra);
+      // A new webview is listed before its document is ready, so wait for the
+      // app to be live rather than for the handle.
+      await browser.waitUntil(
+        async () => await browser.execute(() => !!window.__termic),
+        { timeout: 30_000, timeoutMsg: "the profile window never booted" },
+      );
+      await browser.waitUntil(async () => await browser.execute(
+        () => !!document.querySelector('[data-testid="profile-strip"]')),
+        { timeout: 20_000, timeoutMsg: "the profile window never rendered its strip" },
+      );
+
+      const other = await browser.execute(async () => {
+        const t = window.__termic!;
+        await t.useProfiles.getState().refresh();
+        const view = await t.invoke("profiles_list");
+        return {
+          current: view.current,
+          projects: (await t.invoke("projects_list")).map((p: any) => p.name),
+          strip: document.querySelector('[data-testid="profile-strip"]')?.textContent?.trim(),
+        };
+      });
+
+      // It knows which profile it is, and it cannot see the other's work.
+      expect(other.current).toBe("work");
+      expect(other.projects).toEqual([]);
+      expect(other.strip).toContain(expectedName);
+    } finally {
+      await browser.switchToWindow(main);
+    }
+
+    // ...while the original window is unchanged, at the same moment.
+    const mine = await browser.execute(async () =>
+      (await window.__termic!.invoke("projects_list")).map((p: any) => p.name));
+    expect(mine).toContain("fixture-repo");
+
+    await browser.execute(async () => {
+      await window.__termic!.invoke("profile_close", { slug: "work" });
+    });
+    await browser.waitUntil(
+      async () => (await browser.getWindowHandles()).length === before.length,
+      { timeout: 20_000, timeoutMsg: "the profile window did not close" },
+    );
+    await waitForAppShell();
+  });
+
   it("opens a profile in its own window", async () => {
     // Switching IS opening a window (one window per profile), so this is the
     // switcher's entire mechanism.

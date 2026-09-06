@@ -7361,8 +7361,17 @@ fn task_id_in_topic(topic: &str) -> Option<&str> {
 ///
 /// Falls back to a broadcast when the owner cannot be resolved (see
 /// [`window_for_task`]).
+/// Which window a task-keyed topic routes to, or `None` for a broadcast.
+///
+/// Named and split out so the FALLBACK is testable: "no owner means every
+/// window" is a deliberate choice, not an oversight, and a change that made an
+/// unresolvable event reach nobody would otherwise be silent.
+fn emit_target(topic: &str) -> Option<String> {
+    task_id_in_topic(topic).and_then(window_for_task)
+}
+
 fn emit_scoped<S: Serialize + Clone>(app: &AppHandle, topic: &str, payload: S) {
-    match task_id_in_topic(topic).and_then(window_for_task) {
+    match emit_target(topic) {
         Some(label) => {
             let _ = app.emit_to(label, topic, payload);
         }
@@ -19089,8 +19098,19 @@ fn merged_tray_attention(app: &AppHandle) -> Vec<TrayAttentionItem> {
     let mut guard = TRAY_ATTENTION.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     map.retain(|label, _| app.get_webview_window(label).is_some());
+    merge_tray_rows(map, &profiles_registry())
+}
 
-    let reg = profiles_registry();
+/// The merge itself, with no `AppHandle`.
+///
+/// Split out because an `AppHandle` cannot be constructed off a running app,
+/// which left the whole last-writer-wins fix untestable. Everything the merge
+/// decides (ordering, which rows get a profile heading, what happens to a
+/// window the registry does not know) is here.
+fn merge_tray_rows(
+    map: &HashMap<String, Vec<TrayAttentionItem>>,
+    reg: &profiles::Registry,
+) -> Vec<TrayAttentionItem> {
     let mut out: Vec<TrayAttentionItem> = Vec::new();
     // Registry order, so the menu's profile sections do not reshuffle
     // between rebuilds.
@@ -21270,6 +21290,114 @@ mod tests {
         assert!(crate::drain_deep_links_for("profile-ghost").is_empty());
         assert_eq!(crate::PENDING_DEEP_LINKS.lock().len(), 1, "another window's link was consumed");
         crate::PENDING_DEEP_LINKS.lock().clear();
+    }
+
+    // ───── the tray merge, and the broadcast fallback ─────
+    //
+    // Both used to be untestable because they took an `AppHandle`. Split into
+    // pure cores so they run under `cargo test --workspace --lib`, which is
+    // the REQUIRED CI check, rather than the macOS-only e2e job.
+
+    fn tray_item(task: &str, project: &str) -> crate::TrayAttentionItem {
+        crate::TrayAttentionItem {
+            task_id: task.into(),
+            task_name: task.into(),
+            project_name: project.into(),
+            state: "waiting".into(),
+            profile_name: None,
+        }
+    }
+
+    #[test]
+    fn the_tray_merges_every_window_rather_than_taking_the_last_writer() {
+        // The bug this replaced: each window pushes its OWN profile's set, so
+        // whichever spoke last erased every other profile's rows. That is the
+        // opposite of what the menu-bar item exists for.
+        let mut map = HashMap::new();
+        map.insert("main".to_string(), vec![tray_item("t1", "alpha")]);
+        map.insert("profile-home".to_string(), vec![tray_item("t2", "beta")]);
+
+        let rows = crate::merge_tray_rows(&map, &two_profile_registry());
+        let ids: Vec<&str> = rows.iter().map(|r| r.task_id.as_str()).collect();
+        assert_eq!(ids, vec!["t1", "t2"], "a window's rows went missing");
+    }
+
+    #[test]
+    fn tray_rows_are_ordered_by_the_registry_so_the_menu_does_not_reshuffle() {
+        // A HashMap iteration order would reorder the menu between rebuilds,
+        // which for a menu people click by muscle memory is its own bug.
+        let mut map = HashMap::new();
+        map.insert("profile-home".to_string(), vec![tray_item("t2", "beta")]);
+        map.insert("main".to_string(), vec![tray_item("t1", "alpha")]);
+        // Registry order is work (root, "main") then home, whatever the map says.
+        for _ in 0..8 {
+            let rows = crate::merge_tray_rows(&map, &two_profile_registry());
+            assert_eq!(
+                rows.iter().map(|r| r.task_id.as_str()).collect::<Vec<_>>(),
+                vec!["t1", "t2"],
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_heading_appears_only_when_there_is_more_than_one() {
+        // A single-profile install's menu has to look exactly as it did
+        // before profiles existed.
+        let mut map = HashMap::new();
+        map.insert("main".to_string(), vec![tray_item("t1", "alpha")]);
+
+        let one = Registry {
+            profiles: vec![Profile {
+                slug: "solo".into(), name: "Solo".into(), accent: "blue".into(),
+                order: 0, last_focused_at: None, open_at_quit: false,
+            }],
+            root_slug: Some("solo".into()),
+        };
+        let rows = crate::merge_tray_rows(&map, &one);
+        assert_eq!(rows[0].profile_name, None, "a lone profile grew a heading");
+
+        let rows = crate::merge_tray_rows(&map, &two_profile_registry());
+        assert_eq!(rows[0].profile_name.as_deref(), Some("Work"),
+            "with two profiles the row must say which window it is in");
+    }
+
+    #[test]
+    fn a_window_the_registry_does_not_know_still_contributes_its_rows() {
+        // Ordering is registry-first, but a label the registry has no entry
+        // for (mid-delete, or a dormant install) must not have its tasks
+        // silently dropped from the menu.
+        let mut map = HashMap::new();
+        map.insert("profile-ghost".to_string(), vec![tray_item("t9", "gamma")]);
+        let rows = crate::merge_tray_rows(&map, &two_profile_registry());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, "t9");
+        assert_eq!(rows[0].profile_name, None, "an unknown window cannot claim a profile name");
+    }
+
+    #[test]
+    fn an_unresolvable_task_event_broadcasts_instead_of_reaching_nobody() {
+        // The deliberate fallback. An event with no resolvable owner going to
+        // every window is the pre-profiles behaviour; going nowhere is a
+        // silent regression, and this is the assertion that would catch it.
+        with_scratch_data_dir(|_| {
+            crate::forget_task_window(None);
+            assert_eq!(crate::emit_target("pty://does-not-exist"), None,
+                "None is the signal to broadcast");
+            assert_eq!(crate::emit_target("termic://windowless"), None);
+            assert_eq!(crate::emit_target("no-scheme-at-all"), None);
+        });
+    }
+
+    #[test]
+    fn a_resolvable_task_event_targets_exactly_one_window() {
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::forget_task_window(None);
+            crate::save_task(&a_task("t2", ProfileId::Slug("home".into()))).unwrap();
+            assert_eq!(crate::emit_target("pty://t2").as_deref(), Some("profile-home"));
+            // Script topics append `:<member>:<kind>` after the id.
+            assert_eq!(crate::emit_target("script-done://t2::setup").as_deref(), Some("profile-home"));
+        });
     }
 
     #[test]

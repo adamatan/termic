@@ -1685,7 +1685,7 @@ mod tests {
                 cwd: Some("/t".into()),
             },
         ] {
-            roundtrip(&Request { id: "r1".into(), token: Some("t".into()), cmd });
+            roundtrip(&Request { id: "r1".into(), token: Some("t".into()), profile: None, cmd });
         }
     }
 
@@ -1696,6 +1696,7 @@ mod tests {
         let req = Request {
             id: "r1".into(),
             token: Some("t".into()),
+            profile: None,
             cmd: Command::LastResult { task: None, project: None, cwd: None },
         };
         let line = serde_json::to_string(&req).unwrap();
