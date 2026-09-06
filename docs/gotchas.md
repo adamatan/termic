@@ -284,3 +284,141 @@ to miss in tests because `aria-checked` (the thing a spec naturally asserts) is
 right. It took a screenshot to notice and a computed-style assertion to prove.
 Assert the painted colour, not the attribute, wherever selection is carried by
 colour alone.
+
+## Two components fetching one setting will disagree
+
+The account pill and the usage popover each carry the same "switch
+automatically" checkbox, and each fetched `agent_accounts` for itself. Toggling
+one left the other showing the old value until something happened to remount
+it. Nothing was wrong with either component; there were simply two copies of a
+single fact and no path between them.
+
+The fix is one owner: `hooks/useAgentAccounts.ts` fetches once for the whole
+footer and hands both chips the same object plus a shared `refresh`. Popovers
+call `refresh` when they OPEN, since nothing pushes a settings change into a
+component that is already mounted.
+
+Worth recognising in general: as soon as a second surface renders the same
+stored value, either lift the fetch or accept that the two will drift. An e2e
+case that toggles in one place and reads in the other is what caught this, and
+it is a cheap case to write.
+
+## A new window needs a Tauri capability, or it silently has no permissions
+
+Capabilities (`src-tauri/capabilities/*.json`) are scoped by window LABEL. A
+window whose label matches no entry does not get a reduced set of permissions,
+it gets NONE, `core:event` included. The window builds and paints, and then
+every `listen`/`emit` fails at runtime:
+
+```
+spawn failed: event.listen not allowed on window "profile-work", ...
+allowed on: [windows: "main", URL: local]
+```
+
+Profile windows shipped like this. The root profile keeps the literal `main`
+label, so the first window worked perfectly and only the second was inert,
+which is exactly the case nobody hits until the feature is really used.
+`capabilities/default.json` now lists `profile-*`.
+
+Whenever you add a window LABEL, add it to a capability in the same change, and
+remember `tauri.conf.json` / capabilities changes need a quit + relaunch, not a
+reload.
+
+## Docker is a SECOND REALM, and it does not inherit host fixes
+
+Three separate bugs in one feature, all the same shape: a rule implemented for
+the host, and silently absent in the container.
+
+- "The adopted account relocates nothing" was checked while building the host
+  env overlay. The Docker branch appended the account slug to the mount
+  unconditionally, so naming your first account pointed the container at an
+  empty directory and orphaned the login you were already using. It presents
+  as the agent running its first-run wizard in a task that was signed in a
+  minute earlier.
+- `agent_hooks_sync` only ever UPGRADED an existing install, so a Docker
+  install that was never made stayed missing forever, in silence: no work
+  state and no plan usage in sandboxed tasks, while the same agent on the host
+  reported both.
+- The host shares an account's config by SYMLINK. A host symlink is dangling
+  inside a container, so Docker needed the same entries as MOUNTS. Without it
+  `--resume` answered "No conversation found", and a shared `settings.json`
+  pointed at hook scripts that were not there.
+
+**Whenever you write a rule about where an agent's files live, ask what the
+container does with it.** `docker::build_spec` and the host env overlay are two
+implementations of one idea and they drift apart quietly, because the host is
+what you are looking at while you write the code.
+
+`a_named_account_shares_the_agents_conversations_into_the_container`
+(`docker.rs`) is the guard: every entry in `shared_config_entries` that exists
+must be mounted, so adding one without Docker honouring it fails there rather
+than in a container weeks later.
+
+## `null` is an ANSWER; `undefined` is the absence of one
+
+`??` collapses the two, and in the account switcher that was wrong three times
+in three different places:
+
+- the usage key: `liveAccount ?? configured`. `null` means "running on the
+  agent's ordinary login", which every process spawned before the user named a
+  credential set is doing. Collapsing it re-keyed a RUNNING task's chip the
+  moment the first account was named, and its usage vanished mid-session.
+- the pill's label: same expression, so with a switch staged and not restarted
+  the chip named an account the process had never run as.
+- `pillText`, again, until the view learned to report `adoptedAccount` (the
+  name FOR the ordinary login).
+
+When a value has a meaningful "none" state, spell the two apart in the type
+(`string | null | undefined`) and compare with `=== undefined`. Then say in a
+comment which is which, because the next reader will assume `??` is safe.
+
+## A rendered sandbox rule can be inert
+
+The control plane denies termic's whole data dir, and that deny is deliberately
+the FINAL filesystem rule: SBPL is last-match-wins, so an allow placed anywhere
+above it does nothing. A named account's config dir lives inside that data dir,
+so the agent could not open its own credential (`unable to open database file`)
+while the profile visibly contained an allow for it.
+
+Two rules follow:
+
+1. An allow for something under the data dir has to be emitted AFTER those
+   denies, and kept as narrow as the thing it is for.
+2. **Assert POSITION, not presence.** A `contains` check passes on a rule the
+   kernel never applies. `the_login_store_allow_survives_the_control_plane_deny`
+   compares byte offsets for exactly this reason.
+
+And one trap underneath it: `canonicalize` on a path that does not exist yet
+returns the path unchanged. Seatbelt evaluates canonical paths, so an allow for
+a directory the spawn is about to create named `/var/...` where the kernel sees
+`/private/var/...`, and matched nothing.
+
+## A new window LABEL needs a Tauri capability
+
+Capabilities are scoped by window label, and a window matching no entry gets
+NO permissions at all rather than a reduced set. `core:event` is included, so
+the window builds, paints, looks entirely normal, and then every `listen`
+fails: in practice, every PTY spawn in it dies.
+
+Profile windows shipped like this. The root profile keeps the literal `main`
+label, so the FIRST window worked perfectly and only the second was inert,
+which is exactly the case nobody exercises until the feature is really used.
+`every_profile_window_is_covered_by_a_tauri_capability` (`profiles.rs`) derives
+labels from the real builder and checks the JSON, because nothing in the type
+system connects the two.
+
+## Test infrastructure rots, and it looks like flakiness
+
+Two bugs in test helpers cost more debugging time than any product bug in the
+same session, because each failure named an innocent test and passed on rerun:
+
+- `with_scratch_data_dir` read the variable it was replacing BEFORE taking the
+  lock, so it captured another test's scratch dir and restored that on exit: a
+  directory whose owner had already finished and deleted it.
+- `statusline_run` keyed its temp dir on pid + timestamp. `SystemTime` is not
+  nanosecond-resolution on macOS, so two parallel tests shared a directory and
+  the first to finish deleted the other's file mid-read.
+
+**A failure that names a different test each time and never reproduces alone is
+a shared-state bug, not a flake.** Look at what the tests share before looking
+at the test that failed.

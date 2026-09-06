@@ -32,6 +32,26 @@ Sections share `Controls.tsx`: `Toggle`, `ListField`, `Block` (hairline + spacin
 
 Deep links (`openSettings(tab, repoId, highlight)`) hard-code a tab name, so moving a setting between pages means updating its callers. Live ones: the markdown-preview banner (`general` + `load-remote-images`), the command palette's settings list, and the shortcuts help dialog.
 
+### Settings text runs the full width of the pane
+
+**Never put `max-w-prose`, `max-w-md` or any other width cap on body text in a
+settings page.** The content pane already sets the measure; a second cap inside
+it wraps a paragraph at roughly half the pane's width and leaves an obvious
+empty column to its right. Grep says it plainly: no settings section uses a
+width utility on text, and every one that ever did was a regression.
+
+It keeps happening because `max-w-prose` is genuinely good advice for a
+full-bleed page and is the reflex when writing a description paragraph. It is
+wrong HERE, because the pane is not full-bleed: it has already been narrowed
+once. The two constraints multiply.
+
+The same goes for `mx-auto max-w-*` on an empty state. Center the BOX, not the
+sentence inside it.
+
+If a paragraph genuinely reads too wide, the answer is the pane's own measure
+in `Settings.tsx`, once, for every page: not a cap on one paragraph, which
+makes that page disagree with the twelve beside it.
+
 ### Experimental features
 
 A feature is Experimental when it is off by default **because we are not yet confident in it**, with a stated way out. Off for safety (remote images), off for taste (copy on select), and off as policy (sandbox permission bypass) are none of them experimental: those defaults are permanent, and labelling them experimental makes the label meaningless.
@@ -224,6 +244,24 @@ read live, so editing it there changes every future issue task
 A plain shell or registry terminal has no prompt box, so the composed prompt has
 nowhere to go: the column says so at the point the issue was chosen rather than
 letting Create drop it silently.
+
+## Title bar contents, and what moved out of it
+
+Left to right: traffic lights (reserved unless full-screen), sidebar toggle,
+the profile chip, the updater pill, the waiting-agents pill, then the task
+breadcrumb.
+
+The bar carries the current profile's accent as a wash from the left edge,
+fading out by the first third (`profileWashCss`, docs/profiles.md). The chip
+sits inside that wash, so the colour and the name are one signal rather than
+two. Nothing else in the bar may take a background of its own: a tinted surface
+inside a tinted one reads as a rendering fault.
+
+**The theme picker is NOT here.** It lives in the sidebar footer, first in the
+row, and moved there when the profile chip took the space. It is a set-once
+preference; the title bar is the strip you drive agents from. Anything proposed
+for this bar has to earn its width against the breadcrumb, which is the thing
+people actually read.
 
 ## Window chrome / drag
 
