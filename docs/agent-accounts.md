@@ -469,6 +469,26 @@ documented in Anthropic's own environment reference). termic running the
 real `claude` binary keeps it on the right side of that line either way,
 since termic never speaks to the API itself. The config-dir isolation this ships is literally that blessed pattern; lifting a token blob out of the Keychain and planting it elsewhere, which termic does NOT do, is the part no vendor has blessed. A product risk to weigh, not a legal opinion.
 
+## A plan's dollars are not spend
+
+claude reports `total_cost_usd` on EVERY account, subscription included, so a
+Max account shows plan windows AND a dollar figure. The two are not
+alternatives and the panel shows both.
+
+But the same number means two different things, and the label has to say
+which. On a plan nothing was charged: the figure is what those tokens would
+have cost at API rates, and the subscription covered them. On an account with
+no plan it is money, because that account is billed per token.
+
+So the row reads "Would have cost ... at API rates since launch. Your plan
+covers it." when `sawPlan` is set, and "Spent since launch" when it is not.
+Reported from a real panel showing 9% and 1% next to "Spent since launch $11",
+which reads as eleven dollars charged for a month that charged nothing.
+
+The CHIP is unaffected and was already right: `costChipVisible` requires
+`!sawPlan`, so dollars only ever reach the footer on an account whose
+percentages would be meaningless.
+
 ## Known gaps
 
 - **copilot and muse get no switcher, deliberately.** copilot keys its libsecret

@@ -373,13 +373,25 @@ function UsageDetail({ agentId, entry, level, driver, spend, accountsView, refre
             data-testid="usage-spend-row"
             className="flex items-baseline justify-between border-t border-[var(--color-border-soft)] pt-2.5"
           >
+            {/* The label turns on whether this account has a PLAN, because
+                the same number means two different things.
+
+                claude reports `total_cost_usd` on every account, subscription
+                included, so a Max account shows plan windows AND a dollar
+                figure. On that account the money was never spent: it is what
+                the tokens would have cost at API rates, and the subscription
+                covered them. Calling it "Spent" there states a charge that
+                did not happen, which is exactly how it read to the first
+                person who saw both on one panel. */}
             <span className="text-[var(--color-fg-dim)]">
-              Spent since launch
-              {/* Said out loud, because the number resets when termic does and
-                  someone comparing it against a provider dashboard needs to
-                  know that before they trust it. */}
+              {entry?.sawPlan ? "Would have cost" : "Spent since launch"}
+              {/* The reset is said out loud either way, because the number
+                  goes back to zero when termic does and someone comparing it
+                  against a provider dashboard needs to know that first. */}
               <span className="block text-[11px] text-[var(--color-fg-faint)]">
-                this agent, this account
+                {entry?.sawPlan
+                  ? "at API rates since launch. Your plan covers it."
+                  : "this agent, this account"}
               </span>
             </span>
             <span className="tabular-nums font-medium text-[var(--color-fg)]">{formatUsd(spend)}</span>

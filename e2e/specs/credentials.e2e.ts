@@ -181,6 +181,22 @@ async function resetUsage(): Promise<void> {
   await browser.execute(() => window.__termic!.useAgentUsage.setState({ byAgent: {} }));
 }
 
+/** Seed a reading carrying COST, with or without plan windows.
+ *
+ *  Two shapes because the same dollar figure means two different things, and
+ *  `sawPlan` is sticky per key, so each shape needs its own account. */
+async function seedCost(
+  agent: string, account: string | null, usd: number, withPlan: boolean,
+): Promise<void> {
+  await browser.execute((a, acct, c, plan) => {
+    window.__termic!.useAgentUsage.getState().report(a, acct, {
+      session: plan ? { usedPercent: 9, resetsAt: Math.floor(Date.now() / 1000) + 3600 } : null,
+      weekly: plan ? { usedPercent: 1, resetsAt: Math.floor(Date.now() / 1000) + 86400 } : null,
+      sessionCostUsd: c,
+    }, "statusline", "sess-1");
+  }, agent, account, usd, withPlan);
+}
+
 /** Seed a usage reading for one account, as the status line would.
  *
  *  Keyed by the account the PROCESS is running as, which is the same key the
@@ -668,6 +684,52 @@ describe("agent credentials", () => {
       await removeTask(taskId);
       await clearAccounts(FAKE_CLAUDE);
       signOutAll(FAKE_CLAUDE);
+      await dismissOverlays();
+    }
+  });
+
+  it("does not call a subscription's dollars 'spent'", async () => {
+    // claude reports `total_cost_usd` on EVERY account, subscription
+    // included, so a plan account shows both windows and a dollar figure.
+    // Reported from a real panel: 9% / 1% sitting next to "Spent since launch
+    // $11" reads as eleven dollars charged, and on a plan nothing was
+    // charged at all. Same number, two meanings, so the label has to move.
+    await resetUsage();
+    await addAccounts(FAKE_CLAUDE);
+    const taskId = await openTaskWith(FAKE_CLAUDE, "acct-cost-label");
+    try {
+      await waitVisible('[data-testid="usage-chip"]');
+
+      // A PLAN account: windows and a cost.
+      await seedCost(FAKE_CLAUDE, "Work", 11, true);
+      await clickWhenVisible('[data-testid="usage-chip"]');
+      await waitVisible('[data-testid="usage-spend-row"]');
+      const onPlan = await browser.execute(() =>
+        document.querySelector('[data-testid="usage-spend-row"]')?.textContent ?? "");
+      expect(onPlan).toContain("Would have cost");
+      expect(onPlan).not.toContain("Spent since launch");
+      // ...and it says who paid, which is the whole correction.
+      expect(onPlan).toMatch(/plan covers it/i);
+      await dismissOverlays();
+
+      // An account with NO plan is billed per token, so there "spent" is
+      // exactly right and must not be softened away.
+      await setTaskAccount(taskId, FAKE_CLAUDE, "Client");
+      await respawn(taskId);
+      await waitForSpawnOn(taskId, "Client");
+      await seedCost(FAKE_CLAUDE, "Client", 11, false);
+      await clickWhenVisible('[data-testid="usage-chip"]');
+      await waitVisible('[data-testid="usage-spend-row"]');
+      const noPlan = await browser.execute(() =>
+        document.querySelector('[data-testid="usage-spend-row"]')?.textContent ?? "");
+      expect(noPlan).toContain("Spent since launch");
+      expect(noPlan).not.toContain("Would have cost");
+      await snap("credentials-16-cost-label.png");
+    } finally {
+      await removeTask(taskId);
+      await clearAccounts(FAKE_CLAUDE);
+      signOutAll(FAKE_CLAUDE);
+      await resetUsage();
       await dismissOverlays();
     }
   });
