@@ -15,7 +15,7 @@ import { usePrefs } from "@/store/prefs";
 import { useAgentUsage, usageKey, type UsageEntry } from "@/store/agentUsage";
 import { pillLabel, pillText } from "@/lib/accountPill";
 import { switchCandidate, switchedNotice, switchedAndResumedNotice } from "@/lib/autoSwitch";
-import { restartAgentForAccount, primaryAgentTab } from "@/lib/accountRestart";
+import { restartAgentForAccount, primaryAgentTab, openSignInTab } from "@/lib/accountRestart";
 import type { AgentAccounts } from "@/hooks/useAgentAccounts";
 
 export interface AccountSwitching {
@@ -88,9 +88,18 @@ export function useAccountSwitching(
       if (!primaryAgentTab(taskId, agentId)) return;
       // Not signed in yet: restarting would drop the agent on a login screen,
       // and the offer's promise ("resumes this conversation") would be false.
-      // Stage it and say what is missing instead.
+      //
+      // So OPEN THE PLACE THE LOGIN CAN HAPPEN rather than describing it. The
+      // old copy said "start this agent on it and run its login", which was
+      // true and useless: the agent in front of the user was still on the old
+      // account, so every `/login` available to them signed the OLD account in
+      // again. The tab this opens is on the new account (the write above is
+      // what decides that), so its login lands in the new store.
       if (!view?.accounts.find(a => a.name === name)?.signedIn) {
-        setNotice(`${name} is not signed in yet. Start this agent on it and run its login, then the switch takes hold.`);
+        const opened = openSignInTab(taskId, agentId, name);
+        setNotice(opened
+          ? `${name} has no login yet. Opened a tab on it: run this agent's own login there, then pick ${name} again to move this task over. The conversation beside it is untouched.`
+          : `${name} has no login yet. Start this agent on it and run its login, then the switch takes hold.`);
         return;
       }
       // Asked once per user, not once per switch. Someone who switches often

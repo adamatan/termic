@@ -29,8 +29,9 @@ let tabs: any[] = [];
 const patchTab = vi.fn((_t: string, tabId: string, patch: any) => {
   tabs = tabs.map(t => (t.id === tabId ? { ...t, ...patch } : t));
 });
+const addTab = vi.fn((_t: string, tab: any) => { tabs = [...tabs, tab]; });
 vi.mock("@/store/app", () => ({
-  useApp: { getState: () => ({ tabs: { t1: tabs }, patchTab }) },
+  useApp: { getState: () => ({ tabs: { t1: tabs }, patchTab, addTab }) },
 }));
 
 const agentTab = (over: any = {}) => ({
@@ -38,13 +39,15 @@ const agentTab = (over: any = {}) => ({
 });
 
 let restartAgentForAccount: typeof import("@/lib/accountRestart").restartAgentForAccount;
+let openSignInTab: typeof import("@/lib/accountRestart").openSignInTab;
 
 beforeEach(async () => {
   vi.useFakeTimers();
   tabs = [agentTab()];
   ptyKill.mockClear(); sendMessageToPty.mockClear();
   markPendingPtyRestart.mockClear(); patchTab.mockClear();
-  ({ restartAgentForAccount } = await import("@/lib/accountRestart"));
+  addTab.mockClear();
+  ({ restartAgentForAccount, openSignInTab } = await import("@/lib/accountRestart"));
 });
 afterEach(() => { vi.useRealTimers(); });
 
@@ -121,5 +124,38 @@ describe("restartAgentForAccount", () => {
     vi.advanceTimersByTime(60_000);
     expect(patchTab).toHaveBeenCalledWith("t1", "tab1", { promptPendingTitle: null });
     expect(sendMessageToPty).not.toHaveBeenCalled();
+  });
+});
+
+describe("openSignInTab", () => {
+  it("opens a tab in the task, so the agent can run its own login", () => {
+    // The dead end this removes: the running agent is on the OLD account, so
+    // every `/login` the user can reach signs the old account in again.
+    expect(openSignInTab("t1", "claude", "Work")).toBe(true);
+    expect(addTab).toHaveBeenCalledTimes(1);
+    const [taskId, tab] = addTab.mock.calls[0];
+    expect(taskId).toBe("t1");
+    expect(tab.cli).toBe("claude");
+    expect(tab.type).toBe("terminal");
+  });
+
+  it("names the tab for the job, not the agent", () => {
+    // A second tab called "claude" beside the real one is the confusing
+    // version: this one is disposable and exists to be closed.
+    openSignInTab("t1", "claude", "Work");
+    expect(addTab.mock.calls[0][1].title).toBe("Sign in: Work");
+  });
+
+  it("nothing to open for a task that is not loaded", () => {
+    expect(openSignInTab("nope", "claude", "Work")).toBe(false);
+    expect(addTab).not.toHaveBeenCalled();
+  });
+
+  it("does NOT touch the running agent", () => {
+    // The whole reason this is a tab and not a restart: the conversation
+    // beside it is the thing the switcher exists to protect.
+    openSignInTab("t1", "claude", "Work");
+    expect(ptyKill).not.toHaveBeenCalled();
+    expect(markPendingPtyRestart).not.toHaveBeenCalled();
   });
 });

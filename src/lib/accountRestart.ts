@@ -28,6 +28,41 @@ const SETTLE_MS = 5000;
 /** Give up waiting for the fresh pty. */
 const RESPAWN_DEADLINE_MS = 12000;
 
+/**
+ * Open a tab in this task where the agent runs AS `account`, so its own login
+ * can be run there (GH #278).
+ *
+ * The dead end this removes: an account starts out signed out, by design (termic
+ * makes an empty directory and never handles a credential), and the only way to
+ * fill it is the agent's own login. But the agent in front of the user is still
+ * running on the OLD account, so typing `/login` there signs the old account in
+ * again. We told people to "run its login" and gave them nowhere to do it.
+ *
+ * Nothing here is special-cased at the spawn: `pty_spawn` resolves the account
+ * from the TASK, and `pick` has already written the new one, so an ordinary
+ * agent tab in this task comes up on the new account with an empty store and a
+ * login prompt. The sandbox follows the same resolution
+ * (`task_login_store`), so a caged agent can write the credential it is about
+ * to receive. All that was missing was the button.
+ *
+ * A NEW TAB rather than a restart, because the conversation in the running tab
+ * is the thing the switcher exists to protect. Sign in beside it, then come
+ * back and switch.
+ */
+export function openSignInTab(taskId: string, agentId: string, account: string): boolean {
+  const app = useApp.getState();
+  if (!app.tabs[taskId]) return false;
+  app.addTab(taskId, {
+    id: crypto.randomUUID(),
+    type: "terminal",
+    // Named for the job, not the agent: this tab is disposable, and a second
+    // tab called "claude" beside the real one is the confusing version.
+    title: `Sign in: ${account}`,
+    cli: agentId,
+  });
+  return true;
+}
+
 /** The task's primary agent tab, which is the one an account switch is about. */
 export function primaryAgentTab(taskId: string, agentId: string): TerminalTab | undefined {
   const tabs = (useApp.getState().tabs[taskId] ?? []) as TerminalTab[];

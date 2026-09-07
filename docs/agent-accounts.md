@@ -367,6 +367,30 @@ names those scripts by ABSOLUTE path, so an account without them gets an agent
 that fails every hook on every turn. On the host that path resolves anyway,
 which is why it only broke in Docker.
 
+## Signing a new account in
+
+An account starts signed out, by design: termic makes an empty directory and
+never handles a credential, so only the agent's own login can fill it. The
+trap is that the agent in front of the user is still running on the OLD
+account, so every `/login` they can reach signs the old account in again. The
+first version of this said "start this agent on it and run its login", which
+was true and left them with nowhere to do it.
+
+Picking a signed-out account now OPENS that place: a tab in the same task,
+titled `Sign in: <name>`, where the agent runs as the new account.
+
+Nothing about that tab is special-cased at the spawn, and that is the point.
+`pty_spawn` resolves the account from the TASK, and `pick` writes the new one
+before it checks whether it is signed in, so an ORDINARY agent tab in that
+task already comes up on the new account with an empty store and a login
+prompt. `task_login_store` resolves the same way, so the cage allows the store
+the agent is about to write into. Everything needed was already there; the
+button was not.
+
+A tab rather than a restart, because the conversation in the running tab is
+the thing the switcher exists to protect. Sign in beside it, close the tab,
+then pick the account again to move the task over.
+
 ## Switching a RUNNING agent
 
 A switch writes a setting; the process keeps its environment until it restarts.
