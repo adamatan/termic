@@ -4,7 +4,7 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
-## [1.3.1] - 2026-09-07
+## [1.3.2] - 2026-09-07
 
 Profiles, and several logins per agent with a switcher that moves a running task.
 
@@ -23,8 +23,10 @@ Profiles, and several logins per agent with a switcher that moves a running task
   and runs the agent's own login in it, and everything that is not the
   credential (your settings, skills, commands, prompts and history) is shared
   back to your main config by symlink, so a second account is a second login
-  and not a second setup. Works sandboxed and in Docker. Settings, Agents.
-  ([#278](https://github.com/simion/termic/issues/278))
+  and not a second setup. Picking an account you have not signed into yet
+  opens a tab where you can run that agent's own login, beside the
+  conversation rather than instead of it. Works sandboxed and in Docker.
+  Settings, Agents. ([#278](https://github.com/simion/termic/issues/278))
 - **Switch accounts by yourself, at the limit.** Off by default, one checkbox
   per agent in the usage popover. When the account in use passes 95% of a
   rolling window, Termic moves the task to an account that has room, restarts
@@ -46,7 +48,9 @@ Profiles, and several logins per agent with a switcher that moves a running task
   reads Claude's usage off the status line it installs, so a project or a
   status line of your own that already owns that slot silently took the feed
   away. The chip now names what is holding the slot and where, and offers a
-  prompt you can hand to the agent that owns the script.
+  prompt you can hand to the agent that owns the script. That prompt now also
+  teaches the script to report what the account has cost, which on an account
+  with no subscription is the only reading there is.
   ([#277](https://github.com/simion/termic/issues/277))
 
 ## [1.2.3] - 2026-09-04
