@@ -525,4 +525,28 @@ describe("the blocked-feed explanation", () => {
     expect(p).toMatch(/Print NOTHING extra on stdout/i);
     expect(p).toMatch(/Never substitute 0/i);
   });
+
+  it("teaches the COST field, which is the only signal some accounts have", () => {
+    // The prompt taught four fields while the wire format carries five, so
+    // anyone who followed it got percentages and never a dollar figure. On an
+    // account with no subscription that is the whole reading, so the omission
+    // was not "one field missing", it was the feature not working at all.
+    const p = statusLineAgentPrompt(own("user"));
+    expect(p).toContain("total_cost_usd");
+    // Five placeholders in the example line, not four.
+    const wire = p.split("\n").find(l => l.includes("usage <5h>"))!;
+    expect(wire).toContain("<costUsd>");
+    const example = p.split("\n").find(l => /usage \d+ \d+ \d+ \d+ /.test(l));
+    expect(example).toBeTruthy();
+    expect(example!.trim().split(/\s+/)).toHaveLength(6); // the OSC word + 5 values
+  });
+
+  it("does not tell a script to go silent when only the cost is there", () => {
+    // The old rule was "send nothing if BOTH percentages are missing", which
+    // silences exactly the accounts the cost exists for: an API key, Bedrock,
+    // Vertex or an enterprise seat carries no rate_limits at all.
+    const p = statusLineAgentPrompt(own("user"));
+    expect(p).not.toMatch(/nothing at all if BOTH percentages are missing/i);
+    expect(p).toMatch(/only when ALL of the percentages and the cost are\s+missing/i);
+  });
 });

@@ -83,7 +83,7 @@ function field(raw: string | undefined): number | null {
 /**
  * Parse a trusted `usage …` body, or null when it is not one.
  *
- * Wire format, four space-separated fields after the prefix:
+ * Wire format, five space-separated fields after the prefix:
  *
  *     usage <5h percent> <7d percent> <5h resets_at> <7d resets_at> <cost usd>
  *
@@ -272,19 +272,27 @@ read:
   rate_limits.seven_day.used_percentage     (0-100)
   rate_limits.five_hour.resets_at           (Unix epoch SECONDS)
   rate_limits.seven_day.resets_at           (Unix epoch SECONDS)
+  total_cost_usd                            (dollars, may have decimals)
 
 Then, ONLY when both TERMIC_PTY and TERMIC_TASK_ID are set in the environment,
 open the file named by $TERMIC_PTY and write exactly this, with no newline:
 
-  \\033]777;notify;termic;usage <5h> <7d> <5hResetsAt> <7dResetsAt>\\007
+  \\033]777;notify;termic;usage <5h> <7d> <5hResetsAt> <7dResetsAt> <costUsd>\\007
 
 for example:
-  \\033]777;notify;termic;usage 58 41 1788530400 1788937200\\007
+  \\033]777;notify;termic;usage 58 41 1788530400 1788937200 0.2231\\007
 
 Rules that matter:
-- Write "-" for any of the four values that is missing or is not a number.
-  Never substitute 0, which would report a limit as unused.
-- Send nothing at all if BOTH percentages are missing.
+- Write "-" for any of the five values that is missing or is not a number.
+  Never substitute 0, which would report a limit as unused or a cost as free.
+- Do not round or format the cost. Send the number as it appears; Termic
+  decides how to display it.
+- Send nothing at all only when ALL of the percentages and the cost are
+  missing. In particular an account with no subscription (an API key, Bedrock,
+  Vertex, an enterprise seat) carries NO rate_limits at all, and its cost is
+  then the only thing there is to report: a script that stays silent unless it
+  sees a percentage reports nothing, ever, on exactly the accounts where the
+  cost is the whole point.
 - Print NOTHING extra on stdout. Whatever this script prints is what renders in
   the status line, so the sequence must go to $TERMIC_PTY and nowhere else.
 - Wrap the write so any failure is ignored. A status line that errors is one
