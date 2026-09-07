@@ -580,6 +580,27 @@ One invocation costs ~12ms wall / ~11.5ms CPU, of which ~9ms is the bare
 `/bin/sh` spawn and drain: the parsing itself is ~2.5ms. Against a turn
 measured in seconds, per turn, that is not a number worth optimising.
 
+**`total_cost_usd` is NESTED under a top-level `cost` object.** Measured on
+2.1.250, alongside `total_duration_ms`, `total_api_duration_ms` and the line
+counts. `rate_limits` IS top-level; the cost is not, and the asymmetry is the
+trap. termic's own script survives it by accident: it string-searches the raw
+payload for `"total_cost_usd":` and finds it at any depth. Anyone writing a
+status line with a real JSON parser reads `payload["total_cost_usd"]`, gets
+nothing, and reports no cost for ever on every account. The published fix-it
+prompt said exactly that for one release.
+
+**The status line does not run under `claude -p`.** Print mode has no status
+line, so a non-interactive run cannot be used to capture a payload, and a probe
+that reports nothing there is measuring the wrong thing. Every payload has to
+come from an interactive session.
+
+**Both a subscription and a team seat send `rate_limits` AND `cost`.**
+Measured on two accounts (`claude_team` / `team_tier_1` / `default_claude_max_5x`,
+and an ordinary Max login): each carries both, so the two are not alternatives
+and a panel showing plan windows next to a dollar figure is correct. What
+differs is the MEANING, which is why the spend row is labelled by `sawPlan`
+(see docs/agent-accounts.md).
+
 **A session that was already running does not pick it up.** Claude reads
 `settings.json` ONCE, at session start, so every tab open at the moment the
 status line is installed keeps running without one and reports no usage for the

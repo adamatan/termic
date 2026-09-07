@@ -532,7 +532,13 @@ describe("the blocked-feed explanation", () => {
     // account with no subscription that is the whole reading, so the omission
     // was not "one field missing", it was the feature not working at all.
     const p = statusLineAgentPrompt(own("user"));
-    expect(p).toContain("total_cost_usd");
+    // The PATH, not just the name. Measured against a real claude 2.1.250
+    // payload: the field is nested under a top-level `cost` object, and an
+    // instruction that says "total_cost_usd" alone leads straight to
+    // payload["total_cost_usd"], which is undefined on every account. Our own
+    // shell script survives it only because it string-searches the raw JSON.
+    expect(p).toContain("cost.total_cost_usd");
+    expect(p).toMatch(/NESTED under a top-level "cost"/);
     // Five placeholders in the example line, not four.
     const wire = p.split("\n").find(l => l.includes("usage <5h>"))!;
     expect(wire).toContain("<costUsd>");

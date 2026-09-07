@@ -272,7 +272,11 @@ read:
   rate_limits.seven_day.used_percentage     (0-100)
   rate_limits.five_hour.resets_at           (Unix epoch SECONDS)
   rate_limits.seven_day.resets_at           (Unix epoch SECONDS)
-  total_cost_usd                            (dollars, may have decimals)
+  cost.total_cost_usd                       (dollars, may have decimals)
+
+NOTE the path on that last one: it is NESTED under a top-level "cost" object,
+NOT at the top level. Reading it as payload["total_cost_usd"] finds nothing and
+reports no cost, for ever, which is the single easiest way to get this wrong.
 
 Then, ONLY when both TERMIC_PTY and TERMIC_TASK_ID are set in the environment,
 open the file named by $TERMIC_PTY and write exactly this, with no newline:
