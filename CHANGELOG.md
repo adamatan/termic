@@ -4,9 +4,9 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
-## [1.3.2] - 2026-09-07
+## [1.3.3] - 2026-09-07
 
-Profiles, and several logins per agent with a switcher that moves a running task.
+Work and personal profiles, and a Claude/Codex credentials switcher that moves a running task.
 
 ### Features
 - **Profiles.** A fully separate instance of Termic with its own window,
@@ -44,6 +44,15 @@ Profiles, and several logins per agent with a switcher that moves a running task
   for the release notes.
 
 ### Bug fixes
+- **`termic new --base` refuses a ref it cannot resolve**, instead of silently
+  cutting the worktree from your main checkout's current commit while
+  reporting the ref you asked for. A bare branch name that exists only as
+  `origin/<name>`, which is what `gh pr view --json headRefName` gives you,
+  now resolves the way `git checkout` resolves it.
+- Your plan usage shows on an account billed per token from the first turn,
+  rather than staying blank until it had spent something, and a subscription's
+  dollar figure is labelled as what it would have cost rather than as money
+  spent.
 - The plan usage chip no longer sits blank with nothing to explain it. Termic
   reads Claude's usage off the status line it installs, so a project or a
   status line of your own that already owns that slot silently took the feed
