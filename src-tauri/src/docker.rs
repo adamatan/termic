@@ -2942,11 +2942,18 @@ mod tests {
 
     #[test]
     fn dockerfile_provenance_survives_a_new_shipped_default() {
-        let dir = std::env::temp_dir().join(format!("termic-df-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("TERMIC_DATA_DIR", &dir);
-
+        // Through `with_scratch_data_dir`, which is the ONLY way to redirect
+        // `TERMIC_DATA_DIR`. Setting it here directly took no lock, so this
+        // test raced every other one that redirects it: another test's
+        // scratch dir would land under this one's feet between a write and
+        // the read that checks it, and `read_dockerfile` then answered with
+        // the shipped default for a file it could no longer find. It failed
+        // on CI and never on a developer's machine, because the window is a
+        // function of how slow the other test's filesystem work is.
+        //
+        // The pid-named directory was the other half of the same mistake: two
+        // concurrent runs on one machine share it. See test_support.rs.
+        with_scratch_data_dir(|| {
         let old_default = "FROM node:lts-bookworm\n# an older shipped file\n";
 
         // 1. THE bug. `is_default` used to be `saved == DEFAULT_DOCKERFILE`, so
@@ -2979,9 +2986,7 @@ mod tests {
         let _ = std::fs::remove_file(dockerfile_origin_path());
         assert_eq!(read_dockerfile(), DEFAULT_DOCKERFILE, "swept to the shipped default");
         assert!(!dockerfile_is_customised());
-
-        std::env::remove_var("TERMIC_DATA_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

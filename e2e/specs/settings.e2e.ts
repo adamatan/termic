@@ -3104,8 +3104,16 @@ describe("agent hooks", () => {
     // renders nothing (`present.filter(supported)` is empty), which is exactly
     // the state that made this fail on a runner with no agent CLI installed
     // while passing on every developer laptop that has claude.
-    await browser.execute(() => window.__termic!.useApp.setState({ detectedClis: {} }));
-    await waitForTextGone("Agent hooks");
+    // Re-applied on every poll, for the same reason the seed below is: the
+    // startup `refreshClis()` spawns a login shell to resolve PATH and lands
+    // whenever it lands, so a single clear before this wait is simply
+    // overwritten by a detection that finished a moment later. Clearing once
+    // and waiting passed on a warm machine and failed on a cold runner, which
+    // is the only place the detection is slow enough to land inside the wait.
+    await browser.waitUntil(async () => {
+      await browser.execute(() => window.__termic!.useApp.setState({ detectedClis: {} }));
+      return await browser.execute(() => !document.body.innerText.includes("Agent hooks"));
+    }, { timeout: 15_000, timeoutMsg: "the hooks block never went away with no agent detected" });
     // Seeded on every poll, not once. `refreshClis()` is fired at startup and
     // resolves asynchronously - it spawns a login shell to resolve PATH, which
     // is slow on a cold runner - and lands with `set({ detectedClis })`, so a
