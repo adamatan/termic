@@ -4162,8 +4162,29 @@ fn account_signed_in(agent_id: &str, account: &str, realm: LoginRealm, agents: &
     }
     let Some(dir) = login_store_dir(agent_id, Some(account), realm) else { return false };
     std::fs::read_dir(&dir)
-        .map(|mut d| d.any(|e| e.is_ok()))
+        .map(|d| d.flatten().any(|e| !farm_planted(&e)))
         .unwrap_or(false)
+}
+
+/// Did TERMIC put this here? Then it is not evidence of a login.
+///
+/// "The store has something in it" meant "the agent signed in here" for
+/// exactly as long as a new store was empty. Building the farm as part of
+/// CREATING the account (which is the right behaviour: a bare directory is a
+/// BLANK agent) ended that, and nothing failed loudly: every account reported
+/// signed in from the moment it was named, so the rule that stops a switch
+/// onto an account with no credential was dead, and an automatic switch would
+/// restart a task onto a login screen.
+///
+/// The split is exact rather than heuristic. Everything the farm plants is a
+/// symlink, plus one marker file; what an agent writes when it logs in is a
+/// real file it owns. A shared entry the agent writes THROUGH stays a symlink
+/// here, which is correct: settings.json changing is not a login.
+fn farm_planted(entry: &std::fs::DirEntry) -> bool {
+    if entry.file_name() == std::ffi::OsStr::new(ACCOUNT_FARM_MARKER) {
+        return true;
+    }
+    entry.file_type().map(|t| t.is_symlink()).unwrap_or(false)
 }
 
 #[tauri::command]
@@ -22813,6 +22834,24 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             assert!(!crate::account_signed_in("claude", "Work", LoginRealm::Host, &[]),
                 "an empty directory is not a login");
+
+            // ...and neither is a store TERMIC has already furnished. This is
+            // the case the first version of this test missed: it built the
+            // store by hand, the way the code used to, while `account_add`
+            // had moved to building the farm as part of creating the account.
+            // Every new account then reported signed in from the moment it
+            // was named, which silently disabled the one rule that stops an
+            // automatic switch restarting a task onto a login screen.
+            let primary = dir.parent().unwrap().join("primary");
+            std::fs::create_dir_all(&primary).unwrap();
+            std::fs::write(primary.join("settings.json"), "{}").unwrap();
+            crate::build_account_farm(&primary, &dir, &["settings.json"]).unwrap();
+            assert!(dir.join(crate::ACCOUNT_FARM_MARKER).exists(), "the farm ran");
+            assert!(dir.join("settings.json").symlink_metadata().unwrap()
+                .file_type().is_symlink(), "the shared entry is a symlink");
+            assert!(!crate::account_signed_in("claude", "Work", LoginRealm::Host, &[]),
+                "a furnished store with no credential is not a login");
+
             std::fs::write(dir.join(".credentials.json"), "x").unwrap();
             assert!(crate::account_signed_in("claude", "Work", LoginRealm::Host, &[]));
         });

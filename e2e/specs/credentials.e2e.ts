@@ -228,15 +228,32 @@ describe("agent credentials", () => {
     // The first account names the login the agent ALREADY has, so the user is
     // never shown a credential set they did not name. Same rule as the first
     // profile adopting the existing install.
+    //
+    // TWO names in one step, which is the whole shape of this form: naming
+    // the current login alone leaves the user with one account and no second,
+    // which is not a thing anyone came here to do. Asking for one name behind
+    // a button reading "Second account" ended with the existing login renamed
+    // and still no second account.
     // Started from the header, which is the only affordance while dormant.
     await clickWhenVisible(`[data-testid="agent-accounts-${AGENT}"]`);
     await setInput(`[data-testid="account-name-${AGENT}"]`, "Personal");
-    await browser.keys(["Enter"]);
+    await setInput(`[data-testid="account-second-${AGENT}"]`, "Work");
+    // The confirm button, not Enter: `setInput` writes a value without moving
+    // focus, so a keystroke would go wherever focus happened to be.
+    await clickWhenVisible(`[data-testid="account-add-confirm-${AGENT}"]`);
     await waitVisible(`[data-testid="account-chip-${AGENT}-Personal"]`);
+    await waitVisible(`[data-testid="account-chip-${AGENT}-Work"]`);
 
     const v = await accounts();
-    expect(v.accounts.map((a: any) => a.name)).toEqual(["Personal"]);
+    expect(v.accounts.map((a: any) => a.name)).toEqual(["Personal", "Work"]);
+    // The one that was ADOPTED is the default, not the one just created: the
+    // agent is working right now, and a first switch nobody asked for is the
+    // one way this feature could break a setup it was meant to extend.
     expect(v.accounts[0].isDefault).toBe(true);
+    expect(v.accounts[1].isDefault).toBe(false);
+    // Only the SECOND is a new login. The first was adopted, so it is the one
+    // the agent already had, and nothing was created for it.
+    expect(v.accounts[1].signedIn).toBe(false);
     // It ADOPTS the login the agent already has rather than creating an empty
     // one, so someone whose agent works fine is never told they are "not
     // signed in". Whether it reads as signed in depends on whether this
@@ -249,25 +266,26 @@ describe("agent credentials", () => {
     expect(adopted).toBe("Personal");
   });
 
-  it("adds a second set and refuses names that would collide on disk", async () => {
+  it("adds a further set from the row, and refuses names that collide on disk", async () => {
+    // Every set after the first two comes from the row, which asks for one
+    // name: there is no login left to adopt, so there is nothing to pair it
+    // with. Enter, because a single field has nowhere else for focus to be.
     await clickWhenVisible(`[data-testid="account-add-${AGENT}"]`);
-    await setInput(`[data-testid="account-name-${AGENT}"]`, "Work");
+    await setInput(`[data-testid="account-name-${AGENT}"]`, "Client");
     await browser.keys(["Enter"]);
-    await waitVisible(`[data-testid="account-chip-${AGENT}-Work"]`);
+    await waitVisible(`[data-testid="account-chip-${AGENT}-Client"]`);
     await snap("credentials-02-two-accounts.png");
-    // Only the SECOND set is a new login: the first was adopted, so it is the
-    // one the agent already had.
     const v2 = await accounts();
-    expect(v2.accounts.find((a: any) => a.name === "Work").signedIn).toBe(false);
+    expect(v2.accounts.find((a: any) => a.name === "Client").signedIn).toBe(false);
 
     // The name IS the key, so two names that slugify the same would share one
     // directory. Refused rather than silently merged.
     const err = await browser.execute(async (agent) => {
-      try { await window.__termic!.invoke("account_add", { agentId: agent, name: "work" }); return null; }
+      try { await window.__termic!.invoke("account_add", { agentId: agent, name: "client" }); return null; }
       catch (e) { return String(e); }
     }, AGENT);
     expect(err).toBeTruthy();
-    expect((await accounts()).accounts.length).toBe(2);
+    expect((await accounts()).accounts.length).toBe(3);
   });
 
   it("keeps the first one as the default until told otherwise", async () => {
@@ -503,8 +521,18 @@ describe("agent credentials", () => {
       await waitVisible('[data-testid="usage-chip"]');
       await browser.waitUntil(async () => (await pillAccount()) === "Personal",
         { timeoutMsg: "the task never landed on the adopted account" });
+      // Asserted on the two stores this spec OWNS, not on the adopted one.
+      // "Personal" is adopted, so it reports signed in exactly when the real
+      // agent's config dir exists on this machine, which is true on a
+      // developer's Mac and false on a CI runner that has never run claude.
+      // Pinning it either way makes the spec pass in one place and fail in
+      // the other, which is what it did. What the rule needs is that the two
+      // empty stores are empty, and neither is offered.
       const v = await accountsFor(FAKE_CLAUDE);
-      expect(v.accounts.filter((a: any) => a.signedIn).map((a: any) => a.name)).toEqual(["Personal"]);
+      expect(v.accounts.filter((a: any) => a.signedIn).map((a: any) => a.name))
+        .not.toContain("Work");
+      expect(v.accounts.filter((a: any) => a.signedIn).map((a: any) => a.name))
+        .not.toContain("Client");
 
       await seedUsage(FAKE_CLAUDE, "Personal", 99);
       // Nothing to prove a negative against, so give the offer every chance to
@@ -539,7 +567,7 @@ describe("agent credentials", () => {
       await clickWhenVisible('[data-testid="usage-chip"]');
       await waitVisible('[data-testid="account-auto-toggle"]');
       await snap("credentials-13-auto-toggle.png");
-      await clickWhenVisible('[data-testid="account-auto-toggle"] input');
+      await clickWhenVisible('[data-testid="account-auto-toggle"] [role="checkbox"]');
       await browser.waitUntil(async () => await browser.execute(() =>
         document.querySelector('[data-testid="account-auto-toggle"]')?.getAttribute("data-on") === "1"),
         { timeoutMsg: "the opt-in never stuck" });
@@ -557,28 +585,29 @@ describe("agent credentials", () => {
       const notice = await browser.execute(() =>
         document.querySelector('[data-testid="account-auto-notice"]')?.textContent ?? "");
       expect(notice).toContain("Client");
-      // The delay is stated, not discovered: the running process keeps its
-      // login, so nothing changes until the agent restarts.
-      expect(notice).toContain("next starts");
-      // THE PROMISE THE UI MAKES, asserted: the running process keeps its
-      // login. The setting says Client and the process is still on Work, and
-      // that gap is exactly why usage is keyed by the account the process was
-      // SPAWNED with rather than the configured one.
-      expect(await pillUsageAccount()).toBe("Work");
-      // ...and the pill SAYS both, in that order. The numbers to its right are
-      // Work's, so a pill naming only Client would caption them with an
-      // account that has not spent a token.
-      const pillWords = await browser.execute(() =>
-        document.querySelector('[data-testid="usage-chip"]')?.textContent ?? "");
-      expect(pillWords).toContain("Work");
-      expect(pillWords).toContain("Client");
-      // ...so the numbers on screen are still Work's 97%, not a blank chip
-      // under Client's name. This is the misattribution the account half of
-      // the usage key exists to prevent, asserted end to end.
+      // It RESTARTED, and the copy says so. The manual switch only stages the
+      // change (the case above asserts that gap, which is real: a running
+      // process cannot have its environment changed underneath it). The
+      // automatic one cannot stop there, because nobody is at the keyboard to
+      // do the restart, and a switch that waits for a restart nobody performs
+      // is a switch that never happens.
+      expect(notice).toContain("resumed this conversation");
+      // ...and it says the agent was told to carry on, because output
+      // appearing with nobody at the keyboard is otherwise alarming.
+      expect(notice).toContain("continue");
+      await snap("credentials-14-auto-switched.png");
+
+      // The promise, asserted end to end: a process is actually RUNNING on
+      // Client. The setting alone would be the feature not working.
+      await waitForSpawnOn(taskId, "Client");
+      await browser.waitUntil(async () => (await pillUsageAccount()) === "Client",
+        { timeout: 10_000, timeoutMsg: "the numbers never followed the process onto Client" });
+      // ...and the numbers are Client's, not Work's 97% relabelled. This is
+      // the misattribution the account half of the usage key exists to
+      // prevent: Client has spent nothing, so there is nothing to show.
       expect(await browser.execute(() =>
         document.querySelector('[data-testid="usage-chip"]')?.getAttribute("data-usage-session")))
-        .toBe("97");
-      await snap("credentials-14-auto-switched.png");
+        .not.toBe("97");
 
       // The agent's DEFAULT is untouched: this moved one task, exactly as the
       // manual switch does. Every other task stays where it was.
@@ -627,7 +656,7 @@ describe("agent credentials", () => {
         !!document.querySelector('[data-testid="usage-auto-switch"]'))).toBe(false);
       await snap("credentials-15-one-panel.png");
 
-      await clickWhenVisible('[data-testid="account-auto-toggle"] input');
+      await clickWhenVisible('[data-testid="account-auto-toggle"] [role="checkbox"]');
       await browser.waitUntil(async () => await browser.execute(() =>
         document.querySelector('[data-testid="account-auto-toggle"]')?.getAttribute("data-on") === "1"),
         { timeoutMsg: "the opt-in never stuck" });
@@ -699,19 +728,28 @@ describe("agent credentials", () => {
 
   it("removes a set without touching the login it shares", async () => {
     await openAgentsPage();
+    // "Work" is the default by now (the case above made it one), so this is
+    // also the removal that has to promote a survivor.
     await waitVisible(`[data-testid="account-chip-${AGENT}-Work"]`);
     await clickWhenVisible(`[data-testid="account-remove-${AGENT}-Work"]`);
     await waitGone(`[data-testid="account-chip-${AGENT}-Work"]`);
     const v = await accounts();
-    expect(v.accounts.map((a: any) => a.name)).toEqual(["Personal"]);
+    expect(v.accounts.map((a: any) => a.name)).toEqual(["Personal", "Client"]);
     // Removing the default promotes the survivor rather than leaving none.
-    expect(v.accounts[0].isDefault).toBe(true);
+    // WHICH survivor is not the point and is not asserted; that there is one
+    // is, because an agent with accounts and no default cannot spawn.
+    expect(v.accounts.filter((a: any) => a.isDefault).length).toBe(1);
   });
 
   it("returns to a single login when the last set goes", async () => {
     await openAgentsPage();
-    await clickWhenVisible(`[data-testid="account-remove-${AGENT}-Personal"]`);
-    await waitGone(`[data-testid="account-chip-${AGENT}-Personal"]`);
+    // Empty it from the UI, however many are left, rather than by name: the
+    // count above this case has changed twice, and each time this one failed
+    // for a reason that had nothing to do with what it tests.
+    for (const name of ["Personal", "Client"]) {
+      await clickWhenVisible(`[data-testid="account-remove-${AGENT}-${name}"]`);
+      await waitGone(`[data-testid="account-chip-${AGENT}-${name}"]`);
+    }
     expect((await accounts()).accounts).toEqual([]);
     // The header affordance comes back, so backing out fully is possible.
     await browser.waitUntil(async () => await browser.execute((a) =>
@@ -741,7 +779,10 @@ async function openAgentsPage(agent = AGENT): Promise<void> {
   await browser.execute((a) => {
     (document.querySelector(`[data-agent-id="${a}"]`) as HTMLElement | null)?.click();
   }, agent);
-  await waitVisible(`[data-testid="agent-accounts-${agent}"]`);
+  // The CARD, never the accounts control. An agent with no measured login
+  // store renders no accounts control at all, and that is a case this spec
+  // asserts, so waiting for one here made the helper contradict its own test.
+  await waitVisible(`[data-agent-card="${agent}"]`);
 }
 
 function accounts(): Promise<any> {
