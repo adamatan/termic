@@ -688,6 +688,49 @@ describe("agent credentials", () => {
     }
   });
 
+  it("says why a per-token account has no bars, before it has spent anything", async () => {
+    // The wire an enterprise usage-based seat actually sends, measured:
+    //   usage - - - - 0          at session start
+    //   usage - - - - 0.235401   after the first turn
+    // The chip used to need a POSITIVE figure, so between those two the whole
+    // thing was hidden and nothing said why. That gap is what "it does not
+    // report my account" looks like from the outside.
+    await resetUsage();
+    await addAccounts(FAKE_CLAUDE);
+    const taskId = await openTaskWith(FAKE_CLAUDE, "acct-planless");
+    try {
+      await waitVisible('[data-testid="usage-chip"]');
+      // TWO window-less readings, which is what proves there is no plan: one
+      // alone is every subscription's first payload of a session.
+      await seedCost(FAKE_CLAUDE, "Work", 0, false);
+      await seedCost(FAKE_CLAUDE, "Work", 0, false);
+
+      await clickWhenVisible('[data-testid="usage-chip"]');
+      const panel = await browser.execute(() =>
+        document.querySelector('[data-testid="usage-detail"]')?.textContent ?? "");
+      // The sentence exists already; it simply never got to render.
+      expect(panel).toMatch(/billed per token/i);
+      // ...and the row is there at zero, rather than appearing a turn later.
+      await waitVisible('[data-testid="usage-spend-row"]');
+      await dismissOverlays();
+
+      // Then the first turn lands and the number moves. Nothing appears or
+      // disappears, which is the point: no layout flip mid-session.
+      await seedCost(FAKE_CLAUDE, "Work", 0.235401, false);
+      await clickWhenVisible('[data-testid="usage-chip"]');
+      const after = await browser.execute(() =>
+        document.querySelector('[data-testid="usage-spend-row"]')?.textContent ?? "");
+      expect(after).toContain("0.24");
+      await snap("credentials-17-planless.png");
+    } finally {
+      await removeTask(taskId);
+      await clearAccounts(FAKE_CLAUDE);
+      signOutAll(FAKE_CLAUDE);
+      await resetUsage();
+      await dismissOverlays();
+    }
+  });
+
   it("does not call a subscription's dollars 'spent'", async () => {
     // claude reports `total_cost_usd` on EVERY account, subscription
     // included, so a plan account shows both windows and a dollar figure.

@@ -88,6 +88,14 @@ export interface CostEntry {
 /**
  * Should the FOOTER CHIP show money for this account?
  *
+ *  ZERO IS A READING, not an absence, once the account is known to have no
+ *  plan. Requiring `spend > 0` hid the whole chip on a per-token account
+ *  between its session start and its first completed turn: the wire carries
+ *  `- - - - 0` there, so there was nothing to show and nothing saying why,
+ *  which is the state a user reads as "it does not report my account".
+ *  Measured on an enterprise usage-based seat, which sends `- - - - 0` and
+ *  then `- - - - 0.235401`.
+ *
  *  Only for an account with no plan, which is the case the whole cost feed
  *  exists for: a token-billed account reports no percentages and its chip was
  *  empty. On a subscription the percentages are the readout and money in the
@@ -100,10 +108,18 @@ export interface CostEntry {
  *  plan-less. A subscription reports its windows on the next payload, so a
  *  second one in a row is evidence.
  */
+/** How many window-less readings in a row prove there is no plan. */
+export const WINDOWLESS_FOR_NO_PLAN = 2;
+
 export function costChipVisible(entry: UsageEntry | undefined, spend: number): boolean {
-  if (spend <= 0 || !entry) return false;
+  if (!entry) return false;
   if (entry.sawPlan) return false;
-  return entry.windowless >= 2;
+  // Only claude's status line reports cost at all. codex's feed is plan
+  // windows and nothing else, so a window-less codex reading would otherwise
+  // print "$0.00" for a number it never sent.
+  if (entry.source !== "statusline") return false;
+  if (!(spend >= 0)) return false;
+  return entry.windowless >= WINDOWLESS_FOR_NO_PLAN;
 }
 
 /** Everything spent on this account since launch. */
@@ -195,8 +211,20 @@ export const useAgentUsage = create<AgentUsageState>((set, get) => ({
     // `updatedAt` is deliberately NOT part of the comparison. Refreshing it on
     // an unchanged reading would defeat the bail entirely, and the staleness it
     // feeds is about the NUMBER's age, not the poll's.
-    if (cur && cur.source === source && sameUsage(cur, usage)) return;
     const hasWindow = !!(usage.session || usage.weekly);
+    // ...EXCEPT while the window-less evidence is still being gathered.
+    //
+    // Two readings with no window prove there is no plan. A per-token account
+    // repeats the SAME payload every turn until it spends something
+    // (`- - - - 0`, measured on an enterprise usage-based seat), so bailing on
+    // equality froze `windowless` at one and the evidence never arrived: the
+    // chip stayed hidden with nothing saying why, for the whole first turn.
+    //
+    // Bounded at one extra write per account per session, because the
+    // exemption stops the moment the count reaches the threshold. This is not
+    // a per-turn write and does not reopen bear trap 8.
+    const gathering = !hasWindow && !!cur && cur.windowless < WINDOWLESS_FOR_NO_PLAN;
+    if (cur && cur.source === source && sameUsage(cur, usage) && !gathering) return;
     set(s => ({
       byAgent: {
         ...s.byAgent,

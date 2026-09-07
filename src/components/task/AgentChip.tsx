@@ -368,7 +368,12 @@ function UsageDetail({ agentId, entry, level, driver, spend, accountsView, refre
             This account is billed per token, so it has no plan limits.
           </div>
         )}
-        {spend > 0 && (
+        {/* `costChipVisible` as well as a positive figure: on an account
+            known to have no plan, zero is a reading (nothing spent yet) and
+            hiding the row leaves the panel with a single sentence and no
+            number, one turn before it fills in. A PLAN account keeps the
+            `spend > 0` rule, because `costChipVisible` is false there. */}
+        {(spend > 0 || costChipVisible(entry, spend)) && (
           <div
             data-testid="usage-spend-row"
             className="flex items-baseline justify-between border-t border-[var(--color-border-soft)] pt-2.5"

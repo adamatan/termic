@@ -469,6 +469,40 @@ documented in Anthropic's own environment reference). termic running the
 real `claude` binary keeps it on the right side of that line either way,
 since termic never speaks to the API itself. The config-dir isolation this ships is literally that blessed pattern; lifting a token blob out of the Keychain and planting it elsewhere, which termic does NOT do, is the part no vendor has blessed. A product risk to weigh, not a legal opinion.
 
+## A per-token seat sends nothing but a zero, at first
+
+Measured on an enterprise usage-based seat (`claude_enterprise`,
+`enterprise_usage_based`, `userRateLimitTier: default_claude_zero`), driven
+through a real task:
+
+```
+usage - - - - 0            session start
+usage - - - - 0.235401     after the first turn
+```
+
+No rate limits, EVER: a zero rate-limit tier has no personal window
+allocation, because billing is per token at the org level. The cost is the
+entire reading, and it is zero until the session spends something.
+
+That gap used to render nothing at all. The chip needs a reason to appear and
+the only one available was a positive dollar figure, so between session start
+and the first completed turn the account with nothing BUT a dollar figure
+showed no chip and no explanation. It is exactly what "termic does not report
+my account" looks like from outside.
+
+Zero is now a reading rather than an absence, once the account is KNOWN to
+have no plan. Two window-less readings are what proves that, and getting them
+took a second fix: `report` drops a reading identical to the last one (bear
+trap 8, the status line fires every turn), and a per-token account repeats the
+same payload for ever, so `windowless` froze at one and the evidence never
+arrived. The bail now makes an exception while the count is still below the
+threshold, which is bounded at one extra write per account per session and is
+not a per-turn write.
+
+`costChipVisible` also requires `source === "statusline"`. codex answers plan
+windows and nothing else, so a window-less codex reading would otherwise print
+`$0.00` for a number it never sent.
+
 ## A plan's dollars are not spend
 
 claude reports `total_cost_usd` on EVERY account, subscription included, so a

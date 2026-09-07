@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   USAGE_BODY_PREFIX, parseUsageBody, sameUsage, formatPercent, formatReset, formatUsd,
   usageLevel, drivingWindow, USAGE_WARN_PERCENT, USAGE_CRITICAL_PERCENT,
@@ -265,9 +265,21 @@ describe("when money is allowed in the chip", () => {
     expect(costChipVisible(entry({ sawPlan: true, windowless: 9 }), 5)).toBe(false);
   });
 
-  it("shows nothing when nothing has been spent", () => {
-    expect(costChipVisible(entry({ windowless: 5 }), 0)).toBe(false);
+  it("shows ZERO on an account known to have no plan, because zero is a reading", () => {
+    // Measured on an enterprise usage-based seat: the wire carries
+    // `- - - - 0` at session start and `- - - - 0.235401` after the first
+    // turn. Requiring a positive figure hid the entire chip in between, so
+    // the account that has nothing BUT a dollar figure showed nothing at
+    // all, with no sentence saying why. Nothing spent yet is a fact.
+    expect(costChipVisible(entry({ windowless: 5 }), 0)).toBe(true);
     expect(costChipVisible(undefined, 1)).toBe(false);
+  });
+
+  it("stays hidden for a feed that cannot report cost at all", () => {
+    // codex answers plan windows and nothing else, so a window-less reading
+    // from it would otherwise print "$0.00" for a number it never sent.
+    expect(costChipVisible(entry({ windowless: 5, source: "rpc" }), 0)).toBe(false);
+    expect(costChipVisible(entry({ windowless: 5, source: "rpc" }), 3)).toBe(false);
   });
 });
 
@@ -554,5 +566,44 @@ describe("the blocked-feed explanation", () => {
     const p = statusLineAgentPrompt(own("user"));
     expect(p).not.toMatch(/nothing at all if BOTH percentages are missing/i);
     expect(p).toMatch(/only when ALL of the percentages and the cost are\s+missing/i);
+  });
+});
+
+describe("gathering the no-plan evidence", () => {
+  // The bail that keeps the status line off the hot path (docs/performance.md
+  // bear trap 8) drops a reading identical to the last one. A per-token
+  // account repeats the SAME payload every turn until it spends something, so
+  // that bail froze `windowless` at one and the evidence for "this account has
+  // no plan" never arrived: the chip stayed hidden with nothing saying why.
+  const read = (agent: string, cost: number | null) =>
+    useAgentUsage.getState().report(
+      agent, "Work", { session: null, weekly: null, sessionCostUsd: cost },
+      "statusline", "s1");
+  const entryFor = (agent: string) =>
+    useAgentUsage.getState().byAgent[usageKey(agent, "Work")];
+
+  beforeEach(() => useAgentUsage.setState({ byAgent: {}, cost: {} }));
+
+  it("counts a REPEATED window-less reading, which is all a per-token seat sends", () => {
+    read("a", 0);
+    expect(entryFor("a").windowless).toBe(1);
+    read("a", 0);                       // byte-identical, and it must still count
+    expect(entryFor("a").windowless).toBe(2);
+    expect(costChipVisible(entryFor("a"), 0)).toBe(true);
+  });
+
+  it("stops counting once the evidence is in, so this is not a per-turn write", () => {
+    read("b", 0); read("b", 0);
+    const settled = entryFor("b");
+    read("b", 0); read("b", 0); read("b", 0);
+    // Object identity: an unchanged reading past the threshold writes nothing.
+    expect(entryFor("b")).toBe(settled);
+    expect(entryFor("b").windowless).toBe(2);
+  });
+
+  it("a reading that CHANGES still lands, threshold or not", () => {
+    read("c", 0); read("c", 0);
+    read("c", 0.235401);
+    expect(entryFor("c").sessionCostUsd).toBe(0.235401);
   });
 });
