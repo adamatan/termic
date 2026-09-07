@@ -2538,19 +2538,71 @@ fn detect_default_remote(repo: &Path) -> String {
 /// Callers that refresh the remote (git_fetch_base) must do so BEFORE calling
 /// this, so a fetchable "origin/main" is seen and preferred over stale-local.
 fn resolve_base_ref(repo: &Path, base: &str) -> String {
+    try_resolve_base_ref(repo, base).unwrap_or_else(|| "HEAD".to_string())
+}
+
+/// The same resolution, without the fallback: `None` when nothing matched.
+///
+/// The fallback in `resolve_base_ref` is right for a STORED base and wrong for
+/// one a user just typed. A local-only repo pinned to "origin/main" has no
+/// remote-tracking refs at all and must still open a task, so falling back
+/// there is correct. A `--base` argument that resolves to nothing is a
+/// different situation entirely: the caller asked for a specific commit, and
+/// cutting from HEAD instead hands them a worktree containing code they did
+/// not ask for, reported as if it were the code they did. Exit 0, a summary
+/// line naming the ref, and a worktree on something else (GH report, 1.3.2).
+///
+/// Callers that have a user-supplied ref use THIS and refuse; callers that
+/// have a stored one keep the tolerant wrapper above.
+fn try_resolve_base_ref(repo: &Path, base: &str) -> Option<String> {
     let exists = |r: &str| git(&["rev-parse", "--verify", "--quiet", r], repo).is_ok();
-    if exists(base) {
-        return base.to_string();
+    // `^{commit}` so a ref that exists but does not name a commit (a tree, a
+    // blob, an annotated tag pointing at neither) is rejected here rather than
+    // failing later inside `git branch`.
+    if exists(&format!("{base}^{{commit}}")) {
+        return Some(base.to_string());
     }
     // Strip a leading "<remote>/" segment: "origin/main" -> "main",
     // "origin/feature/x" -> "feature/x" (split on the FIRST slash only).
     if let Some((_, local)) = base.split_once('/') {
-        if exists(local) {
-            return local.to_string();
+        if exists(&format!("{local}^{{commit}}")) {
+            return Some(local.to_string());
         }
     }
-    // Last resort: whatever HEAD points at, so the create still succeeds.
-    "HEAD".to_string()
+    // ...and the reverse, which is the case that actually bites people:
+    // a BARE name that exists only as `refs/remotes/<remote>/<name>`.
+    //
+    // `gh pr view <n> --json headRefName` returns a bare branch name, and for
+    // any branch outside `remote.origin.fetch` that name exists only as a
+    // remote-tracking ref. `git checkout <name>` DWIMs it into a tracking
+    // branch; `git rev-parse --verify <name>` does not, so anything built on
+    // rev-parse rejected a name a user reasonably expects to work.
+    //
+    // git's own rule is "exactly one remote has it", so an ambiguous name
+    // stays unresolved rather than picking a remote by luck. The default
+    // remote wins outright when it has the ref, matching `detect_default_remote`.
+    // No "is it unqualified" guard here: a branch NAME routinely contains a
+    // slash (`feature/pr-1`), and git DWIMs those exactly the same way. The
+    // strip-the-remote branch above already covers `origin/main`, and probing
+    // `refs/remotes/origin/origin/main` for it simply finds nothing.
+    {
+        let default = detect_default_remote(repo);
+        let qualified = format!("refs/remotes/{default}/{base}");
+        if exists(&format!("{qualified}^{{commit}}")) {
+            return Some(qualified);
+        }
+        let remotes: Vec<String> = git(&["remote"], repo)
+            .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+            .unwrap_or_default();
+        let mut hits = remotes.iter().filter_map(|r| {
+            let q = format!("refs/remotes/{r}/{base}");
+            exists(&format!("{q}^{{commit}}")).then_some(q)
+        });
+        if let (Some(one), None) = (hits.next(), hits.next()) {
+            return Some(one);
+        }
+    }
+    None
 }
 
 /// The ref a task's diff is taken against, or None when the worktree has no
@@ -5961,6 +6013,12 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
     // Determine "branch new from" — strip the remote prefix if needed for create.
     // git can branch off "origin/master" directly.
     let base_full = task_base_branch(&proj.base_branch, args.base_branch.as_deref());
+    // Did the CALLER name this base, or did it come off the project's pin?
+    // Only the first is verified strictly: see the resolution below. Trimmed
+    // and emptiness-checked the same way `task_base_branch` does, so " " is
+    // absent rather than a base nobody can satisfy.
+    let user_supplied_base = args.base_branch.as_deref()
+        .map(str::trim).is_some_and(|b| !b.is_empty());
 
     // Personal settings, loaded ONCE here and reused for the tasks root and
     // the sandbox defaults further down.
@@ -6059,7 +6117,29 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
             git_fetch_base(&repo, &base_full);
         }
         // Resolve to a ref that exists (local-only repos have no origin/main).
-        let base_ref = resolve_base_ref(&repo, &base_full);
+        //
+        // A base the USER supplied is verified rather than resolved: if it
+        // names nothing, refuse. The fallback to HEAD is correct for a stored
+        // base and catastrophic for this one, because the caller asked for a
+        // specific commit and would get whatever the main checkout happens to
+        // be sitting on, reported as the ref they asked for. An agent then
+        // reviews an unrelated branch and says so confidently.
+        //
+        // AFTER the fetch above, deliberately: a ref that exists only on the
+        // remote is fetchable, and rejecting it before trying would refuse
+        // something that does work.
+        let base_ref = if user_supplied_base {
+            match try_resolve_base_ref(&repo, &base_full) {
+                Some(r) => r,
+                None => return Err(format!(
+                    "base ref '{base_full}' does not resolve in {}. \
+                     Fetch it first (git fetch origin {base_full}), or pass a ref that exists.",
+                    repo.display(),
+                )),
+            }
+        } else {
+            resolve_base_ref(&repo, &base_full)
+        };
         emit_create_progress(&app, &task_id, format!("Branching '{branch}' from '{base_ref}'…"));
         let branch_result = match git(&["branch", "--no-track", &branch, &base_ref], &repo) {
             Ok(_) => Ok(()),
@@ -25845,6 +25925,80 @@ mod tests {
     // The project default base is remote-tracking ("origin/main"), which a
     // local-only repo (no remote) doesn't have — the reason a race/New Task
     // errored with "not a valid object name: origin/main". Verify the fallback.
+    #[test]
+    fn a_bare_name_that_only_exists_on_the_remote_still_resolves() {
+        // Row three of the report, and the common case rather than an edge
+        // one: `gh pr view <n> --json headRefName` returns a BARE branch name,
+        // and for any branch outside `remote.origin.fetch` that name exists
+        // only as `refs/remotes/origin/<name>`. `git checkout <name>` DWIMs
+        // it; `git rev-parse --verify <name>` does not, so resolution built on
+        // rev-parse rejected a name users reasonably expect to work, and the
+        // rejection was then swallowed into a fallback.
+        let dir = tempdir().unwrap();
+        let origin = dir.path().join("origin.git");
+        let work = dir.path().join("work");
+        fs::create_dir_all(&origin).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        let run = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args).current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "T").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "T").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap();
+            assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&origin, &["init", "--bare", "-b", "main"]);
+        git_init_with_commit(&work);
+        run(&work, &["remote", "add", "origin", &origin.to_string_lossy()]);
+        run(&work, &["push", "-u", "origin", "main"]);
+        // A branch that exists ONLY on the remote, with its own commit.
+        run(&work, &["checkout", "-b", "feature/pr-1"]);
+        run(&work, &["commit", "--allow-empty", "-m", "pr work"]);
+        run(&work, &["push", "origin", "feature/pr-1"]);
+        let pr_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap();
+        let pr_sha = String::from_utf8_lossy(&pr_sha.stdout).trim().to_string();
+        // Delete the local branch: now the name lives only under refs/remotes.
+        run(&work, &["checkout", "main"]);
+        run(&work, &["branch", "-D", "feature/pr-1"]);
+
+        let got = try_resolve_base_ref(&work, "feature/pr-1")
+            .expect("a bare name present only on the remote must resolve");
+        let got_sha = std::process::Command::new("git")
+            .args(["rev-parse", &got]).current_dir(&work).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&got_sha.stdout).trim(), pr_sha,
+            "it must resolve to the REMOTE branch's commit, not to something \
+             that merely exists: a test asserting only Some(_) passes on a \
+             fallback to HEAD");
+    }
+
+    #[test]
+    fn an_unresolvable_base_resolves_to_NOTHING_rather_than_to_head() {
+        // The swallowed failure is the bug, not the ref syntax. `resolve_base_ref`
+        // still answers HEAD, because a STORED base legitimately falls back
+        // (a local-only repo pinned to origin/main). The strict variant is what
+        // a user-supplied `--base` goes through, and it must say no.
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        git_init_with_commit(repo);
+        assert_eq!(try_resolve_base_ref(repo, "this-ref-does-not-exist"), None);
+        assert_eq!(try_resolve_base_ref(repo, "origin/nope"), None);
+        // ...and the tolerant wrapper keeps its fallback, so nothing that
+        // depends on it changes behaviour.
+        assert_eq!(resolve_base_ref(repo, "this-ref-does-not-exist"), "HEAD");
+    }
+
+    #[test]
+    fn a_ref_that_is_not_a_commit_is_refused_here_rather_than_by_git_branch() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        git_init_with_commit(repo);
+        // A tree-ish that exists and is not a commit. `git branch` would fail
+        // on it anyway; failing here keeps the error about the ref the user
+        // typed instead of about git plumbing.
+        assert_eq!(try_resolve_base_ref(repo, "HEAD^{tree}"), None);
+    }
+
     #[test]
     fn resolve_base_ref_falls_back_when_no_remote() {
         let dir = tempdir().unwrap();

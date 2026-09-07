@@ -88,6 +88,36 @@
 - **A controlled `<select>` whose value matches no `<option>` does not render blank, it silently re-points at the first option.** React's `updateOptions` falls back to the first non-disabled option when nothing matches, so the control confidently displays a value the app was never set to, and the next pick saves that lie over the real one. Settings → Projects → More → **Default CLI** is the live case: it stores an agent id, the agent registry it names is edited on a different page (renamed, removed, disabled), and a stale id made the page claim the project defaulted to whichever agent happened to be first. Proven in the real window, not reasoned about: with `default_cli` set to a missing id the select read `claude` while `projects.json` said otherwise. Reordering the registry does NOT do this (the select re-applies its value on every commit, and the pills are keyed by id) — that part of the report did not reproduce. The fix has two halves and both are load-bearing: render an explicit option for the SAVED value whenever the list does not offer it, so display always equals storage; and keep the stored value valid at the source, so `AgentsSection` repoints every project pinned to an agent it renames or removes. Pinned by the three cases in `settings.e2e.ts` ("project default CLI vs the agent registry"). Any other `<select>` bound to a user-editable list has the same hole.
 - **A hook below an early return takes down the whole page it lives on, not just its own row (GH #245).** `RepositorySection` early-returns a placeholder when no project is selected (`if (!project || !draft) return …`), ~170 lines above where its per-field helpers are defined. Adding `const globalBrowser = useApp(s => s.previewBrowser)` next to the helper that used it put a hook *after* that return, so the hook count changed between the no-project and project renders and React tore the component down. The damage is not local: the Settings overlay hosts one section at a time, so a crash there took out Repositories, the tasks-path fields and the named-ports editor as well, and the e2e run reported **seven** failures in unrelated settings specs plus two in the new one. Nothing pointed at the new field. The tell is that a cluster of specs covering *different features on one page* all start failing at once in the same commit; treat that shape as "something on this page throws during render" and look for a hook that moved below a return, not for seven separate regressions. Put every hook at the top with the others even when its only consumer is far below.
 
+## A resolution fallback is a swallowed failure wearing a helpful face
+
+`resolve_base_ref` answered `"HEAD"` for anything it could not resolve, so a
+`termic new --base <garbage>` exited 0, printed `(from <garbage>)`, and cut
+the worktree from the MAIN CHECKOUT'S HEAD. Three failures compounding: a
+script cannot detect it, the reported state contradicts the actual state, and
+the worktree holds code nobody asked for. Reported by someone running four PR
+reviews in four worktrees, whose agent reviewed an unrelated branch and said
+so confidently; they found it by running `git log` in the worktree by hand.
+
+The fallback is not wrong everywhere, which is why it survived: a STORED base
+legitimately falls back (a local-only repo pinned to `origin/main` has no
+remote-tracking refs and must still open a task). It is wrong for a ref a user
+just typed. `try_resolve_base_ref` returns `Option` and `resolve_base_ref`
+keeps the fallback on top, so the two callers are forced to say which they are.
+
+The second half is that the resolution was also incomplete. A BARE name that
+exists only as `refs/remotes/origin/<name>` did not resolve: `git checkout
+<name>` DWIMs it, `git rev-parse --verify <name>` does not. That is the common
+case, not an edge one, because `gh pr view <n> --json headRefName` returns a
+bare name. Note the guard that looks obviously right and is not: a branch name
+routinely CONTAINS a slash (`feature/pr-1`), so gating the DWIM on "is it
+unqualified" skips exactly the branches people file PRs from. Caught by the
+test, not by review.
+
+**A test here passes for the wrong reason unless the fixture base is
+deliberately NOT the main checkout's HEAD.** With the bug present, a worktree
+cut from HEAD equals a base that happens to be HEAD, and the assertion is
+green on the broken code.
+
 ## "Fresh" caches that are fresh by age and stale by content
 
 - **The CLI's per-tab snapshot (`resolve_tab_selector`).** The webview reports

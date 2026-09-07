@@ -773,3 +773,86 @@ describe("termic prompts + -P: prompt library access (Phase 4)", () => {
     expect(list.data.tasks.some((t: any) => t.name === "cli-prompts-doomed")).toBe(false);
   });
 });
+
+// `termic new --base` (GH report against 1.3.2). The bug was a SWALLOWED
+// failure, not a ref-syntax problem: an unresolvable base fell back to the
+// main checkout's HEAD, so the create exited 0, the summary line echoed the
+// ref the caller asked for, and the worktree quietly held different code.
+// Reported by someone driving four PR reviews, one worktree each: the agent
+// spent its first minutes reviewing an unrelated branch and said so
+// confidently.
+//
+// Over the REAL socket, because that is the surface the report is against and
+// the resolution happens in Rust behind it.
+describe("termic new --base resolves or refuses (GH report, 1.3.2)", () => {
+  const gitIn = (cwd: string, args: string) =>
+    execSync(`git ${args}`, { cwd, encoding: "utf8" }).trim();
+
+  let fixture = "";
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    fixture = await browser.execute(() =>
+      (window.__termic!.useApp.getState().projects
+        .find((p: any) => p.name === "fixture-repo") as any).root_path);
+  });
+
+  it("refuses an unresolvable base, and creates nothing", async () => {
+    const before = gitIn(fixture, "rev-parse HEAD");
+    const r = await rpc({
+      cmd: "new", name: "base-garbage", mode: "worktree",
+      agent: "fakeagent", project: "fixture-repo", base: "this-ref-does-not-exist",
+    });
+    // Exit non-zero, which for the socket is ok:false. The report's own note
+    // applies to the shell: `termic ... | sed`; $? reports sed, not termic.
+    expect(r.ok).toBe(false);
+    expect(String(r.error?.message ?? "")).toContain("this-ref-does-not-exist");
+
+    // No task...
+    const tasks = await browser.execute(() =>
+      window.__termic!.useApp.getState().tasks.map((t: any) => t.name));
+    expect(tasks).not.toContain("base-garbage");
+    // ...and no branch left behind in the fixture.
+    expect(gitIn(fixture, "branch --list base-garbage")).toBe("");
+    expect(gitIn(fixture, "rev-parse HEAD")).toBe(before);
+  });
+
+  it("resolves a bare name that exists only as origin/<name>", async () => {
+    // The common case, not an edge one: `gh pr view <n> --json headRefName`
+    // returns a BARE name, and a branch outside remote.origin.fetch exists
+    // only under refs/remotes. `git rev-parse --verify <name>` fails on it.
+    //
+    // The base is deliberately NOT the main checkout's HEAD, or this test
+    // passes for the wrong reason against the very bug it is about.
+    const head = gitIn(fixture, "rev-parse HEAD");
+    let tip = "";
+    try {
+      gitIn(fixture, "branch e2e-remote-only");
+      // Give the branch its own commit, push it, then delete it locally so
+      // the name survives only as refs/remotes/origin/e2e-remote-only.
+      gitIn(fixture, "checkout -q e2e-remote-only");
+      gitIn(fixture, "-c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m 'remote-only tip'");
+      tip = gitIn(fixture, "rev-parse HEAD");
+      gitIn(fixture, "push -q origin e2e-remote-only");
+      gitIn(fixture, "checkout -q main");
+      gitIn(fixture, "branch -q -D e2e-remote-only");
+      expect(tip).not.toBe(gitIn(fixture, "rev-parse HEAD"));
+
+      const r = await rpc({
+        cmd: "new", name: "base-dwim", mode: "worktree",
+        agent: "fakeagent", project: "fixture-repo", base: "e2e-remote-only",
+      });
+      expect(r.ok).toBe(true);
+      // THE assertion: the worktree's HEAD is the base's commit, not the main
+      // checkout's. Asserting only that the create succeeded would pass with
+      // the bug present.
+      expect(gitIn(r.data.task.path, "rev-parse HEAD")).toBe(tip);
+      await archiveTask(r.data.task.id);
+    } finally {
+      try { gitIn(fixture, "checkout -q main"); } catch { /* already there */ }
+      try { gitIn(fixture, "push -q origin --delete e2e-remote-only"); } catch { /* gone */ }
+      try { gitIn(fixture, "branch -q -D e2e-remote-only"); } catch { /* gone */ }
+      try { gitIn(fixture, "reset -q --hard " + head); } catch { /* fine */ }
+    }
+  });
+});
