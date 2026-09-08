@@ -76,6 +76,11 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
       usePrefs: prefs.usePrefs,
       useRace: race.useRace,
       usePr: pr.usePr,
+      // One pass of the BACKGROUND status poller (GH #281). Exposed because
+      // its real cadence is minutes and the badge it drives lives on rows
+      // whose PR card is not mounted - there is nothing on screen to click
+      // that would run it.
+      prStatusPassNow: pr.prStatusPassNow,
       // Profiles (GH #280). Exposed so a spec can read the registry as this
       // window sees it without scraping the strip, and can restore the
       // dormant state in teardown even when the body threw half way.

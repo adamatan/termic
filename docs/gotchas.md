@@ -453,3 +453,29 @@ same session, because each failure named an innocent test and passed on rerun:
 **A failure that names a different test each time and never reproduces alone is
 a shared-state bug, not a flake.** Look at what the tests share before looking
 at the test that failed.
+
+## A poll that lives in a component only covers what is mounted (GH #281)
+
+The sidebar draws a PR/MR badge on every task with a PR, coloured from the
+LIVE lookup in `store/pr.ts`. Every refresh of that lookup, though, hung off
+`PrCard`: gain-focus, a 60s interval while mounted, a push, and an agent
+spawn. `PrCard` renders inside `GitPanel`, which renders only while the right
+panel is open AND on its Git tab, for a task already visited this session.
+So the common case had no poller at all: the badge sat on its grey "state
+unknown" glyph indefinitely and no poll ever arrived to notice the PR had
+merged. It looked intermittent to the reporter because the rule was invisible
+from the outside, and the badge's click-through kept working the whole time
+(the URL is persisted on the task record, only the state is not).
+
+The fix is a second layer that does not depend on any component:
+`initPrStatusPoller` in `store/pr.ts`, started from `App` once `loadAll`
+resolves, walking every task whose record already holds a PR identity. It is
+bounded rather than cheap, because a refresh is a `gh`/`glab` subprocess: a
+3-minute per-task staleness floor, at most 8 tasks per 60s pass, stalest
+first, awaited one at a time.
+
+The general shape: **when a fact is rendered somewhere that is always
+mounted, it cannot be maintained by something that usually is not.** A
+sidebar row, the tray, a window title and a desktop notification all outlive
+the panel their data came from. The tell is a component-owned `setInterval`
+whose output is read outside that component's subtree.

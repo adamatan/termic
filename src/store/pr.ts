@@ -6,21 +6,32 @@
 // side; everything here is the LIVE snapshot - checks, reviews, merged -
 // re-fetched via `task_pr_status` and discarded on app exit.
 //
-// Polling model (NOT a global interval): `PrCard` calls `refresh(taskId,
-// true)` whenever the task's Git tab GAINS focus (mount counts as gaining
-// it - so does switching back to a task that was already sitting on its Git
-// tab in the background) plus every 60s while mounted, and GitPanel calls it
-// right after a successful push. TerminalPane also calls a plain (unforced)
-// `refresh(taskId)` the moment the task's primary agent PTY spawns - i.e. the
-// task LAUNCHED - so PR status doesn't wait on the user opening the Git tab
-// at all, not even the first time. "Mounted" means every worktree task whose
-// Git tab has been opened this session, NOT just the active one - main
-// checkouts are skipped entirely (see GitPanel.tsx and TerminalPane's spawn
-// gate), but every other spawned task keeps ticking in the background so a
-// merge is caught (and auto-archived) on a task nobody is currently looking
-// at. A newly-opened PR is likewise picked up for every mounted task, but
-// only TOASTED for the one on screen right now (see maybeHandleOpened) - a
-// popup for a tab nobody is looking at isn't something anyone asked to see.
+// Polling model. Two layers, because the first one only covers tasks the
+// user is actually looking at:
+//
+//   1. Foreground. `PrCard` calls `refresh(taskId, true)` whenever the
+//      task's Git tab GAINS focus (mount counts as gaining it) plus every
+//      60s while that card is MOUNTED, GitPanel calls it right after a
+//      successful push, and TerminalPane calls a plain (unforced)
+//      `refresh(taskId)` the moment the task's primary agent PTY spawns -
+//      i.e. the task LAUNCHED - so status doesn't wait on the Git tab even
+//      the first time.
+//   2. Background. `initPrStatusPoller` (App start) runs one global slow
+//      tick over every task with a PR identity persisted on its record,
+//      whether or not it has been visited this session. See its doc below.
+//
+// Layer 2 exists because layer 1 is bound to a component that is usually
+// unmounted (issue #281): `PrCard` lives inside `GitPanel`, which renders
+// only while the right panel is open AND on its Git tab, for a task the
+// user has already visited. Every other task with a PR - never opened this
+// session, or sitting on "All files" - had no live lookup at all, so the
+// sidebar badge rendered its "state unknown" grey glyph forever (the link
+// still worked, since the URL is persisted) and no poll ever arrived to
+// notice the PR had been merged.
+//
+// A newly-opened PR is picked up on every polled task, but only TOASTED
+// for the one on screen right now (see maybeHandleOpened) - a popup for a
+// tab nobody is looking at isn't something anyone asked to see.
 
 import { create } from "zustand";
 import type { ForgeCliStatus, PrComment, PrLookup, QueueItem, TerminalTab, Task } from "@/lib/types";
@@ -184,6 +195,95 @@ export const usePr = create<PrStore>((set, get) => ({
     }
   },
 }));
+
+// ────────────────────── background status poller ──────────────────────
+//
+// Issue #281: the sidebar's PR badge colour and the merged-PR lifecycle
+// (toast / auto-archive) both read the LIVE lookup, and until this session
+// polls a task there isn't one. Everything that polls in layer 1 hangs off
+// a mounted `PrCard`, so a task the user has not opened this session - or
+// has open with the right panel on "All files" - was never polled at all:
+// its badge stayed on the grey "state unknown" glyph (the click-through
+// still worked, because the URL is persisted on the record) and its merge
+// went unnoticed for the whole session.
+//
+// Scope is deliberately tasks that ALREADY have a PR identity persisted on
+// the record. That is exactly the set the sidebar draws a badge for, and it
+// keeps the tick's cost proportional to open PRs rather than to how many
+// tasks exist: discovering a brand-new PR still rides the agent spawn / Git
+// tab / push, none of which changed.
+//
+// Cost control, since each refresh is a `gh`/`glab` subprocess:
+//   * only tasks whose snapshot is older than STATUS_STALE_MS,
+//   * at most MAX_PER_TICK of them per pass, oldest snapshot first, so a
+//     user with thirty open PRs spreads them over several ticks instead of
+//     spawning thirty CLIs at once,
+//   * sequentially (each `await`ed), never a fan-out.
+
+const STATUS_TICK_MS = 60_000;
+/** Don't re-poll a task whose snapshot is younger than this. Well above
+ *  the store's own 30s floor: this is the BACKGROUND cadence, and the card
+ *  the user is actually looking at keeps its faster 60s one. */
+const STATUS_STALE_MS = 3 * 60_000;
+/** Ceiling on subprocesses started by one pass. */
+const MAX_PER_TICK = 8;
+
+let statusTimer: number | null = null;
+/** A pass is sequential and can outlive its tick on a slow forge; without
+ *  this the next tick would start a second one alongside it. */
+let statusPassRunning = false;
+
+/** Tasks due a background poll, oldest snapshot first. Exported for tests. */
+export function pollableTasks(): Task[] {
+  const now = Date.now();
+  const { byTask } = usePr.getState();
+  const staleness = (id: string) => now - (byTask[id]?.fetchedAt ?? 0);
+  return useApp.getState().tasks
+    .filter(w => {
+      if (w.archived || w.is_main_checkout) return false;
+      // Exactly the set the sidebar draws a badge for (TaskPrBadge keys on
+      // the url), so no row can render a badge nothing polls. Either half of
+      // the identity is enough: the lookup resolves by BRANCH first and only
+      // falls back to the stored number, so a record whose url parsed but
+      // whose number did not is still perfectly pollable.
+      if (!w.pr_url && !w.pr_number) return false;
+      const entry = byTask[w.id];
+      if (entry?.loading) return false;
+      return staleness(w.id) >= STATUS_STALE_MS;
+    })
+    .sort((a, b) => staleness(b.id) - staleness(a.id))
+    .slice(0, MAX_PER_TICK);
+}
+
+async function statusPass() {
+  if (statusPassRunning) return;
+  statusPassRunning = true;
+  try {
+    for (const w of pollableTasks()) {
+      // Unforced: `pollableTasks` is already the stricter gate, and leaving
+      // the store's floor in play means a foreground refresh that landed
+      // between the filter and here is not repeated.
+      await usePr.getState().refresh(w.id);
+    }
+  } finally {
+    statusPassRunning = false;
+  }
+}
+
+/** Start the global PR status poller. Idempotent; called from App once
+ *  `loadAll` has resolved, because a pass before the tasks are in the
+ *  store has nothing to poll and the badge would stay grey until the
+ *  first tick. Runs a pass immediately, then every STATUS_TICK_MS. */
+export function initPrStatusPoller() {
+  if (statusTimer !== null) return;
+  statusTimer = window.setInterval(() => { void statusPass(); }, STATUS_TICK_MS);
+  void statusPass();
+}
+
+/** Test seam: run one background pass immediately. */
+export function prStatusPassNow(): Promise<void> {
+  return statusPass();
+}
 
 // ───────────────────────── comment watcher ─────────────────────────
 //

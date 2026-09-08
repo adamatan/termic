@@ -2051,6 +2051,104 @@ describe("pr card (#21)", () => {
       await archiveTask(mainTaskId);
     }
   });
+
+  it("keeps the badge current on a task whose PR card is not mounted (#281)", async () => {
+    // Every FOREGROUND refresh hangs off PrCard, which renders only while
+    // the right panel is open on its Git tab. Off that tab (or on a task
+    // never opened this session) nothing polled at all: the sidebar badge
+    // sat on its grey "state unknown" glyph for good and no poll arrived to
+    // notice a merge. The background poller is what covers those rows.
+    const badge = "[data-testid='task-pr-badge']";
+    const prState = () =>
+      browser.execute(
+        (sel) => document.querySelector(sel)?.getAttribute("data-pr-state") ?? null, badge);
+    await ensureActiveTask(taskId!);
+    try {
+      // Leave the Git tab FIRST: the card goes, and with it every poll this
+      // row used to get. Whatever the badge does from here is the background
+      // poller's doing and nothing else's.
+      await openRightTab("All files");
+      await waitGone("[data-testid='pr-card']");
+
+      // A real PR puts its identity on the task record (Rust persists it),
+      // and that record is what draws the badge. Behind it, a snapshot
+      // claiming something the backend will not confirm. Stamped as just
+      // fetched, so the poller's own tick leaves it alone until this case
+      // says otherwise.
+      await browser.execute((id) => {
+        const t = window.__termic!;
+        t.useApp.setState((s: any) => ({
+          tasks: s.tasks.map((w: any) => w.id === id
+            ? {
+              ...w,
+              pr_url: "https://github.com/acme/widgets/pull/4242",
+              pr_number: 4242,
+              pr_provider: "github",
+            }
+            : w),
+        }));
+        t.usePr.setState((s: any) => ({
+          byTask: {
+            ...s.byTask,
+            [id!]: {
+              lookup: {
+                provider: "github",
+                remote_url: "https://github.com/acme/widgets.git",
+                status: "ok",
+                message: "",
+                pr: {
+                  provider: "github", number: 4242,
+                  url: "https://github.com/acme/widgets/pull/4242",
+                  title: "Teach the parser about trailing commas",
+                  state: "merged", checks: "none", review: "none",
+                  base: "main", head: "feat",
+                },
+              },
+              loading: false,
+              fetchedAt: Date.now(),
+            },
+          },
+        }));
+      }, taskId);
+      await browser.waitUntil(async () => await prState() === "merged",
+        { timeout: 8_000, timeoutMsg: "the seeded state never reached the badge" });
+
+      // Age the snapshot past the background cadence and run one pass, in a
+      // single step so no real tick can slip in between and make the result
+      // ambiguous. (One landing there would be the same feature working, but
+      // this case should prove it, not depend on luck.)
+      await browser.execute(async (id) => {
+        const t = window.__termic!;
+        t.usePr.setState((s: any) => ({
+          byTask: {
+            ...s.byTask,
+            [id!]: { ...s.byTask[id!], fetchedAt: Date.now() - 10 * 60_000 },
+          },
+        }));
+        await t.prStatusPassNow();
+      }, taskId);
+
+      // The fixture repo is not on a forge, so the truthful answer has no PR
+      // at all and the badge drops the merged glyph it was holding. Which
+      // direction it moves is incidental (no fixture can produce a real
+      // green one) - what this pins is that a row with no card behind it
+      // still tracks the backend.
+      await browser.waitUntil(async () => await prState() === "unknown",
+        { timeout: 8_000, timeoutMsg: "the badge never followed a background poll" });
+      await waitGone("[data-testid='pr-card']");
+    } finally {
+      // The identity is seeded in memory only (nothing on disk knows about
+      // it); drop it so no later spec inherits a pollable task.
+      await browser.execute((id) => {
+        window.__termic!.useApp.setState((s: any) => ({
+          tasks: s.tasks.map((w: any) => w.id === id
+            ? { ...w, pr_url: null, pr_number: null, pr_provider: null }
+            : w),
+        }));
+      }, taskId);
+      await openRightTab("Git");
+    }
+  });
 });
 
 // ─────────────────── Start a task from an issue ───────────────────

@@ -28,7 +28,10 @@ vi.mock("@/lib/archiveTask", () => ({
   confirmAndArchive: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { usePr, newCommentsSince, commentPromptFor, watchTickNow, openPrArchiveWarning } from "@/store/pr";
+import {
+  usePr, newCommentsSince, commentPromptFor, watchTickNow, openPrArchiveWarning,
+  pollableTasks, prStatusPassNow,
+} from "@/store/pr";
 import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
 import { usePrefs } from "@/store/prefs";
@@ -580,3 +583,109 @@ describe("learning a PR identity mid-session", () => {
   });
 });
 
+
+describe("background status poller (#281)", () => {
+  // The sidebar badge and the merge lifecycle both read the LIVE lookup,
+  // and every foreground poll hangs off a mounted PrCard - which only
+  // exists for a task the user has opened this session, with the right
+  // panel on its Git tab. Everything else showed the grey "state unknown"
+  // glyph forever and never noticed a merge.
+  const KNOWN = { pr_number: 7, pr_provider: "github" } as Partial<Task>;
+
+  function seedTasks(...tasks: Partial<Task>[]) {
+    useApp.setState({
+      tasks: tasks.map((t, i) => ({
+        id: `ws${i + 1}`, project_id: "p1", name: `Feat ${i + 1}`, branch: "feat",
+        base_branch: "main", path: "/x", cli: "claude", port: 1, created: "",
+        archived: false, ...t,
+      } as Task)),
+      projects: [{ id: "p1", name: "proj" } as Project],
+    });
+  }
+
+  it("polls a task the user has never opened this session", async () => {
+    seedTasks({ ...KNOWN });
+    vi.mocked(ipc.taskPrStatus).mockResolvedValue(lookupWith("open"));
+
+    // Nothing has mounted a PrCard, so this is the only thing that runs.
+    await prStatusPassNow();
+
+    expect(ipc.taskPrStatus).toHaveBeenCalledWith("ws1");
+    expect(usePr.getState().byTask["ws1"].lookup?.pr?.state).toBe("open");
+  });
+
+  it("skips tasks with no PR, archived tasks and main checkouts", async () => {
+    seedTasks(
+      { ...KNOWN },
+      {},                                  // no PR: nothing to look up, no badge either
+      { ...KNOWN, archived: true },
+      { ...KNOWN, is_main_checkout: true },
+    );
+    expect(pollableTasks().map(w => w.id)).toEqual(["ws1"]);
+  });
+
+  it("polls a task whose record kept only the url", async () => {
+    // `task_pr_create` parses the number back out of the URL the CLI
+    // printed, and that parse can come back None. The badge renders off the
+    // url alone, so the poll has to run off it too or that row is grey for
+    // good - and it can: the lookup resolves by branch first.
+    seedTasks({ pr_url: "https://github.com/foo/bar/pull/7" });
+    expect(pollableTasks().map(w => w.id)).toEqual(["ws1"]);
+  });
+
+  it("leaves a freshly polled task alone and picks it up once it goes stale", async () => {
+    seedTasks({ ...KNOWN });
+    usePr.setState({ byTask: { ws1: { lookup: null, loading: false, fetchedAt: Date.now() } } });
+    expect(pollableTasks()).toHaveLength(0);
+
+    // Background cadence is minutes, not the store's 30s floor.
+    usePr.setState({
+      byTask: { ws1: { lookup: null, loading: false, fetchedAt: Date.now() - 61_000 } },
+    });
+    expect(pollableTasks()).toHaveLength(0);
+    usePr.setState({
+      byTask: { ws1: { lookup: null, loading: false, fetchedAt: Date.now() - 4 * 60_000 } },
+    });
+    expect(pollableTasks().map(w => w.id)).toEqual(["ws1"]);
+  });
+
+  it("caps one pass and takes the stalest first, so 30 PRs are not 30 CLIs at once", async () => {
+    const many = Array.from({ length: 30 }, () => ({ ...KNOWN }));
+    seedTasks(...many);
+    // ws30 polled longest ago, ws1 most recently: the order must invert.
+    usePr.setState({
+      byTask: Object.fromEntries(many.map((_, i) => [
+        `ws${i + 1}`,
+        { lookup: null, loading: false, fetchedAt: Date.now() - (4 + i) * 60_000 },
+      ])),
+    });
+    const due = pollableTasks();
+    expect(due).toHaveLength(8);
+    expect(due[0].id).toBe("ws30");
+
+    vi.mocked(ipc.taskPrStatus).mockResolvedValue(lookupWith("open"));
+    await prStatusPassNow();
+    expect(ipc.taskPrStatus).toHaveBeenCalledTimes(8);
+  });
+
+  it("does not re-poll a task whose refresh is still in flight", async () => {
+    seedTasks({ ...KNOWN });
+    usePr.setState({ byTask: { ws1: { lookup: null, loading: true, fetchedAt: 0 } } });
+    expect(pollableTasks()).toHaveLength(0);
+  });
+
+  it("fires the merge lifecycle for a task nobody has opened", async () => {
+    // Own id: the "already announced" marker is module-level and keyed by
+    // task, so reusing ws1 would inherit an earlier case's marker.
+    seedTasks({ ...KNOWN, id: "ws-bg-merge" });
+    useApp.setState(s => ({ projects: [{ ...s.projects[0], on_pr_merge: "auto" } as Project] }));
+    vi.mocked(ipc.taskPrStatus).mockResolvedValue(lookupWith("merged"));
+
+    // Merged while termic was closed: the identity is persisted, so the very
+    // first poll of the session is the one that has to notice.
+    await prStatusPassNow();
+
+    expect(usePr.getState().byTask["ws-bg-merge"].lookup?.pr?.state).toBe("merged");
+    expect(archiveAndRefresh).toHaveBeenCalledWith("ws-bg-merge", false);
+  });
+});
