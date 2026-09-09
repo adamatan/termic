@@ -48,6 +48,18 @@ Consequences worth stating explicitly:
   profiles' projects into one directory.
 - **The tag is `#[serde(skip)]`.** Nothing reaches disk, so there is no schema
   bump and an existing install's files stay byte-identical.
+- **Which is exactly why a record arriving from a WINDOW has no tag.** serde
+  fills in `ProfileId::default()`, i.e. `Root`, whatever window sent it. Any
+  command that takes a whole record off the wire must therefore take the tag
+  from the record ON DISK before saving it. `project_update` did not, and the
+  result was silent cross-profile movement: the project was filed under the
+  root profile, and because `save_projects` writes every profile's group, the
+  profile it belonged to was rewritten as an empty list. A user who toggled one
+  setting on a project in their second profile found that profile empty and the
+  project sitting in the default one, on the next launch (the window that did
+  it kept its own in-memory list until then). It is the only command shaped
+  this way today; `settings_save` takes the window instead, and every other
+  edit mutates a loaded record in place, which keeps the tag by construction.
 
 A window is consulted in exactly two places, both of which genuinely cannot
 resolve from a record: `projects_list` (which profile does this sidebar show)

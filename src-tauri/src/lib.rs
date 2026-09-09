@@ -286,7 +286,7 @@ pub struct Project {
     /// no schema bump and an existing install's files stay byte-identical.
     /// It is derived from the directory the record was read from, and it is
     /// how a write knows where to go without the caller naming a profile.
-    /// See docs/plans/profiles.md, "the profile rides the data, not the call".
+    /// See docs/profiles.md, "the profile rides the DATA, not the call".
     #[serde(skip)]
     pub profile: ProfileId,
 }
@@ -631,7 +631,7 @@ pub struct Task {
     /// no schema bump and an existing install's files stay byte-identical.
     /// It is derived from the directory the record was read from, and it is
     /// how a write knows where to go without the caller naming a profile.
-    /// See docs/plans/profiles.md, "the profile rides the data, not the call".
+    /// See docs/profiles.md, "the profile rides the DATA, not the call".
     #[serde(skip)]
     pub profile: ProfileId,
 }
@@ -5374,10 +5374,25 @@ fn project_set_group(ids: Vec<String>, group: Option<String>) -> Result<(), Stri
     save_projects(&list).map_err(|e| e.to_string())
 }
 
+/// Replace a project wholesale with the version a window sent.
+///
+/// **The profile tag comes from the RECORD ON DISK, never from `p`.** The tag
+/// is `#[serde(skip)]`, so a Project arriving over IPC cannot carry one: serde
+/// fills in `ProfileId::default()`, which is `Root`, whatever window sent it.
+/// Assigning that straight over the loaded record filed the project under the
+/// root profile, and since `save_projects` writes EVERY profile's group, the
+/// profile it actually belonged to was rewritten as an empty list. A user
+/// toggling one setting on a project in their second profile got that profile
+/// emptied and the project moved to the default one, which they saw on the
+/// next launch (the window that did it kept its in-memory list until then).
+///
+/// This is the one command that takes a whole record off the wire, which is
+/// why it is the one that has to restore what the wire dropped.
 #[tauri::command]
-fn project_update(p: Project) -> Result<(), String> {
+fn project_update(mut p: Project) -> Result<(), String> {
     let mut list = load_projects_all();
     if let Some(slot) = list.iter_mut().find(|x| x.id == p.id) {
+        p.profile = slot.profile.clone();
         *slot = p;
         save_projects(&list).map_err(|e| e.to_string())?;
         Ok(())
@@ -21763,6 +21778,54 @@ mod tests {
             assert_eq!(root.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["p1"]);
             assert_eq!(home.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["p2"]);
             assert_eq!(home[0].name, "renamed");
+        });
+    }
+
+    #[test]
+    fn updating_a_project_leaves_it_in_its_own_profile() {
+        // Reported: "I updated and restarted, and my second profile opened
+        // with 0 projects, and the project that was there appeared on the
+        // default profile."
+        //
+        // The tag is `serde(skip)`, so a Project arriving from a WINDOW cannot
+        // carry one: serde fills in `ProfileId::default()`, which is Root,
+        // whatever window sent it. `project_update` assigned that value
+        // straight over the loaded record, so the save filed the project under
+        // the root profile - and `save_projects` writes every profile's group,
+        // so the profile it actually belonged to got an empty list. Nothing
+        // was lost, it moved, which is exactly what the report describes.
+        with_scratch_data_dir(|data| {
+            crate::profiles::save_registry(data, &two_profile_registry()).unwrap();
+            crate::save_projects_in(&ProfileId::Root, &[a_project("p1", ProfileId::Root)]).unwrap();
+            crate::save_projects_in(
+                &ProfileId::Slug("home".into()),
+                &[a_project("p2", ProfileId::Slug("home".into()))],
+            )
+            .unwrap();
+
+            // Through JSON, not hand-built: the tag loss belongs to the wire,
+            // and asserting it from a struct literal would only be asserting
+            // what this test already believes.
+            let loaded = crate::load_projects_all().into_iter().find(|p| p.id == "p2").unwrap();
+            assert_eq!(loaded.profile, ProfileId::Slug("home".into()));
+            let mut over_the_wire: crate::Project =
+                serde_json::from_str(&serde_json::to_string(&loaded).unwrap()).unwrap();
+            assert_eq!(over_the_wire.profile, ProfileId::Root, "the wire kept a tag it cannot carry");
+            over_the_wire.name = "renamed".into();
+
+            crate::project_update(over_the_wire).unwrap();
+
+            let home = crate::load_projects_in(&ProfileId::Slug("home".into()));
+            assert_eq!(
+                home.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["p2"],
+                "the project left the profile it belongs to",
+            );
+            assert_eq!(home[0].name, "renamed", "the edit did not land");
+            let root = crate::load_projects_in(&ProfileId::Root);
+            assert_eq!(
+                root.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["p1"],
+                "the project turned up in the root profile",
+            );
         });
     }
 
