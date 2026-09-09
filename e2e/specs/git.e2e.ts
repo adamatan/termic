@@ -2075,7 +2075,7 @@ describe("pr card (#21)", () => {
       // claiming something the backend will not confirm. Stamped as just
       // fetched, so the poller's own tick leaves it alone until this case
       // says otherwise.
-      await browser.execute((id) => {
+      const seed = () => browser.execute((id) => {
         const t = window.__termic!;
         t.useApp.setState((s: any) => ({
           tasks: s.tasks.map((w: any) => w.id === id
@@ -2110,8 +2110,14 @@ describe("pr card (#21)", () => {
           },
         }));
       }, taskId);
-      await browser.waitUntil(async () => await prState() === "merged",
-        { timeout: 8_000, timeoutMsg: "the seeded state never reached the badge" });
+      // RE-SEEDED on every poll, the way every other seeded case in this file
+      // is: `loadAll()` re-reads every task from disk on window focus and on
+      // any archive, and the identity below lives only in memory, so a single
+      // seed can be wiped between the write and the read.
+      await browser.waitUntil(async () => {
+        await seed();
+        return await prState() === "merged";
+      }, { timeout: 8_000, timeoutMsg: "the seeded state never reached the badge" });
 
       // Age the snapshot past the background cadence and run one pass, in a
       // single step so no real tick can slip in between and make the result
