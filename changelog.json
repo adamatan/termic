@@ -1,6 +1,11 @@
 {
   "versions": [
     {
+      "version": "1.3.4",
+      "date": "2026-09-09",
+      "summary": "Fixes a profiles bug that could move a project to the default profile."
+    },
+    {
       "version": "1.3.3",
       "date": "2026-09-07",
       "summary": "Work and personal profiles, and a Claude/Codex credentials switcher that moves a running task."

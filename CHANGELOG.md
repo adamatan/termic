@@ -4,6 +4,39 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
+## [1.3.4] - 2026-09-09
+
+Fixes a profiles bug that could move a project to the default profile.
+
+### Bug fixes
+- **A project could move to the default profile on its own.** Changing anything
+  on a project from a second profile's window (spotlight, a run script, the
+  code intelligence toggle) filed that project under the default profile and
+  left the profile it belonged to empty. The window kept its own list until it
+  was restarted, so the change surfaced on the next launch and looked like the
+  update had caused it. Nothing was lost. A project that already moved cannot
+  be put back automatically, because the record no longer says where it came
+  from: remove it from the default profile and add it again in the profile it
+  belongs to. Its tasks are still on disk and come back with it.
+- **A project added as a subdirectory of a monorepo showed every file as
+  deleted.** Opening any diff drew the whole file as removed lines, and staging
+  a file from the Git panel quietly did nothing. Git reports its paths from the
+  repository root whatever directory it runs in, and Termic was reading them
+  against the project directory. The Git panel now also lists only the changes
+  inside the project, rather than the whole monorepo's.
+- **The PR badge on a task stayed grey, and a merged PR went unnoticed.** Live
+  status was only fetched for a task whose Git tab was open, so every other
+  task with a pull request kept the "state unknown" glyph for the whole session
+  and no poll ever arrived to see it merge (or to archive it). Every task with
+  a PR is now polled in the background.
+  ([#281](https://github.com/simion/termic/issues/281))
+- **A task running two agents showed only one agent's plan usage.** The footer
+  chip was tied to the agent the task was created with, so a Claude tab sitting
+  beside a Codex tab reported nothing at all for the second one. Each agent in
+  a task now gets its own chip, and the one whose tab is on screen is the one
+  that survives a narrow window.
+  ([#277](https://github.com/simion/termic/issues/277))
+
 ## [1.3.3] - 2026-09-07
 
 Work and personal profiles, and a Claude/Codex credentials switcher that moves a running task.
