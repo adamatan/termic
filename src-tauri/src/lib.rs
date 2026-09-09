@@ -17583,6 +17583,32 @@ fn resolve_in_dirs<'a>(dirs: impl Iterator<Item = &'a str>, candidate: &str) -> 
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Is `dir` absolute on `os`?
+///
+/// `Path::is_absolute` reads `cfg(windows)` rather than an argument, so it
+/// cannot be driven per-OS from a test on a Unix runner: `C:\\Users\\u` comes
+/// back NOT absolute on macOS. That is exactly how the Windows guard below
+/// shipped broken, so this takes `os` like every other per-platform decision
+/// here (`open_command`, `reveal_command`, `after_open`) and the tests assert
+/// all three from one host. A conformance test pins it against
+/// `Path::is_absolute` on whichever platform is actually running, so the two
+/// can never drift.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+fn is_absolute_for(os: &str, dir: &str) -> bool {
+    if os != "windows" {
+        return dir.starts_with('/');
+    }
+    // A drive-qualified root (`C:\` or `C:/`), or a UNC / verbatim path
+    // (`\\server\share`, `\\?\C:\...`). Deliberately NOT `\foo` or
+    // `C:foo`: both are drive-relative, and std agrees they are not absolute.
+    let b = dir.as_bytes();
+    let drive = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
+    drive || dir.starts_with("\\\\")
+}
+
 /// The argv that opens `dir` in `app`.
 ///
 /// Split from the spawn for the same reason `open_command` is: the
@@ -17598,7 +17624,11 @@ fn open_with_argv(os: &str, app: &ExternalApp, resolved: &str, dir: &str) -> Res
     // one. The frontend cannot reach this (the directory is resolved from a
     // task id here, not sent), which is exactly why the check is cheap to
     // keep: it stays true if a later caller is less careful.
-    if !dir.starts_with('/') {
+    //
+    // Per-OS, not `starts_with('/')`: a Windows worktree is `C:\...`, so the
+    // Unix form rejected every path on the one platform whose ONLY entry is
+    // the file manager, i.e. it broke the whole feature there.
+    if !is_absolute_for(os, dir) {
         return Err(format!("not an absolute path: {dir}"));
     }
     if app.key == FILE_MANAGER_KEY {
@@ -17703,7 +17733,7 @@ async fn open_with_app(key: String, task_id: String) -> Result<(), String> {
             if !E2E_APPS.iter().any(|(k, _, _)| *k == key) {
                 return Err(format!("unknown app: {key}"));
             }
-            if !dir.starts_with('/') {
+            if !is_absolute_for(std::env::consts::OS, &dir) {
                 return Err(format!("not an absolute path: {dir}"));
             }
             e2e_record_open_with(&key, &dir);
@@ -26149,26 +26179,87 @@ mod tests {
         fn the_file_manager_entry_delegates_to_open_command() {
             // It must stay byte-identical to what the button did before it
             // became a picker, on every platform.
-            for os in ["macos", "linux", "windows"] {
-                let (program, args) = open_with_argv(os, app(FILE_MANAGER_KEY), "", "/w/task").unwrap();
-                let (want_p, want_a) = open_command(os, "/w/task");
+            // The dir has to be absolute FOR each platform: "/w/task" is a
+            // relative path on Windows, which the guard now correctly refuses.
+            for (os, dir) in [("macos", "/w/task"), ("linux", "/w/task"), ("windows", r"C:\w\task")] {
+                let (program, args) = open_with_argv(os, app(FILE_MANAGER_KEY), "", dir).unwrap();
+                let (want_p, want_a) = open_command(os, dir);
                 assert_eq!((program.as_str(), args), (want_p, want_a), "os={os}");
             }
         }
 
         #[test]
-        fn refuses_a_dir_that_is_not_absolute() {
+        fn refuses_a_dir_that_is_not_absolute_on_every_platform() {
             // `open` reads a leading `-` as a flag. Nothing can reach this
-            // today (the dir is resolved from a task id, never sent), which
+            // today (the dir is resolved from a task id here, not sent), which
             // is why the guard is worth keeping for whoever calls it next.
-            for dir in ["-a", "--args", "relative/path", ""] {
-                assert!(
-                    open_with_argv("macos", app("cursor"), "/Applications/Cursor.app", dir).is_err(),
-                    "accepted {dir:?}",
-                );
-                assert!(
-                    open_with_argv("macos", app(FILE_MANAGER_KEY), "", dir).is_err(),
-                    "file manager accepted {dir:?}",
+            for os in ["macos", "linux", "windows"] {
+                for dir in ["-a", "--args", "relative/path", ""] {
+                    assert!(
+                        open_with_argv(os, app("cursor"), "/Applications/Cursor.app", dir).is_err(),
+                        "os={os} accepted {dir:?}",
+                    );
+                    assert!(
+                        open_with_argv(os, app(FILE_MANAGER_KEY), "", dir).is_err(),
+                        "os={os} file manager accepted {dir:?}",
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn accepts_a_windows_worktree_path() {
+            // The regression this pins: a Windows worktree is `C:\...`, and a
+            // `starts_with('/')` guard rejected every one of them. Windows'
+            // only entry is the file manager, so that broke the whole feature
+            // there while every Unix test stayed green.
+            for dir in [r"C:\Users\u\termic\tasks\t", r"C:/Users/u/termic/tasks/t", r"\\server\share\t"] {
+                let (program, args) =
+                    open_with_argv("windows", app(FILE_MANAGER_KEY), "", dir).expect(dir);
+                let (want_p, want_a) = open_command("windows", dir);
+                assert_eq!((program.as_str(), args), (want_p, want_a), "dir={dir:?}");
+            }
+        }
+
+        #[test]
+        fn windows_absoluteness_matches_what_std_would_say() {
+            // Drive-relative forms are NOT absolute, and that is std's rule
+            // rather than a guess: `\foo` has a root but no drive, `C:foo` a
+            // drive but no root.
+            for (dir, want) in [
+                (r"C:\x", true), (r"C:/x", true), (r"c:\x", true),
+                (r"\\srv\share", true), (r"\\?\C:\x", true),
+                (r"\x", false), (r"C:x", false), ("/x", false),
+                ("x", false), ("-a", false), ("", false), ("C:", false),
+            ] {
+                assert_eq!(is_absolute_for("windows", dir), want, "windows {dir:?}");
+            }
+            // Unix is unchanged, including that a Windows path is not absolute
+            // there (it is a relative directory literally named `C:`).
+            for (dir, want) in [("/x", true), (r"C:\x", false), ("x", false), ("", false)] {
+                assert_eq!(is_absolute_for("linux", dir), want, "linux {dir:?}");
+                assert_eq!(is_absolute_for("macos", dir), want, "macos {dir:?}");
+            }
+        }
+
+        #[test]
+        fn absoluteness_agrees_with_std_on_the_host_running_this() {
+            // `is_absolute_for` is hand-rolled because `Path::is_absolute`
+            // reads cfg(windows) rather than an argument, so it cannot be
+            // driven per-OS from a Unix runner -- which is how the Windows
+            // guard shipped broken. This is what keeps the two from drifting:
+            // on whichever platform actually runs the suite, our answer for
+            // THAT platform must be std's answer. Covers the macOS and Linux
+            // CI jobs today, and the Windows branch the day a runner exists.
+            let here = std::env::consts::OS;
+            for dir in [
+                "/Users/u/task", "/tmp", r"C:\Users\u\task", r"C:/Users/u/task",
+                r"\\srv\share", r"\foo", "C:foo", "relative/path", "-a", "",
+            ] {
+                assert_eq!(
+                    is_absolute_for(here, dir),
+                    Path::new(dir).is_absolute(),
+                    "os={here} disagreed with std on {dir:?}",
                 );
             }
         }
