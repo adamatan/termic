@@ -567,6 +567,14 @@ interface PrefsState {
    *  (file edited while selected). Terminal panes key their live-swap
    *  effect on this so an edit updates xterm without a theme re-pick. */
   customThemeRev: number;
+  /** The OS appearance, mirrored into the store so a macOS dark/light flip
+   *  RE-RENDERS the subscribers that resolve a palette in JS. `themeMode`
+   *  cannot do that job: under "auto" the string stays "auto" across a flip,
+   *  so an effect keyed on it never re-runs and xterm keeps the old palette
+   *  until the user re-picks a theme (GH: terminals ignored the OS flip).
+   *  Written on every flip, not only under "auto", so it is already correct
+   *  when the user switches back to auto later. */
+  systemScheme: "light" | "dark";
   /** Font for the CodeMirror editor + diff viewer. */
   editorFontId: string;
   /** Syntax theme for the editor + diff viewer under a dark app theme
@@ -1007,6 +1015,7 @@ export const usePrefs = create<PrefsState>(set => ({
   themeMode: initialTheme,
   customThemes: [],
   customThemeRev: 0,
+  systemScheme: readSystemScheme(),
   desktopNotifications: initialDesktopNotif,
   completionSound: initialCompletionSound,
   completionSoundId: initialCompletionSoundId,
@@ -1394,11 +1403,32 @@ export function resolveTheme(mode: ThemeMode): "light" | "dark" {
  *  solarized). `auto` only ever maps to light or dark - the OS doesn't
  *  speak espresso/solarized; those require an explicit user pick.
  *  Custom ids pass through as-is. */
-export function resolveThemeFull(mode: ThemeMode): ResolvedTheme | `custom:${string}` {
-  if (mode === "auto") {
-    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-  }
+export function resolveThemeFull(
+  mode: ThemeMode,
+  system: "light" | "dark" = readSystemScheme(),
+): ResolvedTheme | `custom:${string}` {
+  if (mode === "auto") return system;
   return mode;
+}
+
+/** The OS appearance, read live. Guarded because `matchMedia` is absent in
+ *  some non-browser environments; dark is the app's default family. */
+export function readSystemScheme(): "light" | "dark" {
+  if (typeof window === "undefined" || !window.matchMedia) return "dark";
+  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+/** React binding for `resolveThemeFull` — the one a component should use.
+ *  Subscribes to `systemScheme` as well as `themeMode`, so an OS flip under
+ *  "auto" re-renders the caller; and it returns the RESOLVED palette id, so a
+ *  flip while an explicit theme is picked changes nothing and re-runs nothing.
+ *  That distinction is load-bearing for the terminal panes: keying their swap
+ *  effect on the raw `systemScheme` would re-assign `options.theme` — and
+ *  repaint every mounted xterm — for a palette that did not change. */
+export function useResolvedThemeFull(): ResolvedTheme | `custom:${string}` {
+  const mode = usePrefs(s => s.themeMode);
+  const system = usePrefs(s => s.systemScheme);
+  return resolveThemeFull(mode, system);
 }
 
 /** Swap the html element's palette. Built-ins toggle their CSS class;
@@ -1440,9 +1470,12 @@ export function applyTheme(mode: ThemeMode) {
 // Apply at module load so the first paint matches the user's preference.
 applyTheme(initialTheme);
 
-// Live-track system-theme changes when in auto mode.
+// Live-track system-theme changes. The store write is unconditional (see
+// `systemScheme`); only the CSS-class swap is gated on being in auto mode.
 if (typeof window !== "undefined" && window.matchMedia) {
   window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+    const scheme = readSystemScheme();
+    if (usePrefs.getState().systemScheme !== scheme) usePrefs.setState({ systemScheme: scheme });
     if (usePrefs.getState().themeMode === "auto") applyTheme("auto");
   });
 }

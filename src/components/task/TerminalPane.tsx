@@ -49,7 +49,7 @@ import { TerminalExitedBanner } from "@/components/task/TerminalExitedBanner";
 import * as ipc from "@/lib/ipc";
 import { maybeRebuildDockerImageForLaunch } from "@/lib/dockerDailyRebuild";
 import { loginShell, loginShellArgs } from "@/lib/loginShell";
-import { usePrefs, currentTerminalStack, currentTerminalTheme, currentColorFgBg, currentMinimumContrastRatio } from "@/store/prefs";
+import { usePrefs, useResolvedThemeFull, currentTerminalStack, currentTerminalTheme, currentColorFgBg, currentMinimumContrastRatio } from "@/store/prefs";
 import { spawnArgsForCli, spawnCommandForCli, tryToggleYoloLive, envForCli, agentDisplayName, cliSupportsIdSession, cliSupportsCaptureResume, postLaunchCaptureForCli, decideResume, resumeIdArgsForCli, workDoneCapable, terminalLaunchCommand, isTerminalCli, classifyAgentTitle, compileSignals, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS, STICKY_DONE_MS, ATTENTION_ECHO_MS, builtinBaseId, BUILTIN_OUTPUT_SIGNALS, resolveAgent } from "@/lib/agents";
 import { recordTitle, noteSubmit, noteDone } from "@/lib/agentSignalLog";
 import { MessageQueueButton } from "./MessageQueueButton";
@@ -2755,9 +2755,13 @@ const captureArmedRef = useRef(false);
   // dropdown, push the new xterm palette into every mounted terminal.
   // xterm's `options.theme` setter triggers an internal repaint so we
   // don't need to touch the WebGL atlas explicitly.
-  const themeMode = usePrefs(s => s.themeMode);
+  // The RESOLVED palette id, not the raw mode: under "auto" the mode string
+  // survives a macOS dark/light flip unchanged, so keying this on it left
+  // every terminal painting the old palette until the user re-picked a theme.
+  // Resolved also means an explicit pick ignores the flip, re-running nothing.
+  const themeKey = useResolvedThemeFull();
   // customThemeRev bumps when the active custom theme's FILE was edited
-  // (same themeMode string, new palette) — see prefs.loadCustomThemes.
+  // (same theme id, new palette) — see prefs.loadCustomThemes.
   const customThemeRev = usePrefs(s => s.customThemeRev);
   const firstThemeRun = useRef(true);
   useEffect(() => {
@@ -2766,7 +2770,7 @@ const captureArmedRef = useRef(false);
     if (!t) return;
     t.options.theme = currentTerminalTheme() as any;
     t.options.minimumContrastRatio = currentMinimumContrastRatio();
-  }, [themeMode, customThemeRev]);
+  }, [themeKey, customThemeRev]);
 
   // YOLO live toggle — for agents that support runtime mode switching (only
   // gemini today), send the appropriate slash command. For claude/codex this

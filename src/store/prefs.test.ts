@@ -474,3 +474,87 @@ describe("prefs: availableMonoFontsAsync showAll", () => {
     expect(ids).not.toContain("hack");
   });
 });
+
+// The macOS appearance flip. `themeMode` cannot carry it: under "auto" the
+// stored string is "auto" before AND after the flip, so every subscriber keyed
+// on it (the xterm palette swap in TerminalPane / AuxTerminal, the editor and
+// diff themes) stayed on the old palette until the user re-picked a theme by
+// hand. `systemScheme` is the field that actually changes, and these cases pin
+// both halves: that a flip is recorded, and that it only moves the RESOLVED
+// palette when the user is following the system.
+describe("prefs: systemScheme follows the OS appearance", () => {
+  function stubMatchMedia(light: boolean) {
+    const listeners = new Set<() => void>();
+    let isLight = light;
+    const mql = {
+      get matches() { return isLight; },
+      addEventListener: (_: string, fn: () => void) => { listeners.add(fn); },
+      removeEventListener: (_: string, fn: () => void) => { listeners.delete(fn); },
+    };
+    // Every query resolves to the same list — prefs only ever asks for
+    // "(prefers-color-scheme: light)".
+    vi.stubGlobal("matchMedia", () => mql);
+    return (next: boolean) => { isLight = next; listeners.forEach(fn => fn()); };
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", fakeLocalStorage());
+    vi.resetModules();
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("initializes from the OS at module load", async () => {
+    stubMatchMedia(true);
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().systemScheme).toBe("light");
+  });
+
+  it("defaults to dark when matchMedia is unavailable", async () => {
+    vi.stubGlobal("matchMedia", undefined);
+    const { usePrefs, readSystemScheme } = await import("./prefs");
+    expect(readSystemScheme()).toBe("dark");
+    expect(usePrefs.getState().systemScheme).toBe("dark");
+  });
+
+  it("records a flip, so an auto theme resolves to the new palette", async () => {
+    const flip = stubMatchMedia(false);
+    const { usePrefs, resolveThemeFull } = await import("./prefs");
+    usePrefs.getState().setThemeMode("auto");
+    expect(resolveThemeFull("auto", usePrefs.getState().systemScheme)).toBe("dark");
+
+    flip(true);
+    expect(usePrefs.getState().systemScheme).toBe("light");
+    expect(resolveThemeFull("auto", usePrefs.getState().systemScheme)).toBe("light");
+  });
+
+  it("records the flip under an explicit theme too, without moving the palette", async () => {
+    // The store write is unconditional so the value is already right when the
+    // user switches to auto later — but the resolved id is what the terminal
+    // panes key on, and it must NOT move here: re-assigning `options.theme`
+    // repaints every mounted xterm for a palette that did not change.
+    const flip = stubMatchMedia(false);
+    const { usePrefs, resolveThemeFull } = await import("./prefs");
+    usePrefs.getState().setThemeMode("claude");
+
+    flip(true);
+    expect(usePrefs.getState().systemScheme).toBe("light");
+    expect(resolveThemeFull("claude", usePrefs.getState().systemScheme)).toBe("claude");
+
+    usePrefs.getState().setThemeMode("auto");
+    expect(resolveThemeFull("auto", usePrefs.getState().systemScheme)).toBe("light");
+  });
+
+  it("leaves a custom theme id untouched across a flip", async () => {
+    const flip = stubMatchMedia(false);
+    const { usePrefs, resolveThemeFull } = await import("./prefs");
+    const custom = {
+      id: "custom:paper" as const, name: "Paper", colorScheme: "light" as const,
+      ui: {}, terminal: {},
+    };
+    usePrefs.setState({ customThemes: [custom as any] });
+    usePrefs.getState().setThemeMode(custom.id);
+
+    flip(true);
+    expect(resolveThemeFull(custom.id, usePrefs.getState().systemScheme)).toBe(custom.id);
+  });
+});

@@ -27,7 +27,7 @@ import { setupImeReplacementBridge } from "@/lib/ime";
 import * as ipc from "@/lib/ipc";
 import { loginShell } from "@/lib/loginShell";
 import { TerminalExitedBanner } from "@/components/task/TerminalExitedBanner";
-import { usePrefs, currentTerminalStack, currentTerminalTheme, currentColorFgBg, currentMinimumContrastRatio } from "@/store/prefs";
+import { usePrefs, useResolvedThemeFull, currentTerminalStack, currentTerminalTheme, currentColorFgBg, currentMinimumContrastRatio } from "@/store/prefs";
 import { useApp } from "@/store/app";
 import { IS_MAC, bindingMatches } from "@/lib/shortcuts";
 
@@ -368,7 +368,7 @@ export function AuxTerminal({ taskId, tabId, taskPath, active, autoFocus, onExit
   }, [terminalFontId, terminalFontSize, terminalLetterSpacing, terminalOptionAsMeta]);
 
   // Live theme swap mirrors TerminalPane's effect; see the comment there.
-  const themeMode = usePrefs(s => s.themeMode);
+  const themeKey = useResolvedThemeFull();
   const customThemeRev = usePrefs(s => s.customThemeRev);
   const firstThemeRun = useRef(true);
   useEffect(() => {
@@ -377,7 +377,7 @@ export function AuxTerminal({ taskId, tabId, taskPath, active, autoFocus, onExit
     if (!t) return;
     t.options.theme = currentTerminalTheme() as any;
     t.options.minimumContrastRatio = currentMinimumContrastRatio();
-  }, [themeMode, customThemeRev]);
+  }, [themeKey, customThemeRev]);
 
   return (
     <div className="relative flex h-full w-full flex-col">
