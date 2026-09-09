@@ -1,9 +1,9 @@
 {
   "versions": [
     {
-      "version": "1.3.4",
+      "version": "1.3.5",
       "date": "2026-09-09",
-      "summary": "Fixes a profiles bug that could move a project to the default profile."
+      "summary": "Open a task's folder in any app, plus a profiles fix that moved projects."
     },
     {
       "version": "1.3.3",

@@ -4,9 +4,18 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
-## [1.3.4] - 2026-09-09
+## [1.3.5] - 2026-09-09
 
-Fixes a profiles bug that could move a project to the default profile.
+Open a task's folder in any app, plus a profiles fix that moved projects.
+
+### Features
+- **Open a task's folder in the app you actually want.** The folder button in
+  the title bar always opened Finder, and a git worktree is usually something
+  you want to hand to an editor or a terminal instead. It is now a split
+  control: the left half launches whatever you picked last, and the chevron
+  lists the well-known editors and terminals found on your machine. Finder
+  stays first and stays the default, so nothing that worked before stopped
+  working. ([#284](https://github.com/simion/termic/pull/284))
 
 ### Bug fixes
 - **A project could move to the default profile on its own.** Changing anything
@@ -36,6 +45,10 @@ Fixes a profiles bug that could move a project to the default profile.
   a task now gets its own chip, and the one whose tab is on screen is the one
   that survives a narrow window.
   ([#277](https://github.com/simion/termic/issues/277))
+
+### Thanks
+- Vinodkumar Naidu (@nvkvin) for the open-with control, and for following it
+  onto Windows before anyone could run it there.
 
 ## [1.3.3] - 2026-09-07
 
