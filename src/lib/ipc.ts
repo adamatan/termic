@@ -10,7 +10,7 @@ import type {
   ImportableWorktree, CliInfo, ChangeFile, Changes, GitStatus, CheckoutResult, UpdateMode, UpdateResult, UpdateInfo, FileEntry, Agent, RepoConfig,
   SandboxMode, TaskDiffSummary, CliInstallStatus, McpStatus, BranchContext, BlameFile, GitCommit, GitCompare, GitFile, GitLogPage, GitRef,
   ForgeCliStatus, PrLookup, PrComment, IssueLookup, AgentHookStatus, HookPlan,
-  ProfileView, ProfilesView, ProfileDeletePreview, AgentAccountsView,
+  ProfileView, ProfilesView, ProfileDeletePreview, AgentAccountsView, ExternalAppInfo,
 } from "./types";
 import type { CustomThemeFile } from "./customTheme";
 import {
@@ -1246,6 +1246,19 @@ async function resolveCompletionSoundValue(
 }
 
 export const openPath  = (path: string) => invoke<void>("open_path", { path });
+/** The built-in apps this machine has, in menu order, for the title bar's
+ *  "open with" picker. Called lazily when the menu opens, never on a render
+ *  path: on Linux it walks the login shell's PATH and can block. */
+export const openWithApps = () => invoke<ExternalAppInfo[]>("open_with_apps");
+/** Open a task's worktree root in one of those apps.
+ *
+ *  Sends the task ID, never a path: the directory is resolved in Rust from the
+ *  task record, so the webview never composes a launcher argument. `taskId` is
+ *  camelCase because Tauri camelCases the Rust `task_id` parameter (same as
+ *  `scratch_write` below). Rejects when the app has been uninstalled since the
+ *  menu last listed it, which is what lets the caller revert the pick. */
+export const openWithApp = (key: string, taskId: string) =>
+  invoke<void>("open_with_app", { key, taskId });
 /** What `openExternalUrl` did: "default" (nothing configured, OS default took
  *  it), "browser" (the configured command took it) or "fallback" (it failed
  *  and the OS default took it). `reason` is set only for "fallback". */

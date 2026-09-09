@@ -263,6 +263,43 @@ preference; the title bar is the strip you drive agents from. Anything proposed
 for this bar has to earn its width against the breadcrumb, which is the thing
 people actually read.
 
+### The folder button is a picker, not one action
+
+`OpenWithButton` replaced a fixed "Open in Finder". Left half launches the app
+picked last, a 14px chevron opens the menu of everything detected. Finder is
+first in the list and the default, so the old behaviour is one click away and
+nothing that worked stopped working. It earns the extra width because a git
+worktree is rarely something you want in a file manager: the tools you want on
+one are an editor or a terminal.
+
+Three things about it are load-bearing:
+
+**The app list is fetched on first menu open, never during render.** Detection
+is a Rust call that stats `/Applications` (and on Linux walks the login shell's
+PATH, which blocks), and this component repaints whenever the active task
+changes. A render-path fetch is performance.md bear trap 5 here.
+
+**Which means the button cannot know whether the remembered app still
+exists, so it does not try.** It renders from the preference alone, and
+`open_with_app` rejecting is what triggers the recovery: toast, then revert the
+pick to the file manager. That is also the only correct answer for an app
+deleted while the menu was open, so it is not a second-best fallback.
+
+**The preference stores the label and kind, not just the key**
+(`openWithApp` in localStorage, decoded once at store init by
+`parseOpenWithPick`). That is what lets the button paint its icon and tooltip
+with zero IPC. Decoding in a selector instead would mint a fresh object per
+store notification and re-render the bar on unrelated prefs writes.
+
+Icons are per GROUP, not per app (`FolderOpen` / `Code2` / `SquareTerminal`):
+lucide has no Cursor or Warp glyph, and eight brand SVGs is a bigger change
+than the feature. The label carries the identity, the tooltip spells it out.
+
+Deliberately NOT extended to the file context menus (`CopyPathItems`,
+`TerminalPathMenu`). Those act on a FILE and already have "Open in default
+app"; this acts on the task root. `ContextMenuItem` also drops `data-*`
+attributes, so its rows cannot carry a test id.
+
 ## Window chrome / drag
 
 macOS overlay title bar, hidden title, 84px reserved left for traffic lights. Three drag mechanisms (each fails differently):

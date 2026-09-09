@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { archiveTask, clickByText, clickMenuItem, clickWhenVisible, dismissOverlays, ensureActiveTask, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitForWorkBadge, waitGone, waitVisible } from "../helpers";
@@ -2379,5 +2379,212 @@ describe("branch as the task name (GH #260)", () => {
       timeout: 8_000,
       timeoutMsg: "the typed name never came back",
     });
+  });
+});
+
+// P1: the title bar's "open with" picker. That button used to be a fixed
+// "Open in Finder"; it is now a split control whose left half launches the app
+// picked last and whose chevron lists everything detected on the machine.
+//
+// The e2e binary records the pick instead of launching it (see
+// `open_with_app` in lib.rs) and reports a FIXED app list instead of a real
+// one (`E2E_APPS`): the CI runner has no editors installed, so a spec keyed on
+// detection would assert an empty menu there. Real detection is unit-tested in
+// Rust with an injected filesystem instead, which is the only place it can be
+// tested deterministically.
+//
+// Cases: the menu's contents and group order; a pick reaches the backend with
+// the task's absolute worktree path; the pick is REMEMBERED, so the left half
+// then launches it without the menu; an app that has gone away reverts the
+// button instead of staying dead; and Escape launches nothing.
+describe("open the task folder in another app", () => {
+  const openLog = path.join(process.cwd(), ".e2e", "profile", "e2e-open-with.log");
+  const FILE_MANAGER_PICK = { key: "file-manager", label: "Finder", kind: "file-manager" };
+  let taskId = "";
+
+  /** `<app key>\t<absolute dir>` per launch, newest last. */
+  const opens = (): string[][] => {
+    try {
+      return readFileSync(openLog, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => l.split("\t"));
+    } catch {
+      return []; // not written yet — the caller is inside a waitUntil
+    }
+  };
+
+  /** The MOST RECENT launch, waited for rather than slept on. The last line,
+   *  not the first: a launch from the previous case can still be landing when
+   *  this one clears the log. */
+  const lastOpen = async (): Promise<string[]> => {
+    await browser.waitUntil(() => opens().length > 0, {
+      timeout: 8_000,
+      timeoutMsg: "nothing reached open_with_app",
+    });
+    const all = opens();
+    return all[all.length - 1];
+  };
+
+  const setPick = (p: unknown) =>
+    browser.execute((v) => {
+      window.__termic!.usePrefs.getState().setOpenWithApp(v);
+    }, p);
+
+  const currentPick = () =>
+    browser.execute(() => window.__termic!.usePrefs.getState().openWithApp);
+
+  /** Open the menu and wait for the app list to arrive. It is fetched on first
+   *  open, never during render, so the items are not there on the first tick. */
+  const openMenu = async () => {
+    // A dispatched pointerdown/up pair, NOT clickWhenVisible: Radix opens on
+    // pointerdown and WebKit's WebDriver click emits no pointer events at all,
+    // so `el.click()` leaves the trigger `data-state="closed"` (measured here:
+    // the first run of this spec failed with state closed and no menu in the
+    // DOM). Same helper shape as the History scope picker in git.e2e.ts, and
+    // no trailing click for the same reason: it would toggle straight shut.
+    // Menu ITEMS are fine with a plain click, which is why only this half
+    // needs the pair.
+    await waitVisible('[data-testid="open-with-menu"]');
+    await browser.execute(() => {
+      const el = document.querySelector('[data-testid="open-with-menu"]') as HTMLElement;
+      const opts = { bubbles: true, cancelable: true, pointerType: "mouse", button: 0, isPrimary: true, pointerId: 1 } as any;
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", opts));
+    });
+    // The app list is fetched on first open, never during render, so the rows
+    // land a tick after the menu does.
+    await waitVisible('[data-testid="open-with-file-manager"]');
+  };
+
+  /** Visible labels of the picker's menu rows, in render order. */
+  const menuLabels = () =>
+    browser.execute(() =>
+      [...document.querySelectorAll("[role='menuitem']")]
+        .filter((el) => el.getAttribute("data-testid")?.startsWith("open-with-"))
+        .map((el) => (el as HTMLElement).innerText.trim()),
+    );
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await dismissOverlays();
+    taskId = await openTask("e2e-open-with");
+    await ensureActiveTask(taskId);
+    await waitVisible('[data-testid="open-with-launch"]');
+  });
+
+  after(async () => {
+    // The pref is app-wide and the profile is shared with every later spec
+    // file: a synthetic editor left behind would make any later click on this
+    // button write a log line that spec never asked for.
+    await setPick(FILE_MANAGER_PICK);
+    rmSync(openLog, { force: true });
+    if (taskId) await archiveTask(taskId);
+  });
+
+  it("defaults to the file manager, which is what the button always did", async () => {
+    expect(await currentPick()).toMatchObject({ key: "file-manager" });
+    expect(
+      await browser.execute(
+        () => document.querySelector('[data-testid="open-with-launch"]')?.getAttribute("data-app"),
+      ),
+    ).toBe("file-manager");
+  });
+
+  it("renders as one control, not two buttons side by side", async () => {
+    // A split control in a 28px slot either reads as one button or looks
+    // broken, and no screenshot assertion can say which. So measure it: equal
+    // heights, touching edges, a real icon in the launch half, and a total
+    // width that cannot silently balloon in a bar that has to earn its space
+    // against the breadcrumb (docs/ui.md).
+    const box = await browser.execute(() => {
+      const l = document.querySelector('[data-testid="open-with-launch"]') as HTMLElement;
+      const m = document.querySelector('[data-testid="open-with-menu"]') as HTMLElement;
+      const lr = l.getBoundingClientRect();
+      const mr = m.getBoundingClientRect();
+      const svg = l.querySelector("svg");
+      const sr = svg?.getBoundingClientRect();
+      return {
+        lh: Math.round(lr.height), mh: Math.round(mr.height),
+        gap: Math.round(mr.left - lr.right),
+        total: Math.round(mr.right - lr.left),
+        icon: sr ? Math.round(sr.width) : 0,
+      };
+    });
+    expect(box.lh).toBe(box.mh);            // one control, one height
+    expect(box.gap).toBe(0);                // touching, no seam
+    expect(box.icon).toBeGreaterThan(8);    // the glyph actually rendered
+    expect(box.total).toBeLessThanOrEqual(48);
+  });
+
+  it("lists the file manager first, then editors, then terminals", async () => {
+    // The menu draws one separator per group boundary, so the order is
+    // load-bearing: a terminal sorted among the editors would put a separator
+    // in the middle of them.
+    await openMenu();
+    expect(await menuLabels()).toEqual(["Finder", "E2E Editor", "E2E Terminal"]);
+    await snap("open-with-menu.png");
+    await browser.keys(["Escape"]);
+    await waitGone('[data-testid="open-with-file-manager"]');
+  });
+
+  it("launches nothing when the menu is dismissed", async () => {
+    // Opening the menu is not a launch. Escape has to leave the folder alone.
+    rmSync(openLog, { force: true });
+    await openMenu();
+    await browser.keys(["Escape"]);
+    await waitGone('[data-testid="open-with-file-manager"]');
+    expect(opens()).toEqual([]);
+  });
+
+  it("sends the task's absolute worktree path, not a relative one", async () => {
+    rmSync(openLog, { force: true });
+    await openMenu();
+    await clickWhenVisible('[data-testid="open-with-e2e-editor"]');
+    const [key, dir] = await lastOpen();
+    expect(key).toBe("e2e-editor");
+    // Absolute, and resolved in Rust from the task id: the frontend never
+    // sends a path at all.
+    expect(dir.startsWith("/")).toBe(true);
+    const want = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.path,
+      taskId,
+    );
+    expect(dir).toBe(want);
+  });
+
+  it("remembers the pick, so the button launches it without the menu", async () => {
+    // The whole point of the split control: pick once, then one click.
+    expect(await currentPick()).toMatchObject({ key: "e2e-editor", label: "E2E Editor" });
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () => document.querySelector('[data-testid="open-with-launch"]')?.getAttribute("data-app"),
+        )) === "e2e-editor",
+      { timeout: 8_000, timeoutMsg: "the button never adopted the pick" },
+    );
+    await snap("open-with-remembered.png");
+
+    rmSync(openLog, { force: true });
+    await clickWhenVisible('[data-testid="open-with-launch"]');
+    const [key] = await lastOpen();
+    expect(key).toBe("e2e-editor");
+  });
+
+  it("reverts to the file manager when the remembered app has gone away", async () => {
+    // An app can be uninstalled between picking it and clicking, or weeks
+    // later. Detection never runs on the render path (it is a blocking Rust
+    // call), so recovering at launch is the only place this can be caught —
+    // and leaving the button dead is the failure this prevents.
+    rmSync(openLog, { force: true });
+    await setPick({ key: "e2e-gone", label: "Gone", kind: "editor" });
+    await clickWhenVisible('[data-testid="open-with-launch"]');
+    await waitForText("Could not open in Gone");
+    await browser.waitUntil(
+      async () => (await currentPick()).key === "file-manager",
+      { timeout: 8_000, timeoutMsg: "the pick never reverted to the file manager" },
+    );
+    expect(opens()).toEqual([]);
   });
 });
