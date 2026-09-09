@@ -366,6 +366,29 @@ describe("git history tab", () => {
       ),
     ) as Promise<string[]>;
 
+  /** The same, but only once the graph has finished fetching.
+   *
+   *  Changing the scope does not clear the list: `HistoryPanel` calls
+   *  `setCommits` on success only, so the rows of the scope you just LEFT stay
+   *  on screen until the new page lands. Reading between those two moments
+   *  gives you the previous scope's commits, and they look exactly like a real
+   *  answer. On this Mac the fetch lands before the next line runs, so the gap
+   *  does not exist; on the CI runner it does, and this file failed there
+   *  three releases running while passing everywhere else.
+   *
+   *  Hence the panel's own `data-loading`, not a count that stopped moving: a
+   *  list is "stable" for the whole duration of a slow fetch, so quiet is not
+   *  evidence of anything. */
+  const settledSubjects = async (): Promise<string[]> => {
+    await browser.waitUntil(
+      () => browser.execute(() =>
+        document.querySelector('[data-testid="history-panel"]')
+          ?.getAttribute("data-loading") === "false"),
+      { timeout: 15_000, timeoutMsg: "the commit graph never finished loading" },
+    );
+    return commitSubjects();
+  };
+
   it("lists real commits, newest first", async () => {
     await waitForAppShell();
     await requireTermicApi();
@@ -552,21 +575,31 @@ describe("git history tab", () => {
     // fourth scope, it is how much of the topology to walk, so it stacks on
     // whatever scope is active and the menu stays open.
     await openGraph();
-    const before = (await commitSubjects()).length;
+    // SETTLED, not sampled. The case before this one leaves the picker on Auto
+    // and waits only for the scope ATTRIBUTES to say so, so the refetch back
+    // to Auto can still be in flight here: an unsettled read returns the
+    // all-refs list it was showing a moment ago, which on a machine with a
+    // dozen branches from earlier specs is much longer than Auto's. `before`
+    // is then a number the graph will never return to, and the last wait in
+    // this case times out on a restore that did happen.
+    const before = (await settledSubjects()).length;
     await openMenu();
     await pick("First parent only");
-    await browser.waitUntil(
-      async () => (await commitSubjects()).length > 0,
-      { timeout: 10_000, timeoutMsg: "the first-parent view came back empty" },
-    );
+    const firstParent = (await settledSubjects()).length;
+    expect(firstParent).toBeGreaterThan(0);
     // The fixture may have no merges, in which case the two walks agree; what
     // must never happen is the option emptying the graph or growing it.
-    expect((await commitSubjects()).length).toBeLessThanOrEqual(before);
+    expect(firstParent).toBeLessThanOrEqual(before);
     await pick("First parent only");
-    await browser.waitUntil(
-      async () => (await commitSubjects()).length === before,
-      { timeout: 10_000, timeoutMsg: "turning first-parent off did not restore the walk" },
-    );
+    const restored = (await settledSubjects()).length;
+    // Thrown with the NUMBERS in it. "did not restore the walk" is what this
+    // failure said for three releases, and a bare count mismatch is exactly
+    // the case where knowing which of the two moved is the whole diagnosis.
+    if (restored !== before) {
+      throw new Error(
+        `first-parent off restored ${restored} rows, not the ${before} it started with ` +
+        `(first-parent showed ${firstParent})`);
+    }
     await browser.keys(["Escape"]);
   });
 

@@ -340,7 +340,18 @@ export function HistoryPanel({ task, reloadToken, onOpenDiff, repoDir: repoDirPr
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col" data-testid="history-panel">
+    <div
+      className="flex h-full min-h-0 flex-col"
+      data-testid="history-panel"
+      // Is a fetch in flight? A refetch keeps the PREVIOUS rows on screen
+      // until the new page lands (setCommits only fires on success), which is
+      // right for the eye and invisible to a reader: the rows for the scope
+      // you just left look exactly like the rows for the one you picked. A
+      // spec that samples the list between the two reads the wrong scope's
+      // commits, and only on a machine slow enough for the gap to exist. That
+      // is what this attribute is for.
+      data-loading={loading || paging ? "true" : "false"}
+    >
       {/* Repo pills — multi-repo tasks pick which repo's history to read. */}
       {members.length > 0 && (
         <div className="flex flex-wrap gap-1 border-b border-[var(--color-border-soft)] px-2 py-1.5">

@@ -183,6 +183,20 @@ export function seed(o = {}) {
   // task records are recreated by the specs, so every pad still on disk here
   // belongs to a task that no longer exists.
   rmSync(path.join(dataDir, "scratch"), { recursive: true, force: true });
+  // The profile REGISTRY (GH #280), and the tree of any non-root profile with
+  // it. Absent is the dormant state, which is what a seeded run starts from.
+  //
+  // This one is not tidiness, it is the difference between a repeatable suite
+  // and an unusable checkout. `profiles.e2e.ts` creates and deletes profiles,
+  // and deleting the ROOT one leaves `root_slug: null` behind. `Registry::ids`
+  // omits `ProfileId::Root` when that field is null, so the app can no longer
+  // see the projects and tasks this script just wrote into the root data dir:
+  // every spec after it fails, on a fixture that looks perfectly healthy from
+  // the outside. A run whose `after` hook never got there leaves exactly that,
+  // and re-seeding did not clear it, so the checkout stayed broken until
+  // somebody deleted the file by hand.
+  rmSync(path.join(dataDir, "profiles.json"), { force: true });
+  rmSync(path.join(dataDir, "profiles"), { recursive: true, force: true });
   // Every worktree under `tasksPath` belongs to a previous run: task records
   // are recreated by the specs themselves, so anything still on disk here is
   // debris from a run that was interrupted before its `after` hook. Drop it,
