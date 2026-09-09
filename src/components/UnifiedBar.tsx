@@ -15,7 +15,7 @@ import { Tip } from "@/components/ui/Tooltip";
 import * as HoverCard from "@radix-ui/react-hover-card";
 import { Check } from "lucide-react";
 import {
-  PanelLeft, PanelRight, FolderOpen, Archive,
+  PanelLeft, PanelRight, Archive,
   Sun, Moon, Monitor, ArrowUpToLine, Sunrise, Droplet, Binary, Code2, Flower2,
   MessageSquareText, Library, Palette,
 } from "lucide-react";
@@ -26,7 +26,8 @@ import { taskLabel } from "@/lib/taskLabel";
 import { SandboxIcon, DockerSandboxIcon } from "@/components/SandboxIcon";
 import { UpdaterBanner } from "@/components/UpdaterBanner";
 import { WaitingAgentsPill } from "@/components/WaitingAgentsPill";
-import { openPath, themesDir, taskSendDiffToMain } from "@/lib/ipc";
+import { themesDir, taskSendDiffToMain } from "@/lib/ipc";
+import { OpenWithButton } from "@/components/OpenWithButton";
 import { confirmAndArchive } from "@/lib/archiveTask";
 import {
   DropdownRoot, DropdownTrigger, DropdownMenu, DropdownItem, DropdownSeparator,
@@ -363,11 +364,7 @@ export function UnifiedBar() {
                 data-testid="archive-task"
               ><Archive className="h-4 w-4" /></Button>
             </Tip>
-            <Tip content="Open in Finder" side="bottom">
-              <Button size="icon" variant="icon" onClick={() => openPath(task.path).catch(() => {})}>
-                <FolderOpen className="h-4 w-4" />
-              </Button>
-            </Tip>
+            <OpenWithButton task={task} />
             <div className="mx-1 h-4 w-px bg-[var(--color-border-soft)]" />
             <Tip content={tipWithKey("Toggle right panel", "toggle-right-sidebar")} side="bottom">
               <Button size="icon" variant="icon" onClick={toggleRP} data-testid="toggle-right-panel">

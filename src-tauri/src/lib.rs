@@ -17276,6 +17276,508 @@ fn open_command(os: &str, target: &str) -> (&'static str, Vec<String>) {
     }
 }
 
+// ─────────────────── open with (the title bar's folder button) ───────────────────
+//
+// The toolbar button used to hard-code `openPath(task.path)`, i.e. Finder.
+// The folder in question is a git worktree, and the tools a user actually
+// wants on one are an editor or a terminal. So the button became a picker.
+//
+// Unlike the preview browser above, this is a FIXED TABLE of well-known apps
+// rather than a user-typed command template, and the two coexist for a reason:
+// a browser preset has to express "Chrome, but my work profile", which only a
+// template can, whereas "open this folder in Cursor" has exactly one spelling.
+// The table's job is to be *detected*, which a template can never be.
+//
+// The frontend only ever sends a KEY from this table. It never names a path,
+// an app or an argv: the webview sits outside the Seatbelt cage
+// (docs/sandbox.md, "Known gap"), so letting it compose `open` arguments would
+// hand it a launcher. The directory is resolved here from the task id, the
+// same discipline `task_reveal_path` follows.
+//
+// ADDING AN APP: a macOS app only accepts a *folder* if its bundle declares
+// `public.folder` or `public.directory` in `CFBundleDocumentTypes`. Check
+// before adding an entry, or `open -a` silently opens the app at its last
+// state and ignores the path:
+//
+//     plutil -extract CFBundleDocumentTypes json -o - \
+//       "/Applications/Cursor.app/Contents/Info.plist"
+//
+// Verified for the entries below at the time of writing: Cursor, Warp and Zed
+// declare `public.folder`; Terminal declares `public.directory`. Bundle
+// identifiers are deliberately NOT used to launch (`open -b`): two installed
+// versions make an id ambiguous where a path never is. Recorded only because
+// they are unguessable if anyone needs them later, e.g. Cursor ships as
+// `com.todesktop.230313mzl4w4u92` and Warp as `dev.warp.Warp-Stable`.
+//
+// Detection is `Path::exists` on candidate bundle paths, which is the first
+// /Applications probe in the tree. The alternative, a PATH lookup like
+// `detect_clis_blocking` does, was rejected: `code` and `cursor` are opt-in
+// shell commands the user installs from inside the app, and Warp, Terminal,
+// iTerm2 and Ghostty ship no folder-opening CLI at all, so PATH would report
+// most installed editors as missing. Linux has no bundles and so does use the
+// PATH walk, via `shell_env::resolved_path()` for the reason documented on
+// `detect_clis_blocking`. `sandbox.rs` denies /Applications to sandboxed
+// agents; this runs in the host process, outside that cage.
+
+/// Which group an app sits in, for the menu's separators. Also what the
+/// frontend keys its icon off, so it never has to know app names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AppKind {
+    /// Finder / Explorer / the freedesktop file manager. Always present, and
+    /// always first: it is what the button did before it was a picker.
+    FileManager,
+    Editor,
+    Terminal,
+}
+
+impl AppKind {
+    /// Menu order. Groups render in this order with one separator between.
+    #[cfg_attr(feature = "e2e", allow(dead_code))]
+    fn rank(self) -> u8 {
+        match self {
+            AppKind::FileManager => 0,
+            AppKind::Editor => 1,
+            AppKind::Terminal => 2,
+        }
+    }
+}
+
+/// One row of the built-in table.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+struct ExternalApp {
+    /// Stable wire identifier. The ONLY app-identifying value that crosses
+    /// the IPC boundary. Never renamed: it is persisted in the frontend's
+    /// remembered-pick preference.
+    key: &'static str,
+    label: &'static str,
+    kind: AppKind,
+    /// macOS `.app` bundles, first hit wins. A leading `~/` is expanded
+    /// (JetBrains Toolbox installs into ~/Applications, not /Applications).
+    mac_paths: &'static [&'static str],
+    /// Linux/BSD executables, resolved on the login shell's PATH.
+    unix_bins: &'static [&'static str],
+}
+
+/// The file manager's key. Special-cased everywhere: it needs no detection
+/// (every OS has one) and it launches through `open_command`, so it cannot
+/// drift from what the button did before this feature existed.
+const FILE_MANAGER_KEY: &str = "file-manager";
+
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+const EXTERNAL_APPS: &[ExternalApp] = &[
+    ExternalApp {
+        key: FILE_MANAGER_KEY,
+        // The frontend substitutes its own FILE_MANAGER constant here, so
+        // "Finder" vs "File Manager" has exactly one definition (see
+        // src/lib/openExternal.ts). This label is the fallback, not the
+        // source of truth.
+        label: "Finder",
+        kind: AppKind::FileManager,
+        mac_paths: &[],
+        unix_bins: &[],
+    },
+    // ── editors ──
+    ExternalApp {
+        key: "vscode",
+        label: "VS Code",
+        kind: AppKind::Editor,
+        mac_paths: &["/Applications/Visual Studio Code.app", "~/Applications/Visual Studio Code.app"],
+        unix_bins: &["code"],
+    },
+    ExternalApp {
+        key: "vscodium",
+        label: "VSCodium",
+        kind: AppKind::Editor,
+        mac_paths: &["/Applications/VSCodium.app"],
+        unix_bins: &["codium"],
+    },
+    ExternalApp {
+        key: "cursor",
+        label: "Cursor",
+        kind: AppKind::Editor,
+        mac_paths: &["/Applications/Cursor.app", "~/Applications/Cursor.app"],
+        unix_bins: &["cursor"],
+    },
+    ExternalApp {
+        key: "windsurf",
+        label: "Windsurf",
+        kind: AppKind::Editor,
+        mac_paths: &["/Applications/Windsurf.app"],
+        unix_bins: &["windsurf"],
+    },
+    ExternalApp {
+        key: "zed",
+        label: "Zed",
+        kind: AppKind::Editor,
+        mac_paths: &["/Applications/Zed.app", "~/Applications/Zed.app"],
+        unix_bins: &["zed", "zeditor"],
+    },
+    ExternalApp {
+        key: "sublime",
+        label: "Sublime Text",
+        kind: AppKind::Editor,
+        mac_paths: &["/Applications/Sublime Text.app"],
+        unix_bins: &["subl"],
+    },
+    ExternalApp {
+        key: "intellij",
+        label: "IntelliJ IDEA",
+        kind: AppKind::Editor,
+        mac_paths: &[
+            "/Applications/IntelliJ IDEA.app",
+            "/Applications/IntelliJ IDEA CE.app",
+            "~/Applications/IntelliJ IDEA Ultimate.app",
+            "~/Applications/IntelliJ IDEA Community Edition.app",
+        ],
+        unix_bins: &["idea"],
+    },
+    ExternalApp {
+        key: "webstorm",
+        label: "WebStorm",
+        kind: AppKind::Editor,
+        mac_paths: &["/Applications/WebStorm.app", "~/Applications/WebStorm.app"],
+        unix_bins: &["webstorm"],
+    },
+    ExternalApp {
+        key: "pycharm",
+        label: "PyCharm",
+        kind: AppKind::Editor,
+        mac_paths: &[
+            "/Applications/PyCharm.app",
+            "/Applications/PyCharm CE.app",
+            "~/Applications/PyCharm Professional.app",
+            "~/Applications/PyCharm Community Edition.app",
+        ],
+        unix_bins: &["pycharm"],
+    },
+    // ── terminals ──
+    //
+    // macOS only, deliberately. Every Linux terminal emulator spells "start
+    // in this directory" differently (--working-directory, -d, --cwd) and
+    // none of them is verifiable from a Mac, so shipping a guess would ship a
+    // menu entry that opens a terminal in the wrong place.
+    ExternalApp {
+        key: "terminal",
+        label: "Terminal",
+        kind: AppKind::Terminal,
+        // Moved to /System/Applications in macOS 11. The /Applications path
+        // backstops an older install.
+        mac_paths: &[
+            "/System/Applications/Utilities/Terminal.app",
+            "/Applications/Utilities/Terminal.app",
+        ],
+        unix_bins: &[],
+    },
+    ExternalApp {
+        key: "iterm",
+        label: "iTerm",
+        kind: AppKind::Terminal,
+        mac_paths: &["/Applications/iTerm.app"],
+        unix_bins: &[],
+    },
+    ExternalApp {
+        key: "warp",
+        label: "Warp",
+        kind: AppKind::Terminal,
+        mac_paths: &["/Applications/Warp.app"],
+        unix_bins: &[],
+    },
+    ExternalApp {
+        key: "ghostty",
+        label: "Ghostty",
+        kind: AppKind::Terminal,
+        mac_paths: &["/Applications/Ghostty.app"],
+        unix_bins: &[],
+    },
+];
+
+/// One detected app, as the menu renders it. No path and no argv: see the
+/// module comment on why the webview is told a key and nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExternalAppInfo {
+    pub key: String,
+    pub label: String,
+    pub kind: AppKind,
+}
+
+/// Expand a leading `~/` in a table path. Only the leading form: a `~` mid
+/// path is a legal directory name, and the table never contains one.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+fn expand_home(path: &str, home: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// Which of the built-in apps this machine has, in menu order.
+///
+/// `exists` is injected so the unit tests cover the real table without
+/// touching the filesystem, and so a test can describe a machine that has an
+/// app this developer's does not.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+fn detect_external_apps(
+    os: &str,
+    home: &str,
+    exists: &dyn Fn(&str) -> bool,
+) -> Vec<ExternalAppInfo> {
+    let mut found: Vec<&ExternalApp> = Vec::new();
+    for app in EXTERNAL_APPS {
+        // The file manager is not detected: every OS has one, and it is the
+        // fallback the frontend reverts to when a remembered app is gone.
+        if app.key == FILE_MANAGER_KEY {
+            found.push(app);
+            continue;
+        }
+        let hit = match os {
+            "macos" => app.mac_paths.iter().any(|p| exists(&expand_home(p, home))),
+            // Windows: registry work, not path work. Nobody has measured it,
+            // so the menu honestly offers only the file manager there rather
+            // than guessing at install locations.
+            "windows" => false,
+            _ => app.unix_bins.iter().any(|b| exists(*b)),
+        };
+        if hit {
+            found.push(app);
+        }
+    }
+    found.sort_by_key(|a| a.kind.rank());
+    found
+        .into_iter()
+        .map(|a| ExternalAppInfo { key: a.key.to_string(), label: a.label.to_string(), kind: a.kind })
+        .collect()
+}
+
+/// Locate one table candidate, returning the path to LAUNCH.
+///
+/// A bundle path is checked directly; a bare binary name is looked up on
+/// `shell_env::resolved_path()`, NOT `env::var("PATH")`: a GUI-launched app
+/// inherits a bare launchd PATH, so the latter misses everything Homebrew /
+/// nvm / volta export from a shell rc. `detect_clis_blocking` documents that
+/// trap at length.
+///
+/// It returns the RESOLVED path rather than a bool, and that is the whole
+/// point. Answering "yes, `code` exists somewhere on the login shell's PATH"
+/// and then handing the bare name to `Command::new` would search the host
+/// process's own PATH instead - a different, shorter list - so an editor in
+/// `~/.local/bin` would be offered in the menu and then fail to launch. Same
+/// reason `detect_clis_blocking` and `forge::resolve_bin_uncached` both keep
+/// the full path once they have found it.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+fn resolve_external_app(candidate: &str) -> Option<String> {
+    if candidate.starts_with('/') || candidate.starts_with('~') {
+        return Path::new(candidate).exists().then(|| candidate.to_string());
+    }
+    resolve_in_dirs(shell_env::resolved_path().split(':'), candidate)
+}
+
+/// The dir-list half of the lookup above, split out so a test can drive it
+/// with a directory it created rather than with whatever this machine happens
+/// to have installed. Returns the FULL path of the first hit.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+fn resolve_in_dirs<'a>(dirs: impl Iterator<Item = &'a str>, candidate: &str) -> Option<String> {
+    dirs.filter(|d| !d.is_empty())
+        .map(|dir| Path::new(dir).join(candidate))
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// The argv that opens `dir` in `app`.
+///
+/// Split from the spawn for the same reason `open_command` is: the
+/// per-platform dispatch is the part worth unit-testing, and the spawn is not
+/// testable without launching something.
+///
+/// `resolved` is the bundle path (macOS) or binary (elsewhere) that detection
+/// already found, so this never re-probes and never guesses.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+fn open_with_argv(os: &str, app: &ExternalApp, resolved: &str, dir: &str) -> Result<(String, Vec<String>), String> {
+    // An absolute path is not decoration. `open` reads a leading `-` as a
+    // flag, so a relative or dash-leading string would let a caller inject
+    // one. The frontend cannot reach this (the directory is resolved from a
+    // task id here, not sent), which is exactly why the check is cheap to
+    // keep: it stays true if a later caller is less careful.
+    if !dir.starts_with('/') {
+        return Err(format!("not an absolute path: {dir}"));
+    }
+    if app.key == FILE_MANAGER_KEY {
+        // Delegate, never reimplement: the file-manager entry must stay
+        // byte-identical to what the button did before it was a picker.
+        let (program, args) = open_command(os, dir);
+        return Ok((program.to_string(), args));
+    }
+    match os {
+        // No `-n`: reusing the running instance is what "open this folder in
+        // Cursor" means. `-n` would spawn a second copy of the editor.
+        "macos" => Ok(("open".to_string(), vec!["-a".to_string(), resolved.to_string(), dir.to_string()])),
+        _ => Ok((resolved.to_string(), vec![dir.to_string()])),
+    }
+}
+
+/// E2E-ONLY (`--features e2e`): record the pick instead of launching it. A
+/// spec that opens the menu must not launch Cursor over the window under
+/// test, and the CI runner has none of these apps installed anyway. Its own
+/// log file, NOT `e2e-opened.log`: that one is asserted line-for-line by the
+/// file-tree specs, which know nothing about this feature.
+#[cfg(feature = "e2e")]
+fn e2e_record_open_with(key: &str, dir: &str) {
+    if let Ok(d) = global_dir() {
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(d.join("e2e-open-with.log"))
+            .and_then(|mut f| writeln!(f, "{key}\t{dir}"));
+    }
+}
+
+/// E2E-ONLY: a fixed app list, so the menu's contents are the same on any
+/// machine. Real detection depends on what is installed, which a spec cannot
+/// assume (the macos-14 runner has no editors at all) — `detect_external_apps`
+/// is covered by `cargo test` instead, where the filesystem is injected.
+#[cfg(feature = "e2e")]
+const E2E_APPS: &[(&str, &str, AppKind)] = &[
+    (FILE_MANAGER_KEY, "Finder", AppKind::FileManager),
+    ("e2e-editor", "E2E Editor", AppKind::Editor),
+    ("e2e-terminal", "E2E Terminal", AppKind::Terminal),
+];
+
+/// The built-in apps this machine has, in menu order.
+///
+/// Async + `spawn_blocking`: a handful of `stat`s on macOS, but on Linux the
+/// PATH walk can block for hundreds of ms while the first login-shell probe
+/// lands, and a synchronous command would hold the WKWebView event loop for
+/// it. Not cached: it is one call behind a user click, and a `OnceLock` would
+/// hide an app installed since launch for the rest of the session.
+#[tauri::command]
+async fn open_with_apps() -> Vec<ExternalAppInfo> {
+    #[cfg(feature = "e2e")]
+    {
+        return E2E_APPS
+            .iter()
+            .map(|(key, label, kind)| ExternalAppInfo {
+                key: key.to_string(),
+                label: label.to_string(),
+                kind: *kind,
+            })
+            .collect();
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        tauri::async_runtime::spawn_blocking(|| {
+            let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            detect_external_apps(std::env::consts::OS, &home, &|c: &str| resolve_external_app(c).is_some())
+        })
+        .await
+        .unwrap_or_default()
+    }
+}
+
+/// Open a task's worktree root in one of the built-in apps.
+///
+/// Takes the TASK ID, never a path: the directory is resolved here from the
+/// task record, the same reason `task_reveal_path` does it rather than
+/// trusting a path the frontend reconstructed.
+///
+/// The path is always the HOST worktree, in every sandbox mode including
+/// Docker. The app being launched is a host GUI application, so there is no
+/// container-realm counterpart to build (docs/gotchas.md, "Docker is a SECOND
+/// REALM") — a container has no Cursor to open.
+///
+/// `Err` when the key is unknown or its app has been uninstalled since the
+/// menu was last opened, which is what lets the frontend fall back to the
+/// file manager instead of leaving a dead button.
+#[tauri::command]
+async fn open_with_app(key: String, task_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let task = load_tasks_all()
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .ok_or("no task")?;
+        let dir = task.path;
+
+        #[cfg(feature = "e2e")]
+        {
+            // Accept the synthetic keys too: they are not in the real table,
+            // so an unconditional lookup would reject the spec's every pick.
+            if !E2E_APPS.iter().any(|(k, _, _)| *k == key) {
+                return Err(format!("unknown app: {key}"));
+            }
+            if !dir.starts_with('/') {
+                return Err(format!("not an absolute path: {dir}"));
+            }
+            e2e_record_open_with(&key, &dir);
+            return Ok(());
+        }
+        #[cfg(not(feature = "e2e"))]
+        {
+            let os = std::env::consts::OS;
+            let app = EXTERNAL_APPS
+                .iter()
+                .find(|a| a.key == key)
+                .ok_or_else(|| format!("unknown app: {key}"))?;
+            let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            // Re-resolve rather than trusting that the menu's detection still
+            // holds: an app can be deleted between opening the menu and
+            // clicking, and the remembered pick can be weeks old.
+            let resolved = if app.key == FILE_MANAGER_KEY {
+                String::new()
+            } else {
+                let cands: Vec<String> = match os {
+                    "macos" => app.mac_paths.iter().map(|p| expand_home(p, &home)).collect(),
+                    "windows" => Vec::new(),
+                    _ => app.unix_bins.iter().map(|b| b.to_string()).collect(),
+                };
+                cands
+                    .into_iter()
+                    .find_map(|c| resolve_external_app(&c))
+                    .ok_or_else(|| "it is not installed".to_string())?
+            };
+            let (program, args) = open_with_argv(os, app, &resolved, &dir)?;
+
+            // The file manager keeps `open_path`'s policy: SPAWN failure is an
+            // error, exit status is ignored. That is not laziness, it is the
+            // only correct answer here - `explorer` exits NON-ZERO on success
+            // (see `open_command`), and Windows offers no other entry, so
+            // reading the status would make every Windows open report failure.
+            // This path must also stay byte-identical to what the button did
+            // before it became a picker.
+            if app.key == FILE_MANAGER_KEY {
+                Command::new(program).args(&args).status().map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+
+            // A real app DOES carry signal in its exit status, and the whole
+            // self-heal path depends on it: `open -a` on a deleted bundle, or
+            // an editor that cannot start, exits non-zero in milliseconds, and
+            // without noticing that the frontend shows no toast and never
+            // reverts the remembered pick - the button just silently does
+            // nothing, forever.
+            //
+            // Bounded watch rather than `status()`, reusing the launcher policy
+            // GH #245 already established (`run_browser_argv`, named for its
+            // first caller): a launcher that is going to fail does so at once,
+            // while one that took the folder either exits 0 immediately or
+            // lives on. `status()` would instead BLOCK this spawn_blocking
+            // thread for as long as the editor stays open, since not every
+            // editor binary detaches.
+            // Reason fragments, not sentences: the toast that shows these
+            // already says which app it was ("Could not open in Cursor: ..."),
+            // the same split openExternal.ts uses. A self-contained message
+            // here would name the app twice.
+            let mut argv = Vec::with_capacity(args.len() + 1);
+            argv.push(program);
+            argv.extend(args);
+            match run_browser_argv(&argv) {
+                BrowserLaunch::Launched => Ok(()),
+                BrowserLaunch::Failed(why) => Err(why),
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ─────────────────── preview browser (GH #245) ───────────────────
 //
 // The user names a COMMAND TEMPLATE, not an app: `open -a "Google Chrome"`,
@@ -17465,6 +17967,11 @@ enum BrowserLaunch {
 /// must be on the blocking pool.
 #[cfg_attr(feature = "e2e", allow(dead_code))]
 fn run_browser_argv(argv: &[String]) -> BrowserLaunch {
+    // ALSO the launcher policy for the title bar's "open with" picker
+    // (`open_with_app`). Named for its first caller, not scoped to it: a
+    // second copy of this timing rule is exactly what `spawn_os_open`'s
+    // comment warns about.
+
     let mut child = match Command::new(&argv[0]).args(&argv[1..]).spawn() {
         Ok(c) => c,
         Err(e) => return BrowserLaunch::Failed(format!("could not run `{}`: {e}", argv[0])),
@@ -21191,7 +21698,7 @@ pub fn run() {
             pty_spawn, pty_write, pty_resize, pty_kill,
             procmon_start, procmon_sample, procmon_stop, procmon_signal, procmon_open_window,
             lsp_offer, lsp_catalog, lsp_install, lsp_install_zuban, lsp_check_update, lsp_update, lsp_start, lsp_send, lsp_stop, lsp_reap_foreign, lsp_list,
-            notify, open_path, reveal_path, open_file_external, open_external_url, browser_command_check, home_dir, project_tasks_path_default, tasks_path_conflicts, default_shell, path_exists, path_is_git_repo, log_line, pty_debug_append, terminal_stage_file, install_notification_sound, play_completion_sound,
+            notify, open_path, reveal_path, open_file_external, open_with_apps, open_with_app, open_external_url, browser_command_check, home_dir, project_tasks_path_default, tasks_path_conflicts, default_shell, path_exists, path_is_git_repo, log_line, pty_debug_append, terminal_stage_file, install_notification_sound, play_completion_sound,
             settings_load, settings_save, discovery_dismiss, agents_save, agents_defaults, run_capture_command, discover_repos, detect_clis,
             docker_check, docker_image_status, docker_get_dockerfile, docker_default_dockerfile, docker_set_dockerfile, docker_build_image, docker_agent_dirs, docker_command_preview,
             automation::automation_result,
@@ -25468,6 +25975,256 @@ mod tests {
         assert_eq!(after_open("macos", false, false), AfterOpen::Reveal);
         assert_eq!(after_open("linux", false, false), AfterOpen::Reveal);
         assert_eq!(after_open("windows", false, false), AfterOpen::Reveal);
+    }
+
+    // ── open with (the title bar's app picker) ──
+    //
+    // The real table is compiled out of the e2e binary (the menu is a fixed
+    // synthetic list there), so these only run in a normal `cargo test`.
+    #[cfg(not(feature = "e2e"))]
+    mod open_with {
+        use super::super::*;
+
+        /// A machine that has exactly the named bundles/binaries.
+        ///
+        /// Compared with `iter().any`, not `contains`: the latter wants a
+        /// `&&'static str` and the probe is handed a borrow with a shorter
+        /// lifetime, so it does not type-check.
+        fn machine(installed: &'static [&'static str]) -> impl Fn(&str) -> bool {
+            move |p: &str| installed.iter().any(|c| *c == p)
+        }
+
+        fn keys(apps: &[ExternalAppInfo]) -> Vec<&str> {
+            apps.iter().map(|a| a.key.as_str()).collect()
+        }
+
+        #[test]
+        fn a_bare_machine_offers_only_the_file_manager() {
+            // Every OS has a file manager and it needs no detection, so the
+            // menu is never empty. This is also the Windows answer.
+            let apps = detect_external_apps("macos", "/Users/u", &machine(&[]));
+            assert_eq!(keys(&apps), vec!["file-manager"]);
+        }
+
+        #[test]
+        fn lists_only_what_exists() {
+            let apps = detect_external_apps(
+                "macos",
+                "/Users/u",
+                &machine(&["/Applications/Cursor.app", "/Applications/Warp.app"]),
+            );
+            assert_eq!(keys(&apps), vec!["file-manager", "cursor", "warp"]);
+        }
+
+        #[test]
+        fn groups_render_file_manager_then_editors_then_terminals() {
+            // The menu draws one separator per group boundary, so the order
+            // is load-bearing: a terminal sorted in among the editors would
+            // put a separator in the middle of them.
+            let apps = detect_external_apps(
+                "macos",
+                "/Users/u",
+                &machine(&[
+                    "/Applications/Warp.app",
+                    "/Applications/Zed.app",
+                    "/System/Applications/Utilities/Terminal.app",
+                    "/Applications/Cursor.app",
+                ]),
+            );
+            let kinds: Vec<AppKind> = apps.iter().map(|a| a.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    AppKind::FileManager,
+                    AppKind::Editor,
+                    AppKind::Editor,
+                    AppKind::Terminal,
+                    AppKind::Terminal,
+                ],
+            );
+        }
+
+        #[test]
+        fn expands_a_tilde_path_for_a_toolbox_install() {
+            // JetBrains Toolbox installs into ~/Applications, so an entry
+            // that only checked /Applications would report a working IDE as
+            // missing.
+            let apps = detect_external_apps(
+                "macos",
+                "/Users/u",
+                &machine(&["/Users/u/Applications/WebStorm.app"]),
+            );
+            assert_eq!(keys(&apps), vec!["file-manager", "webstorm"]);
+            // The literal, unexpanded form must NOT match.
+            let apps = detect_external_apps(
+                "macos",
+                "/Users/u",
+                &machine(&["~/Applications/WebStorm.app"]),
+            );
+            assert_eq!(keys(&apps), vec!["file-manager"]);
+        }
+
+        #[test]
+        fn linux_detects_binaries_and_offers_no_terminal() {
+            // Bundles do not exist here, so a mac path must never match; and
+            // every Linux terminal spells "start in this dir" differently, so
+            // the table deliberately ships none.
+            let apps = detect_external_apps("linux", "/home/u", &machine(&["code", "zed"]));
+            assert_eq!(keys(&apps), vec!["file-manager", "vscode", "zed"]);
+            let apps = detect_external_apps(
+                "linux",
+                "/home/u",
+                &machine(&["/Applications/Cursor.app"]),
+            );
+            assert_eq!(keys(&apps), vec!["file-manager"]);
+        }
+
+        #[test]
+        fn windows_is_the_file_manager_only_even_with_apps_present() {
+            // Detection there is registry work nobody has measured. Offering
+            // an entry we cannot locate would be a menu item that fails on
+            // click.
+            let apps = detect_external_apps(
+                "windows",
+                "C:\\Users\\u",
+                &machine(&["/Applications/Cursor.app", "code"]),
+            );
+            assert_eq!(keys(&apps), vec!["file-manager"]);
+        }
+
+        #[test]
+        fn every_table_key_and_label_is_unique() {
+            // The key is persisted in the frontend's remembered pick, and the
+            // label is the menu's React key. A duplicate of either is a bug
+            // that only shows up as a mis-rendered menu.
+            let mut ks: Vec<&str> = EXTERNAL_APPS.iter().map(|a| a.key).collect();
+            let n = ks.len();
+            ks.sort_unstable();
+            ks.dedup();
+            assert_eq!(ks.len(), n, "duplicate key in EXTERNAL_APPS");
+            let mut ls: Vec<&str> = EXTERNAL_APPS.iter().map(|a| a.label).collect();
+            ls.sort_unstable();
+            ls.dedup();
+            assert_eq!(ls.len(), n, "duplicate label in EXTERNAL_APPS");
+        }
+
+        #[test]
+        fn every_non_file_manager_entry_is_detectable_somewhere() {
+            // An entry with no mac bundle AND no unix binary can never be
+            // detected, so it would be dead weight in the table that reads
+            // like a supported app.
+            for app in EXTERNAL_APPS {
+                if app.key == FILE_MANAGER_KEY {
+                    continue;
+                }
+                assert!(
+                    !app.mac_paths.is_empty() || !app.unix_bins.is_empty(),
+                    "{} can never be detected",
+                    app.key,
+                );
+            }
+        }
+
+        fn app(key: &str) -> &'static ExternalApp {
+            EXTERNAL_APPS.iter().find(|a| a.key == key).expect("no such key")
+        }
+
+        #[test]
+        fn macos_launches_with_open_dash_a_and_the_bundle_path() {
+            // No `-n`: reusing the running instance is what the user means.
+            let (program, args) =
+                open_with_argv("macos", app("cursor"), "/Applications/Cursor.app", "/w/task").unwrap();
+            assert_eq!(program, "open");
+            assert_eq!(args, vec!["-a", "/Applications/Cursor.app", "/w/task"]);
+        }
+
+        #[test]
+        fn linux_launches_the_binary_with_the_dir() {
+            let (program, args) = open_with_argv("linux", app("vscode"), "/usr/bin/code", "/w/task").unwrap();
+            assert_eq!(program, "/usr/bin/code");
+            assert_eq!(args, vec!["/w/task"]);
+        }
+
+        #[test]
+        fn the_file_manager_entry_delegates_to_open_command() {
+            // It must stay byte-identical to what the button did before it
+            // became a picker, on every platform.
+            for os in ["macos", "linux", "windows"] {
+                let (program, args) = open_with_argv(os, app(FILE_MANAGER_KEY), "", "/w/task").unwrap();
+                let (want_p, want_a) = open_command(os, "/w/task");
+                assert_eq!((program.as_str(), args), (want_p, want_a), "os={os}");
+            }
+        }
+
+        #[test]
+        fn refuses_a_dir_that_is_not_absolute() {
+            // `open` reads a leading `-` as a flag. Nothing can reach this
+            // today (the dir is resolved from a task id, never sent), which
+            // is why the guard is worth keeping for whoever calls it next.
+            for dir in ["-a", "--args", "relative/path", ""] {
+                assert!(
+                    open_with_argv("macos", app("cursor"), "/Applications/Cursor.app", dir).is_err(),
+                    "accepted {dir:?}",
+                );
+                assert!(
+                    open_with_argv("macos", app(FILE_MANAGER_KEY), "", dir).is_err(),
+                    "file manager accepted {dir:?}",
+                );
+            }
+        }
+
+        #[test]
+        fn resolution_returns_the_path_to_launch_not_just_a_yes() {
+            // The bug this pins: answering only "it exists somewhere on the
+            // login shell's PATH" and then handing `Command::new` the bare
+            // name makes it search the HOST process's PATH instead, which on a
+            // GUI-launched app is a much shorter list. An editor in
+            // ~/.local/bin would be offered and then fail to launch.
+            let abs = resolve_external_app("/bin/sh");
+            assert_eq!(abs.as_deref(), Some("/bin/sh"));
+
+            // A bare name comes back ABSOLUTE, which is the whole point.
+            let looked_up = resolve_external_app("sh").expect("sh is on every platform we ship");
+            assert!(looked_up.starts_with('/'), "not absolute: {looked_up}");
+            assert!(looked_up.ends_with("/sh"), "not the binary asked for: {looked_up}");
+
+            assert_eq!(resolve_external_app("termic-no-such-editor-xyz"), None);
+            assert_eq!(resolve_external_app("/nope/termic-no-such-editor-xyz"), None);
+        }
+
+        #[test]
+        fn resolution_returns_a_full_path_from_a_dir_only_a_shell_rc_exports() {
+            // The reachable Linux case: an editor in a directory the login
+            // shell exports but launchd does not. Driven through the extracted
+            // dir-list walk so it is deterministic -- a temp dir is on no real
+            // PATH, so a hit can only come from the list handed in.
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join("termic-fake-editor");
+            fs::write(&exe, "#!/bin/sh\n").unwrap();
+            let dirs = dir.path().to_string_lossy().into_owned();
+
+            let hit = resolve_in_dirs(dirs.split(':'), "termic-fake-editor");
+            assert_eq!(hit.as_deref(), Some(exe.to_string_lossy().as_ref()));
+            // Absolute, so `Command::new` never has to search a PATH again.
+            assert!(hit.unwrap().starts_with('/'));
+
+            assert_eq!(resolve_in_dirs(dirs.split(':'), "termic-not-there"), None);
+            // An empty PATH entry must not resolve to the candidate relative
+            // to the cwd, which would launch whatever sits beside the binary.
+            assert_eq!(resolve_in_dirs("".split(':'), "termic-fake-editor"), None);
+        }
+
+        #[test]
+        fn expand_home_only_rewrites_a_leading_tilde_slash() {
+            assert_eq!(expand_home("~/Applications/X.app", "/Users/u"), "/Users/u/Applications/X.app");
+            assert_eq!(expand_home("/Applications/X.app", "/Users/u"), "/Applications/X.app");
+            // A `~` that is not the leading segment is a legal directory
+            // name and must survive untouched.
+            assert_eq!(expand_home("/opt/~weird/X.app", "/Users/u"), "/opt/~weird/X.app");
+            // No home to expand into: leave it alone rather than produce
+            // "/Applications/..." out of a path that was never absolute.
+            assert_eq!(expand_home("~/Applications/X.app", ""), "~/Applications/X.app");
+        }
     }
 
     #[test]

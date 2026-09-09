@@ -33,6 +33,8 @@ import {
   type CompletionSoundId,
 } from "@/lib/notificationSounds";
 import { scoped } from "@/lib/profileScope";
+import { encodeOpenWithPick, parseOpenWithPick } from "@/lib/openWith";
+import type { OpenWithPick } from "@/lib/types";
 
 const LS_EDITOR_FONT   = "editorFont";
 const LS_EDITOR_THEME  = "editorThemeId";
@@ -81,6 +83,7 @@ const LS_PANE_DIM      = "splitPaneDim";
 const LS_PANE_DIM_AMT  = "splitPaneDimAmount";
 const LS_UI_SCALE      = "uiScale";
 const LS_SHOW_ALL_FONTS = "showAllInstalledFonts";
+const LS_OPEN_WITH     = "openWithApp";
 
 /** UI zoom bounds (percent). The whole webview is scaled via the CSS
  *  `zoom` property, so these are browser-zoom-style limits. */
@@ -735,6 +738,16 @@ interface PrefsState {
    *  task dialog (e.g. "feature" → "feature/my-task"). Empty means no
    *  prefix. The user can still freely edit the branch field per task. */
   branchPrefix: string;
+  /** Which app the title bar's folder button opens the task worktree in.
+   *  Defaults to the file manager, which is what that button did before it
+   *  became a picker.
+   *
+   *  Holds the label and kind as well as the key so the button can paint its
+   *  icon and tooltip with no IPC: detection is a Rust call, and running it on
+   *  a render path is docs/performance.md bear trap 5. Parsed ONCE here at
+   *  module load, so the object identity is stable and an unrelated prefs
+   *  write cannot invalidate the title bar's selector. */
+  openWithApp: OpenWithPick;
   /** Minimum delay (ms) enforced between consecutive message-queue sends to
    *  the same agent. A throttle on the "ralph loop": even if the agent
    *  reports work-done in under this window (or a false "done" fires), the
@@ -810,6 +823,7 @@ interface PrefsState {
   setMarkdownDefaultView: (v: MarkdownView) => void;
   setSvgDefaultView: (v: MarkdownView) => void;
   setBranchPrefix: (v: string) => void;
+  setOpenWithApp: (p: OpenWithPick) => void;
   setQueueMinIntervalMs: (ms: number) => void;
   setSplitPaneDim: (v: boolean) => void;
   setSplitPaneDimAmount: (v: number) => void;
@@ -999,6 +1013,11 @@ const initialSvgView: MarkdownView = (() => {
   return raw === "source" || raw === "split" ? raw : "preview";
 })();
 const initialBranchPrefix = lsGet(LS_BRANCH_PREFIX, "feature");
+// Decoded here rather than in a selector: parsing per read would mint a fresh
+// object on every store notification and re-render the title bar on writes
+// that have nothing to do with it (bear trap 5). A bad value degrades to the
+// file manager, never throws — this runs before first paint.
+const initialOpenWith = parseOpenWithPick(lsGet(LS_OPEN_WITH, ""));
 // Clamp 0–120s. Default 10s — fast loops (or false "done" oscillation)
 // shouldn't fire prompts at the agent faster than this.
 const initialQueueMinInterval = Math.max(0, Math.min(120000, Math.round(lsGetNum(LS_QUEUE_MIN_INTERVAL, 10000))));
@@ -1050,6 +1069,7 @@ export const usePrefs = create<PrefsState>(set => ({
   markdownDefaultView: initialMarkdownView,
   svgDefaultView: initialSvgView,
   branchPrefix: initialBranchPrefix,
+  openWithApp: initialOpenWith,
   queueMinIntervalMs: initialQueueMinInterval,
   shortcuts: loadShortcuts(),
   splitPaneDim: lsGetBool(LS_PANE_DIM, true),
@@ -1336,6 +1356,10 @@ export const usePrefs = create<PrefsState>(set => ({
     // NewTaskDialog) so a trailing "/" isn't stripped mid-keystroke.
     try { localStorage.setItem(LS_BRANCH_PREFIX, v); } catch {}
     set({ branchPrefix: v });
+  },
+  setOpenWithApp: (p) => {
+    try { localStorage.setItem(LS_OPEN_WITH, encodeOpenWithPick(p)); } catch {}
+    set({ openWithApp: p });
   },
   setQueueMinIntervalMs: (ms) => {
     const clamped = Math.max(0, Math.min(120000, Math.round(ms)));

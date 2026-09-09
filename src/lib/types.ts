@@ -635,6 +635,34 @@ export interface Agent {
   kind?: "agent" | "terminal";
 }
 
+/** Which group an "open with" app sits in. Mirrors `AppKind` in lib.rs
+ *  (serialised kebab-case). The frontend keys the menu's separators and the
+ *  button's icon off this, so it never has to know app names. */
+export type OpenWithKind = "file-manager" | "editor" | "terminal";
+
+/** One app the machine has, as `open_with_apps` reports it. No path and no
+ *  argv: the webview is told a KEY and nothing else, so it can never compose
+ *  a launcher (it sits outside the sandbox, see docs/sandbox.md). */
+export interface ExternalAppInfo {
+  key: string;
+  label: string;
+  kind: OpenWithKind;
+}
+
+/** The remembered "open with" pick (`openWithApp` in localStorage).
+ *
+ *  The LABEL is stored alongside the key on purpose. The title-bar button has
+ *  to paint its icon and tooltip before any menu is opened, and running
+ *  detection on a render path is docs/performance.md bear trap 5, so this is
+ *  what lets the button render from localStorage with zero IPC. It is a cache
+ *  of a past pick, not a second copy of the table: the menu rewrites it on
+ *  every pick, and an uninstalled app is caught at launch. */
+export interface OpenWithPick {
+  key: string;
+  label: string;
+  kind: OpenWithKind;
+}
+
 export interface Settings {
   repos_dir: string;
   welcomed: boolean;

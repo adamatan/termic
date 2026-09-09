@@ -290,6 +290,35 @@ Preferences (theme, fonts, terminal/editor settings, shortcut bindings) are
 deliberately NOT scoped: they are machine-level, and muscle memory does not
 change per identity.
 
+## `open -a` ignores the folder unless the app declares `public.folder`
+
+An app that does not claim folders still launches from `open -a "<App>" <dir>`
+with exit 0. It just comes up at whatever it had open last and drops the path,
+so the bug reads as "the picker opened the wrong project" rather than as a
+failure, and nothing in the exit status can tell you.
+
+So the criterion for adding an entry to `EXTERNAL_APPS` (`lib.rs`, the title
+bar's "open with" table) is the bundle's own declaration, checked before the
+entry is written:
+
+```sh
+plutil -extract CFBundleDocumentTypes json -o - \
+  "/Applications/Cursor.app/Contents/Info.plist"
+```
+
+Look for `public.folder` or `public.directory` in an entry's
+`LSItemContentTypes`. Verified at the time of writing: Cursor, Warp and Zed
+declare `public.folder`; Terminal declares `public.directory`. All four are
+role `Editor`.
+
+Two related traps in the same area. **Launch by bundle PATH, not bundle id**
+(`open -b`): two installed versions make an id ambiguous where a path never is,
+and the ids are unguessable anyway (Cursor ships as
+`com.todesktop.230313mzl4w4u92`, Warp as `dev.warp.Warp-Stable`), so a guessed
+one fails silently too. And **no `-n`**: it forces a second instance of the
+editor instead of adding the folder to the running one, which is not what
+"open this in Cursor" means.
+
 ## `transition-colors` freezes a themed border-color change (WKWebView)
 
 A selected/unselected control that swaps `border-[var(--color-a)]` for
