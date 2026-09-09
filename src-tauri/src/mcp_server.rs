@@ -1,4 +1,4 @@
-//! MCP endpoint, Phase A (docs/plans/mcp.md): a loopback HTTP listener
+//! MCP endpoint, Phase A (docs/ideas/mcp.md): a loopback HTTP listener
 //! serving the stateless MCP revision (2026-07-28) to OUTSIDE clients
 //! (Claude Desktop, `claude mcp add`). One full-scope credential, the
 //! per-bind `mcp-token` file; no scoped/per-task tokens yet (Phase B).

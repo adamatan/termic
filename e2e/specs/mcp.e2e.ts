@@ -1,4 +1,4 @@
-// MCP endpoint, Phase A (docs/plans/mcp.md), over the REAL loopback
+// MCP endpoint, Phase A (docs/ideas/mcp.md), over the REAL loopback
 // listener: the seeded profile enables mcp_enabled, so the app binds at
 // launch, writes <dataDir>/mcp-port (the URL) and <dataDir>/mcp-token
 // (the credential), and this spec speaks HTTP to it like an outside MCP

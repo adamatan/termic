@@ -1,7 +1,13 @@
 # termic MCP endpoint
 
-Status: Phase A shipped (see the landing notes); B1 and B2 not started. Tracked in
-[#176](https://github.com/simion/termic/issues/176).
+**This is an IDEA, not a plan.** Phase A shipped in 1.0.0 and
+[#176](https://github.com/simion/termic/issues/176) is closed with it. What is
+left, the per-task bearer token of B1/B2, was reopened as a design question by
+the 2026-07-28 spec revision, so nobody has committed to building it and it has
+no tracking issue. Being detailed is not the same as being decided: the
+document below is kept because re-deriving the rejected options is the
+expensive part, not because the shape is settled. It lived under `docs/plans/`
+until then, which is why older references point there.
 
 Build a scoped MCP control plane an agent can call without being handed a
 terminal, using the 2026-07-28 spec revision. Two things made this

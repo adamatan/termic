@@ -330,7 +330,7 @@ export interface Task {
    *  post-create via `taskSetDocker` (mirrors the mode edit path). When
    *  true AND the global `Settings.docker_sandbox_enabled` master switch
    *  is also on and an image is built, the agent PTY runs inside
-   *  `docker run` instead of the Seatbelt path. See docs/plans/docker-sandbox. */
+   *  `docker run` instead of the Seatbelt path. See docs/docker-sandbox. */
   docker_sandbox_enabled?: boolean;
   /** User-appended `docker run` args for this task (e.g. `--memory 4g`). */
   docker_extra_args?: string[];
@@ -747,7 +747,7 @@ export interface Settings {
   cli_default_migrated?: boolean;
   /** "Enable MCP endpoint": binds the loopback MCP listener for outside
    *  clients (Claude Desktop, claude mcp add). Default off; unlike the CLI
-   *  socket the listener only exists while this is on. See docs/plans/mcp.md. */
+   *  socket the listener only exists while this is on. See docs/ideas/mcp.md. */
   mcp_enabled?: boolean;
   /** What the window's close button does. Absent/"ask" = show the close
    *  prompt (whose "Show this every time" checkbox writes the choice back here);

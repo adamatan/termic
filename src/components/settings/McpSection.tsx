@@ -1,4 +1,4 @@
-// MCP endpoint (Phase A, docs/plans/mcp.md): a loopback HTTP listener
+// MCP endpoint (Phase A, docs/ideas/mcp.md): a loopback HTTP listener
 // serving the app's verbs as MCP tools to outside clients. Off by default
 // and EXPERIMENTAL per the docs/ui.md rule (a surface still settling ships
 // off + badged).

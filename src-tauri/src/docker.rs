@@ -11,7 +11,7 @@
 // source of truth: the argv previewed in the UI and the argv actually
 // spawned come from the same function, so they can never drift.
 //
-// Design: docs/plans/docker-sandbox/design.md
+// Design: docs/docker-sandbox/design.md
 
 use crate::sandbox::{canonicalize_or_keep, parent_git_dir_for_worktree, subst_path};
 use crate::{global_dir, Task};
@@ -122,7 +122,7 @@ struct AgentConfig {
 
 /// Every agent this module has a CONFIRMED state dir for and mounts
 /// unconditionally — no opt-in needed, because `agent_dirs::state_dirs`
-/// only lists dirs `docs/plans/docker-sandbox/findings.md` actually
+/// only lists dirs `docs/docker-sandbox/findings.md` actually
 /// verified. grok is the one exception still declined outright: binary +
 /// skills + config all live under `~/.grok`, no clean relocation env.
 pub const KNOWN_SAFE_AGENTS: &[&str] = &["claude", "codex", "copilot", "agy", "antigravity", "opencode", "pi", "muse"];

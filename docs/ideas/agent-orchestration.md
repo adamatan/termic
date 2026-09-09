@@ -94,7 +94,7 @@ to fan out. The trust question moves from "is this code correct" to
    paid on every turn of every session. Xirp's is roughly 200 words.
    Find the shortest text that produces correct behaviour, or decide
    this belongs in MCP tool definitions instead, where the schema is the
-   documentation (see [../plans/mcp.md](../plans/mcp.md)).
+   documentation (see [mcp.md](mcp.md)).
 3. **Prompt injection or MCP?** These are alternatives, not a sequence.
    The prompt route works today for every agent that accepts a system
    prompt append, costs context on every turn, and gives no argument
@@ -132,7 +132,7 @@ So injecting a CLI tutorial into a sandboxed session teaches it to reach
 for something it cannot have, which is worse than silence. Either
 injection is skipped for caged tasks, or orchestration for caged agents
 rides the per-task bearer token described in
-[../plans/mcp.md](../plans/mcp.md), which was designed for exactly this.
+[mcp.md](mcp.md), which was designed for exactly this.
 
 ## What termic already has
 

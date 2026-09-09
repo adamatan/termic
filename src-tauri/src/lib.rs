@@ -506,7 +506,7 @@ pub struct Task {
     /// instead of the Seatbelt path. Mutually exclusive with the seatbelt
     /// cage; only takes effect when `Settings::docker_sandbox_enabled`
     /// (the global master switch) is also on AND an image is built. See
-    /// docs/plans/docker-sandbox/design.md.
+    /// docs/docker-sandbox/design.md.
     #[serde(default)]
     pub docker_sandbox_enabled: bool,
     /// User-appended `docker run` args for this task (e.g. `--memory 4g`).
@@ -18236,7 +18236,7 @@ pub struct Settings {
     pub sandbox_default_allowed_hosts: Vec<String>,
     /// Master switch for Docker sandbox mode (Settings → Docker Sandbox). A task's
     /// own `docker_sandbox_enabled` only takes effect when this is also on.
-    /// See docs/plans/docker-sandbox/design.md.
+    /// See docs/docker-sandbox/design.md.
     pub docker_sandbox_enabled: bool,
     /// How often to nudge a rebuild of the Docker sandbox image before a
     /// Docker-mode task's agent launches, so an agent CLI that publishes

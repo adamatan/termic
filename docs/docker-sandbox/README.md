@@ -6,6 +6,14 @@ touch the paths we mount. Status: **implemented** (`src-tauri/src/docker.rs`,
 `src/components/settings/DockerSection.tsx`, `task_set_docker`). See
 `docs/sandbox.md` for the shipped Docker section.
 
+**Why this sits in `docs/` and not `docs/plans/`.** It shipped, so it is not a
+plan: there is no work left in it to pick up, and a plan directory is a claim
+that there is. It is not deleted either, which is what a shipped plan usually
+earns, because `sandbox.md` cites this bundle by path for the full design and
+cites `findings.md` for the per-agent config-dir research behind the grok
+deferral. Those are measurements nobody should have to take again, so they stay
+reachable as reference rather than being folded into a doc they would swamp.
+
 Since this bundle's research (2026-06-25), the agent roster changed: Gemini
 CLI retired (replaced by opencode), and Claude Code's npm install was
 deprecated in favor of a native installer (`curl -fsSL

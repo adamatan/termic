@@ -10,7 +10,7 @@
 //!   that is never the host's real `$HOME`.
 //!
 //! Docker only wants the CONFIRMED state dirs (login, sessions, MCP
-//! config — the ones `docs/plans/docker-sandbox/findings.md` actually
+//! config — the ones `docs/docker-sandbox/findings.md` actually
 //! verified hold real state): it mounts a termic-owned dir, not the real
 //! `$HOME`, so persisting a cache dir there buys nothing. Seatbelt allows
 //! these same dirs, PLUS its own macOS-only extras (XDG-style

@@ -6,7 +6,7 @@
 //
 // Build is deliberately decoupled from spawn: the image is built by an
 // explicit action here and never lazily on a PTY spawn (a multi-GB build on
-// the spawn path would freeze the webview). See docs/plans/docker-sandbox.
+// the spawn path would freeze the webview). See docs/docker-sandbox.
 
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";

@@ -157,7 +157,7 @@ export function Settings() {
           {tab === "sandbox"     && <SandboxSection />}
           {tab === "docker"      && <DockerSection />}
           {/* MCP shares the CLI page: one "control plane" surface, two
-              presentations of the same verbs (docs/plans/mcp.md). */}
+              presentations of the same verbs (docs/ideas/mcp.md). */}
           {tab === "cli"         && <><CliSection /><div className="mt-10"><McpSection /></div></>}
           {tab === "appearance"  && <AppearanceSection />}
           {tab === "agents"      && <AgentsSection />}
