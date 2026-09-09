@@ -479,3 +479,51 @@ mounted, it cannot be maintained by something that usually is not.** A
 sidebar row, the tray, a window title and a desktop notification all outlive
 the panel their data came from. The tell is a component-owned `setInterval`
 whose output is read outside that component's subtree.
+
+## git speaks repo-root paths; termic speaks project paths
+
+A project does not have to be a repository root. Point termic at
+`packages/app` of a monorepo and that directory is the project: the file tree,
+every `task_file_read`/`write`, every diff and every "viewed" mark address
+files relative to it.
+
+git does not work that way, and it does not care which directory it ran in.
+`status --porcelain`, `diff --name-status`, `diff-tree` and `show <rev>:<path>`
+are all phrased against the REPOSITORY ROOT. Run them in `packages/app` and
+they still say `packages/app/src/index.js`.
+
+Where those two met, the Git panel listed a row the rest of the app could not
+address, and the failure was silent and wrong rather than loud:
+
+- the diff pane read the working-tree side at
+  `packages/app/packages/app/src/index.js`, which does not exist, while
+  `git show HEAD:packages/app/src/index.js` resolved fine, so it had a full
+  original against a missing modified and **drew every line of the file as
+  deleted**;
+- staging a row passed that same path to `git add --`, where a pathspec IS
+  cwd-relative, so it matched nothing and quietly staged nothing.
+
+The conversion is `git rev-parse --show-prefix` (`repo_prefix` in `lib.rs`),
+which is git's own answer and the only one worth trusting: subtracting one path
+from another gets symlinked checkouts and case-insensitive filesystems wrong,
+and both are ordinary on a Mac. Everything crossing the boundary goes through
+it:
+
+- **status** takes `-- .` (scope) and has the prefix stripped off each row.
+- **diff-family** commands (`diff`, `diff-tree`, `--numstat`, `--name-status`)
+  take `--relative`, which both rewrites the paths and drops what lies outside.
+- **`<rev>:<path>`** is written `<rev>:./<path>`, which is what makes it
+  cwd-relative. Bare `HEAD:x` is root-relative however deep you are.
+- **pathspecs** (`add`, `checkout`, `blame`, `ls-files`) need nothing: they
+  were always cwd-relative, which is precisely why they broke on paths phrased
+  the other way.
+
+All of it is a no-op when the project is the repository root, which is why this
+survived so long: the 99% case has an empty prefix and every rule above reduces
+to what the code did before.
+
+The rule for anything new: **a path that came out of git is not a termic path
+until it has been through the prefix.** If you add a git command that prints
+paths, it needs `--relative` or a strip; if you add one that takes a path, ask
+whether that argument is a pathspec (cwd-relative, fine) or part of a revision
+(root-relative, needs `./`).

@@ -9812,56 +9812,113 @@ fn parse_porcelain_line(line: &str) -> (Option<GitFile>, Option<GitFile>) {
     (staged, unstaged)
 }
 
+/// Where a directory sits inside its repository: a slash-terminated
+/// root-relative prefix (`"packages/app/"`), empty when the directory IS the
+/// repository root.
+///
+/// A project can be a SUBDIRECTORY of a repo - point termic at `packages/app`
+/// of a monorepo and that is the project. git does not care where it was run:
+/// `status --porcelain`, `diff --name-status` and `show <rev>:<path>` all
+/// speak paths relative to the repository ROOT. Everything above them here
+/// speaks paths relative to the project, and the two are only the same string
+/// when the project is the root. This is the conversion between them.
+fn repo_prefix(cwd: &Path) -> String {
+    // A directory holding `.git` IS its working tree's root, so its prefix is
+    // empty: a directory for an ordinary clone, a FILE for a worktree or a
+    // submodule, and each of those is the root of the tree git will report
+    // against. That covers every project termic had before subdirectories were
+    // a case at all, and it is a stat rather than the ~15ms subprocess below,
+    // on a path the Git panel polls.
+    if cwd.join(".git").exists() {
+        return String::new();
+    }
+    // `rev-parse --show-prefix` is git's own answer and the only one worth
+    // trusting for the rest: deriving it by subtracting paths gets symlinked
+    // checkouts and case-insensitive filesystems wrong, and both are ordinary
+    // on a Mac. It prints a trailing slash ("packages/app/"), which is what
+    // makes `strip_repo_prefix` a plain prefix match.
+    git(&["rev-parse", "--show-prefix"], cwd)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Re-base a path git reported onto the project directory. `None` when the
+/// path lies outside it, which is a file this project has no name for: it
+/// cannot be diffed, opened or staged from here, so it is not listed.
+fn strip_repo_prefix(prefix: &str, path: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return Some(path.to_string());
+    }
+    path.strip_prefix(prefix).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// One repo's staged/unstaged rows for the Git panel. Free function rather
+/// than a closure so the subdirectory-project cases can drive it directly.
+fn git_repo_status(name: String, dir_name: String, kind: &str, p: &Path) -> GitRepo {
+    let branch = git(&["branch", "--show-current"], p)
+        .map(|s| s.trim().to_string()).unwrap_or_default();
+    let last_commit_message = git(&["log", "-1", "--pretty=%B"], p)
+        .map(|s| s.trim_end().to_string()).unwrap_or_default();
+    // Where this directory sits in its repo, so root-relative git paths can be
+    // re-based onto it. Empty for the ordinary case (project == repo root),
+    // where every line below is a no-op.
+    let prefix = repo_prefix(p);
+    // -uall expands untracked DIRECTORIES into their individual files.
+    // Without it git collapses a brand-new folder to a single
+    // "docs/foo/" entry (trailing slash = directory), which the UI
+    // then treats as a file: blank name in the tree, empty diff.
+    //
+    // `-- .` scopes the listing to this directory. It is what stops a
+    // subdirectory project from listing its monorepo siblings' changes, which
+    // it has no path for, cannot open, and must not stage: `git commit` takes
+    // the index, so a row the user never saw would ride along.
+    let out = git(&["status", "--porcelain", "-uall", "--", "."], p).unwrap_or_default();
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in out.lines() {
+        let (s, u) = parse_porcelain_line(line);
+        // One stat per changed line (the set is small), reused for the
+        // staged + unstaged halves of the same path.
+        let rel = match s.as_ref().or(u.as_ref()).map(|f| f.path.clone()) {
+            Some(r) => match strip_repo_prefix(&prefix, &r) {
+                Some(r) => r,
+                // Outside the project (a rename OUT of it, or a pathspec edge
+                // case): nothing here can address it.
+                None => continue,
+            },
+            None => continue,
+        };
+        let fp = file_fp(&p.join(&rel));
+        if let Some(mut f) = s { f.path = rel.clone(); f.fp = fp.clone(); seen.insert(rel.clone()); staged.push(f); }
+        if let Some(mut f) = u { f.path = rel.clone(); f.fp = fp;         seen.insert(rel.clone()); unstaged.push(f); }
+    }
+    const MAX_FILES: usize = 5_000;
+    let truncated = staged.len() + unstaged.len() > MAX_FILES;
+    if truncated {
+        staged.truncate(MAX_FILES / 2);
+        unstaged.truncate(MAX_FILES / 2);
+    }
+    GitRepo {
+        name, branch, kind: kind.to_string(), dir_name,
+        changed: seen.len(),
+        last_commit_message,
+        staged, unstaged,
+        truncated,
+        ahead: ahead_count(p),
+    }
+}
+
 #[tauri::command]
 async fn task_git_status(id: String) -> Result<GitStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let w = load_tasks_all().into_iter().find(|w| w.id == id).ok_or("no task")?;
 
-        let branch_of = |p: &Path| -> String {
-            git(&["branch", "--show-current"], p).map(|s| s.trim().to_string()).unwrap_or_default()
-        };
-        let last_msg = |p: &Path| -> String {
-            git(&["log", "-1", "--pretty=%B"], p).map(|s| s.trim_end().to_string()).unwrap_or_default()
-        };
-        let build = |name: String, dir_name: String, kind: &str, p: &Path| -> GitRepo {
-            // -uall expands untracked DIRECTORIES into their individual files.
-            // Without it git collapses a brand-new folder to a single
-            // "docs/foo/" entry (trailing slash = directory), which the UI
-            // then treats as a file: blank name in the tree, empty diff.
-            let out = git(&["status", "--porcelain", "-uall"], p).unwrap_or_default();
-            let mut staged = Vec::new();
-            let mut unstaged = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for line in out.lines() {
-                let (s, u) = parse_porcelain_line(line);
-                // One stat per changed line (the set is small), reused for the
-                // staged + unstaged halves of the same path.
-                let rel = s.as_ref().or(u.as_ref()).map(|f| f.path.clone());
-                let fp = rel.as_deref().map(|r| file_fp(&p.join(r))).unwrap_or_default();
-                if let Some(mut f) = s { f.fp = fp.clone(); seen.insert(f.path.clone()); staged.push(f); }
-                if let Some(mut f) = u { f.fp = fp;          seen.insert(f.path.clone()); unstaged.push(f); }
-            }
-            const MAX_FILES: usize = 5_000;
-            let truncated = staged.len() + unstaged.len() > MAX_FILES;
-            if truncated {
-                staged.truncate(MAX_FILES / 2);
-                unstaged.truncate(MAX_FILES / 2);
-            }
-            GitRepo {
-                name, branch: branch_of(p), kind: kind.to_string(), dir_name,
-                changed: seen.len(),
-                last_commit_message: last_msg(p),
-                staged, unstaged,
-                truncated,
-                ahead: ahead_count(p),
-            }
-        };
-
         let host_name = load_projects_all().into_iter()
             .find(|p| p.id == w.project_id)
             .map(|p| p.name)
             .unwrap_or_else(|| w.name.clone());
-        let mut repos = vec![build(host_name, String::new(), "host", Path::new(&w.path))];
+        let mut repos = vec![git_repo_status(host_name, String::new(), "host", Path::new(&w.path))];
 
         for m in &w.composition {
             let member_path = Path::new(&m.path);
@@ -9870,7 +9927,7 @@ async fn task_git_status(id: String) -> Result<GitStatus, String> {
                 MemberMode::Worktree => "worktree",
                 MemberMode::RepoRoot => "repo_root",
             };
-            repos.push(build(m.dir_name.clone(), m.dir_name.clone(), kind, member_path));
+            repos.push(git_repo_status(m.dir_name.clone(), m.dir_name.clone(), kind, member_path));
         }
 
         let total_changed = repos.iter().map(|r| r.changed).sum();
@@ -10810,9 +10867,14 @@ fn git_commit_files(cwd: &Path, sha: &str) -> Result<Vec<GitFile>, String> {
     if !is_commit_ish(sha) {
         return Err("bad commit id".into());
     }
+    // `--relative` keeps these rows in the same namespace as everything else
+    // the UI holds: paths relative to the project directory, which for a
+    // project that is a subdirectory of a monorepo is not the repository root.
+    // It also drops the commit's files from OUTSIDE this directory, which this
+    // project has no path for and could not open.
     let out = git(
         &[
-            "--no-pager", "diff-tree", "--no-commit-id", "--name-status",
+            "--no-pager", "diff-tree", "--no-commit-id", "--name-status", "--relative",
             "-r", "-m", "--first-parent", "--root", sha,
         ],
         cwd,
@@ -11070,9 +11132,11 @@ fn git_compare(cwd: &Path, base: &str, merge_base: bool) -> Result<GitCompare, S
     // Both halves of the range in one pass each: name-status for the glyph,
     // numstat for the churn. Two processes over the same range rather than
     // one, because git has no format that carries both.
-    let names = git(&["--no-pager", "diff", "--name-status", "-M", "-z", &base_sha], cwd)
+    // `--relative` for the same reason as everywhere else: the paths these
+    // rows carry have to be the project's, not the repository root's.
+    let names = git(&["--no-pager", "diff", "--name-status", "-M", "-z", "--relative", &base_sha], cwd)
         .unwrap_or_default();
-    let stats = git(&["--no-pager", "diff", "--numstat", "-M", "-z", &base_sha], cwd)
+    let stats = git(&["--no-pager", "diff", "--numstat", "-M", "-z", "--relative", &base_sha], cwd)
         .unwrap_or_default();
     let churn: std::collections::HashMap<String, (Option<u32>, Option<u32>)> =
         parse_numstat_z(&stats).into_iter().map(|(p, a, d)| (p, (a, d))).collect();
@@ -12898,12 +12962,18 @@ fn task_file_diff_sides_for_task(w: &Task, path: &str, scope: Option<&str>) -> R
         Some(p) if p.exists() => fs::read(p).ok(),
         _ => None,
     };
-    let show_head = || git_bytes(&["--no-pager", "show", &format!("HEAD:{rel_path}")], &cwd).ok();
-    let show_index = || git_bytes(&["--no-pager", "show", &format!(":0:{rel_path}")], &cwd).ok();
+    // `./` is what makes these CWD-relative. Bare `HEAD:<path>` is resolved
+    // from the repository ROOT however deep the cwd is, so for a project that
+    // is a subdirectory of a monorepo it read a different file than the
+    // working-tree side above (or, more often, none at all) - the left half of
+    // the "everything is deleted" bug. Harmless where the project IS the root:
+    // `HEAD:./x` and `HEAD:x` are the same object there.
+    let show_head = || git_bytes(&["--no-pager", "show", &format!("HEAD:./{rel_path}")], &cwd).ok();
+    let show_index = || git_bytes(&["--no-pager", "show", &format!(":0:./{rel_path}")], &cwd).ok();
     // A historical revision has no working-tree side at all: BOTH sides come
     // out of the object store, and a first commit legitimately has no parent
     // (`sha^` doesn't resolve) — that is an add, so the left side is missing.
-    let show_at = |rev: &str| git_bytes(&["--no-pager", "show", &format!("{rev}:{rel_path}")], &cwd).ok();
+    let show_at = |rev: &str| git_bytes(&["--no-pager", "show", &format!("{rev}:./{rel_path}")], &cwd).ok();
     let commit_sha = scope.and_then(|s| s.strip_prefix("commit:")).filter(|s| is_commit_ish(s));
     let base_sha = scope.and_then(|s| s.strip_prefix("base:")).filter(|s| is_commit_ish(s));
     let (original, modified) = match (commit_sha, base_sha, scope) {
@@ -12943,7 +13013,12 @@ fn task_file_diff_for_task(w: &Task, path: &str) -> Result<String, String> {
     // which already constrains paths to the working tree. The untracked
     // fallback below DOES read straight from disk, so for THAT branch we
     // safe-resolve before reading.
-    let tracked_diff = git(&["--no-pager", "diff", "HEAD", "--", &rel_path], &cwd)
+    // `--relative` rewrites the `diff --git a/… b/…` headers to paths relative
+    // to the cwd. The pathspec was already cwd-relative (git resolves those
+    // against the cwd), but the HEADERS are root-relative without it, so a
+    // subdirectory project's patch named a file the rest of the UI has no path
+    // for. No-op when the project is the repository root.
+    let tracked_diff = git(&["--no-pager", "diff", "--relative", "HEAD", "--", &rel_path], &cwd)
         .unwrap_or_default();
     if !tracked_diff.trim().is_empty() {
         return Ok(tracked_diff);
@@ -25693,6 +25768,196 @@ mod tests {
         let diff = task_file_diff_for_task(&task, "frontend/base.txt").unwrap();
         assert!(diff.contains("member changed"));
         assert!(diff.contains("diff --git a/base.txt b/base.txt"));
+    }
+
+    /// A monorepo whose SUBDIRECTORY is the project: one repo at the root,
+    /// the project pointed at `packages/app`. Returns (repo root, project dir).
+    fn monorepo_with_subdir_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        git_run(&root, &["init", "-b", "main"]);
+        let sub = root.join("packages/app/src");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("index.js"), "one\ntwo\nthree\n").unwrap();
+        fs::write(root.join("README.md"), "root\n").unwrap();
+        git_run(&root, &["add", "-A"]);
+        git_run(&root, &["-c", "user.name=Test", "-c", "user.email=t@t", "commit", "-m", "init"]);
+        (dir, root.join("packages/app"))
+    }
+
+    /// GH: a project added as a SUBDIRECTORY of a monorepo showed every file
+    /// as entirely deleted the moment you diffed it.
+    ///
+    /// git reports paths from `status --porcelain` relative to the REPOSITORY
+    /// ROOT, whatever directory it ran in, while everything downstream in
+    /// termic treats a path as relative to the TASK. For a project at
+    /// `packages/app` the panel therefore listed `packages/app/src/index.js`,
+    /// and the diff then looked for that under the project directory - i.e.
+    /// `packages/app/packages/app/src/index.js`, which does not exist. The
+    /// left side still resolved, because `git show HEAD:<path>` is
+    /// root-relative too, so the pane got a full original against a missing
+    /// modified and drew the whole file as removed.
+    #[test]
+    fn repo_prefix_answers_root_worktree_and_subdirectory() {
+        let (_dir, project) = monorepo_with_subdir_project();
+        let root = project.parent().unwrap().parent().unwrap().to_path_buf();
+        assert_eq!(repo_prefix(&root), "");
+        assert_eq!(repo_prefix(&project), "packages/app/");
+        // A worktree's `.git` is a FILE, and it is still the root of its tree.
+        // Its own tempdir: `git worktree add` refuses a path that exists, so a
+        // shared parent would make this pass once and fail on every rerun.
+        let wt_home = tempdir().unwrap();
+        let wt = wt_home.path().join("wt");
+        git_run(&root, &["worktree", "add", "-b", "side", &wt.to_string_lossy()]);
+        assert!(wt.join(".git").is_file());
+        assert_eq!(repo_prefix(&wt), "");
+        // Not a repo at all: nothing to be relative to.
+        let plain = tempdir().unwrap();
+        assert_eq!(repo_prefix(plain.path()), "");
+    }
+
+    #[test]
+    fn strip_repo_prefix_keeps_only_what_is_inside() {
+        assert_eq!(strip_repo_prefix("", "src/a.rs"), Some("src/a.rs".into()));
+        assert_eq!(strip_repo_prefix("packages/app/", "packages/app/src/a.rs"), Some("src/a.rs".into()));
+        // Outside the project: no name for it here.
+        assert_eq!(strip_repo_prefix("packages/app/", "README.md"), None);
+        assert_eq!(strip_repo_prefix("packages/app/", "packages/other/a.rs"), None);
+        // A sibling whose name merely STARTS with the project's is not inside
+        // it - the trailing slash on the prefix is what rules that out.
+        assert_eq!(strip_repo_prefix("packages/app/", "packages/app-utils/a.rs"), None);
+        // The project directory itself is not a file in it.
+        assert_eq!(strip_repo_prefix("packages/app/", "packages/app/"), None);
+    }
+
+    #[test]
+    fn subdirectory_project_lists_paths_relative_to_the_project() {
+        let (_dir, project) = monorepo_with_subdir_project();
+        fs::write(project.join("src/index.js"), "one\ntwo CHANGED\nthree\n").unwrap();
+
+        let repo = git_repo_status("app".into(), String::new(), "host", &project);
+
+        let paths: Vec<&str> = repo.unstaged.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/index.js"], "paths must be relative to the project directory");
+        // And the row's fingerprint must be a real one: it is what the
+        // "viewed" mark anchors to, and a missing file gives an empty string.
+        assert!(!repo.unstaged[0].fp.is_empty(), "fingerprint was resolved against the wrong directory");
+    }
+
+    #[test]
+    fn subdirectory_project_diff_has_both_sides() {
+        let (_dir, project) = monorepo_with_subdir_project();
+        fs::write(project.join("src/index.js"), "one\ntwo CHANGED\nthree\n").unwrap();
+        let task = Task { path: project.to_string_lossy().into_owned(), ..Default::default() };
+
+        // Exactly the path the panel row above carries, straight into the diff:
+        // the two have to speak one namespace or this is the deleted-file bug.
+        let sides = task_file_diff_sides_for_task(&task, "src/index.js", None).unwrap();
+        assert!(sides.original_exists);
+        assert!(sides.modified_exists, "the working-tree side was looked for in the wrong directory");
+        assert!(sides.original.contains("two\n"));
+        assert!(sides.modified.contains("two CHANGED"));
+
+        let patch = task_file_diff_for_task(&task, "src/index.js").unwrap();
+        assert!(patch.contains("two CHANGED"), "patch: {patch}");
+    }
+
+    #[test]
+    fn subdirectory_project_status_row_opens_the_diff_it_names() {
+        // The bug end to end, in the one shape that produced it: the path the
+        // panel row carries, handed straight to the diff the click opens. Both
+        // halves can look right on their own and still not agree, and the
+        // disagreement is the whole defect - the row said
+        // `packages/app/src/index.js` and the diff went looking for that
+        // UNDER `packages/app`.
+        let (_dir, project) = monorepo_with_subdir_project();
+        fs::write(project.join("src/index.js"), "one\ntwo CHANGED\nthree\n").unwrap();
+        let task = Task { path: project.to_string_lossy().into_owned(), ..Default::default() };
+
+        let repo = git_repo_status("app".into(), String::new(), "host", &project);
+        let row = &repo.unstaged[0];
+        let sides = task_file_diff_sides_for_task(&task, &row.path, None).unwrap();
+
+        assert!(sides.original_exists && sides.modified_exists,
+            "row {:?} did not open: original={} modified={}",
+            row.path, sides.original_exists, sides.modified_exists);
+        assert_eq!(sides.original, "one\ntwo\nthree\n");
+        assert_eq!(sides.modified, "one\ntwo CHANGED\nthree\n");
+    }
+
+    #[test]
+    fn a_subdirectory_projects_row_path_is_a_usable_pathspec() {
+        // `task_stage` / `task_unstage` / `task_discard` hand the row's path
+        // to git as a PATHSPEC, and git resolves a pathspec against the
+        // directory it ran in - not against the repository root the row used
+        // to be phrased in. Staging a row therefore looked for
+        // `packages/app/packages/app/src/index.js` and quietly staged nothing.
+        let (_dir, project) = monorepo_with_subdir_project();
+        fs::write(project.join("src/index.js"), "one\ntwo CHANGED\nthree\n").unwrap();
+
+        let row = git_repo_status("app".into(), String::new(), "host", &project)
+            .unstaged[0].path.clone();
+        // Exactly what task_stage runs, from exactly the directory it runs in.
+        git_run(&project, &["add", "--", &row]);
+
+        let after = git_repo_status("app".into(), String::new(), "host", &project);
+        assert_eq!(after.staged.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), vec!["src/index.js"]);
+        assert!(after.unstaged.is_empty());
+    }
+
+    #[test]
+    fn subdirectory_project_scopes_status_to_the_project() {
+        // A change OUTSIDE the project directory is not this project's
+        // business: it cannot be diffed (there is no path for it in the
+        // project's namespace), it cannot be opened, and staging it from here
+        // would commit something the user never saw.
+        let (_dir, project) = monorepo_with_subdir_project();
+        let root = project.parent().unwrap().parent().unwrap().to_path_buf();
+        fs::write(root.join("README.md"), "root changed\n").unwrap();
+        fs::write(project.join("src/index.js"), "one\ntwo CHANGED\nthree\n").unwrap();
+
+        let repo = git_repo_status("app".into(), String::new(), "host", &project);
+        let paths: Vec<&str> = repo.unstaged.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/index.js"]);
+        assert_eq!(repo.changed, 1);
+    }
+
+    #[test]
+    fn subdirectory_project_handles_untracked_staged_and_renamed() {
+        let (_dir, project) = monorepo_with_subdir_project();
+        let root = project.parent().unwrap().parent().unwrap().to_path_buf();
+        fs::write(project.join("src/untracked.js"), "new\n").unwrap();
+        fs::write(project.join("src/staged.js"), "staged\n").unwrap();
+        git_run(&root, &["add", "packages/app/src/staged.js"]);
+        git_run(&root, &["mv", "packages/app/src/index.js", "packages/app/src/renamed.js"]);
+
+        let repo = git_repo_status("app".into(), String::new(), "host", &project);
+        let mut staged: Vec<&str> = repo.staged.iter().map(|f| f.path.as_str()).collect();
+        let mut unstaged: Vec<&str> = repo.unstaged.iter().map(|f| f.path.as_str()).collect();
+        staged.sort();
+        unstaged.sort();
+        // A rename keeps its NEW path, which is the one on disk and the one
+        // `git add` expects - relative to the project like every other row.
+        assert_eq!(staged, vec!["src/renamed.js", "src/staged.js"]);
+        assert_eq!(unstaged, vec!["src/untracked.js"]);
+    }
+
+    #[test]
+    fn a_repo_root_project_is_untouched_by_the_subdirectory_handling() {
+        // The 99% case: nothing about a project that IS its repo root may
+        // change, prefix logic included.
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        fs::write(dir.path().join("base.txt"), "changed\n").unwrap();
+
+        let repo = git_repo_status("r".into(), String::new(), "host", dir.path());
+        let paths: Vec<&str> = repo.unstaged.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["base.txt"]);
+
+        let task = Task { path: dir.path().to_string_lossy().into_owned(), ..Default::default() };
+        let sides = task_file_diff_sides_for_task(&task, "base.txt", None).unwrap();
+        assert!(sides.original_exists && sides.modified_exists);
+        assert!(sides.modified.contains("changed"));
     }
 
     #[test]
