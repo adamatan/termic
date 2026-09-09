@@ -36,12 +36,12 @@ import {
   type UsageLevel, type UsageWindow, type StatusLineOwner,
 } from "@/lib/agentUsage";
 import { builtinBaseId, agentDisplayName } from "@/lib/agents";
-import type { AgentAccounts } from "@/hooks/useAgentAccounts";
+import { useAgentAccounts, type AgentAccounts } from "@/hooks/useAgentAccounts";
 import { useAccountSwitching } from "@/hooks/useAccountSwitching";
 import { AccountSwitcher } from "@/components/task/AccountSwitcher";
 import { pillVisible } from "@/lib/accountPill";
 import { KeyRound, ArrowRightLeft } from "lucide-react";
-import type { AgentAccountsView } from "@/lib/types";
+import type { AgentAccountsView, TerminalTab } from "@/lib/types";
 import { useApp } from "@/store/app";
 
 /** How long a codex reading stands before the chip asks again.
@@ -57,7 +57,66 @@ const CODEX_REFRESH_MS = 120_000;
  *  otherwise present last night's number as current. */
 const STALE_AFTER_MS = 15 * 60_000;
 
-export function AgentChip({ taskId, agentId, cwd, docker, accounts, visible }: {
+/** One footer chip, for ONE of the agents a task runs (GH #277).
+ *
+ *  Owns that agent's account state rather than taking it from the footer: with
+ *  several agents in one task there is no single "the task's account" to lift
+ *  any more, and each chip's numbers are keyed by the login ITS agent process
+ *  was spawned with. The pill and the usage numbers still share one fetch,
+ *  which was the reason `useAgentAccounts` was lifted in the first place -
+ *  they are now the same chip, so the shared owner moved down here with them.
+ */
+export function FooterAgentChip({ taskId, agentId, cwd, docker, visible, secondary }: {
+  taskId: string;
+  agentId: string;
+  cwd?: string;
+  docker: boolean;
+  visible: boolean;
+  /** An agent the user is not currently looking at, in a task that runs more
+   *  than one. Dropped when the footer is too narrow to hold every chip, so
+   *  what survives is the agent whose tab is on screen. */
+  secondary: boolean;
+}) {
+  // The account THIS agent's process is running as, which is the running one
+  // and not the configured one: a switch applies on the next spawn, so between
+  // the click and the restart the two differ.
+  //
+  // Selected as the string, so this chip re-renders when its own agent
+  // restarts on another account and not when a sibling agent changes.
+  const liveAccount = useApp(s => {
+    const tab = (s.tabs[taskId] || []).find(
+      t => t.type === "terminal" && (t as TerminalTab).cli === agentId,
+    ) as TerminalTab | undefined;
+    // `undefined` when nothing has spawned yet; `null` once a process is
+    // running on the agent's ordinary login. The distinction is load-bearing:
+    // merging them re-keys a running task's usage the moment the user names
+    // their first credential set, and the numbers disappear mid-session.
+    return tab && "liveAccount" in tab ? (tab.liveAccount ?? null) : undefined;
+  });
+  const accounts = useAgentAccounts(taskId, agentId, docker, liveAccount, visible);
+  return (
+    <AgentChip
+      taskId={taskId}
+      agentId={agentId}
+      cwd={cwd}
+      docker={docker}
+      accounts={accounts}
+      visible={visible}
+      // The width below which one footer cannot hold every agent's chip.
+      // Measured rather than guessed, in the e2e window: a chip with both
+      // windows and no account name renders at 174px, the sandbox status
+      // beside it takes ~92px, and the queue + Terminal controls on the left
+      // take ~214px with their labels. Two chips is 666px of an 894px bar,
+      // which is comfortable; 780 keeps a little room for the wider cases (an
+      // account name adds up to ~100px, a "N blocked" chip ~80px) before the
+      // bar's own label-shedding rules take over at 680 and 560. The two-agent
+      // case in e2e/specs/agent.e2e.ts re-measures all of this.
+      className={secondary ? "@max-[780px]:hidden" : undefined}
+    />
+  );
+}
+
+export function AgentChip({ taskId, agentId, cwd, docker, accounts, visible, className }: {
   taskId: string;
   /** The agent ENTRY id (a clone keeps its own). Half of the account key: the
    *  other half is `liveAccount`, because one entry can now hold several
@@ -80,6 +139,11 @@ export function AgentChip({ taskId, agentId, cwd, docker, accounts, visible }: {
    *  (they are display:none, never visibility:hidden), so without this every
    *  open task would spawn its own app-server on the same timer. */
   visible: boolean;
+  /** Extra classes for the chip itself. The footer uses it to drop a
+   *  SECONDARY agent's chip when the bar is too narrow for every agent the
+   *  task runs; there is no wrapper element to hang that on, because an empty
+   *  one would still spend a flex gap on a chip that rendered nothing. */
+  className?: string;
 }) {
   const { account: liveAccount, view: accountsView, refresh: refreshAccounts } = accounts;
   const entry = useAgentUsage(s => s.byAgent[usageKey(agentId, liveAccount)]);
@@ -159,7 +223,7 @@ export function AgentChip({ taskId, agentId, cwd, docker, accounts, visible }: {
   const hasNumbers = !!entry && (!!entry.session || !!entry.weekly || costChipVisible(entry, spend));
   const hasAccounts = pillVisible(accountsView);
   if (!hasNumbers && !hasAccounts) {
-    return blocksUsageFeed(owner) ? <BlockedChip owner={owner!} /> : null;
+    return blocksUsageFeed(owner) ? <BlockedChip owner={owner!} className={className} /> : null;
   }
 
   const stale = !!entry && Date.now() - entry.updatedAt > STALE_AFTER_MS;
@@ -222,6 +286,7 @@ export function AgentChip({ taskId, agentId, cwd, docker, accounts, visible }: {
             // everywhere except the machine it ships on.
             sw.alert ? "text-[var(--color-warn)]"
               : stale ? "text-[var(--color-fg-faint)]" : "text-[var(--color-fg-dim)]",
+            className,
           )}
         >
           {/* The agent's own brand icon, not a generic gauge. Two DIFFERENT
@@ -552,7 +617,7 @@ function UsageRow({ label, sub, window: w, driving, level, source }: {
  * someone who went looking, not a defect to be alarmed about, and the thing
  * blocking it is usually a status line the user wants more than this one.
  */
-function BlockedChip({ owner }: { owner: StatusLineOwner }) {
+function BlockedChip({ owner, className }: { owner: StatusLineOwner; className?: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <PopoverRoot>
@@ -565,6 +630,7 @@ function BlockedChip({ owner }: { owner: StatusLineOwner }) {
           className={cn(
             "flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5",
             "text-[var(--color-fg-faint)] hover:bg-[var(--color-bg-2)] hover:text-[var(--color-fg-dim)]",
+            className,
           )}
         >
           <CircleSlash className="h-3.5 w-3.5" />

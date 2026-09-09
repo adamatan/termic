@@ -1191,6 +1191,108 @@ describe("agent notifications", () => {
     expect(await sidebarBadge(taskId!)).not.toBe("attention");
   });
 
+  // One task, two agents (GH #277). The footer's chip used to be hard-bound to
+  // `task.cli`, the agent the task was CREATED with, so a claude tab sitting
+  // beside a codex tab got one chip for the task's own agent and nothing at
+  // all for the other one - reported on #277 by a user running exactly that
+  // pair. The second agent's tab is seeded rather than spawned: a real one
+  // needs a second agent CLI installed, and the fixture profile has exactly
+  // one.
+  it("gives every agent in the task its own footer chip, and keeps the one you are on when the bar is narrow (#277)", async () => {
+    await ensureActiveTask(taskId!);
+    const SECOND = "fakeagent-2";
+    /** Every chip in the ON-SCREEN task's footer, and whether it actually
+     *  PAINTS: the narrow-bar rule is a container query, so a dropped chip is
+     *  still in the DOM. Scoped to the footer that paints, because every task
+     *  the user has visited stays mounted (display:none) with a footer of its
+     *  own. */
+    const chips = () => browser.execute(() => {
+      const footer = [...document.querySelectorAll('[data-testid="task-footer"]')]
+        .find(el => el.getClientRects().length > 0);
+      return [...(footer?.querySelectorAll('[data-testid="usage-chip"]') ?? [])].map(el => ({
+        agent: el.getAttribute("data-usage-agent") ?? "",
+        session: el.getAttribute("data-usage-session") ?? "",
+        visible: el.getClientRects().length > 0,
+      }));
+    });
+    const shown = async () => (await chips()).filter(c => c.visible).map(c => c.agent);
+    const seedUsage = (agent: string, session: number, weekly: number) =>
+      browser.execute((a, se, wk) => {
+        window.__termic!.useAgentUsage.getState().report(
+          a, null,
+          {
+            session: { usedPercent: se, resetsAt: null },
+            weekly: { usedPercent: wk, resetsAt: null },
+            sessionCostUsd: null,
+          },
+          "statusline");
+      }, agent, session, weekly);
+    try {
+      await browser.execute((id, second) => {
+        window.__termic!.useApp.setState((s: any) => ({
+          tabs: {
+            ...s.tabs,
+            [id!]: [...s.tabs[id!], {
+              id: "e2e-second-agent-tab", type: "terminal", cli: second,
+              title: second, is_default: false,
+            }],
+          },
+        }));
+      }, taskId, SECOND);
+      await seedUsage("fakeagent", 12, 34);
+      await seedUsage(SECOND, 56, 78);
+
+      // Both agents, task's own first, each carrying its OWN numbers. The bug
+      // was one chip speaking for the whole task.
+      await browser.waitUntil(
+        async () => (await shown()).length === 2,
+        { timeout: 8_000, timeoutMsg: "the second agent in the task never got a chip" });
+      const both = await chips();
+      expect(both.map(c => c.agent)).toEqual(["fakeagent", SECOND]);
+      expect(both.map(c => c.session)).toEqual(["12", "56"]);
+      await snap("footer-two-agents.png");
+
+      // Now take the room away. The footer IS the container the rule is
+      // written against (`@container` sits on it), so its width is set
+      // directly rather than by dragging a column: neither the sidebar nor the
+      // right panel can squeeze this window's task pane below the threshold -
+      // the sidebar caps at 33vw and the right panel at 35vw - so a drag would
+      // assert nothing here. The rule itself is evaluated by the real engine
+      // either way. The chip that survives is the one whose tab is on screen,
+      // which is the task's own agent.
+      const setFooterWidth = (px: string) => browser.execute((w) => {
+        const el = [...document.querySelectorAll('[data-testid="task-footer"]')]
+          .find(e => e.getClientRects().length > 0) as HTMLElement | undefined;
+        if (el) el.style.width = w;
+      }, px);
+      await setFooterWidth("600px");
+      await browser.waitUntil(
+        async () => (await shown()).length === 1,
+        { timeout: 8_000, timeoutMsg: "a footer with no room for both chips still drew both" });
+      expect(await shown()).toEqual(["fakeagent"]);
+      await snap("footer-two-agents-narrow.png");
+      // Dropped, not unmounted: it is still in the DOM, still reporting, and
+      // it comes back with the room.
+      expect((await chips()).map(c => c.agent)).toEqual(["fakeagent", SECOND]);
+
+      await setFooterWidth("");
+      await browser.waitUntil(
+        async () => (await shown()).length === 2,
+        { timeout: 8_000, timeoutMsg: "the second chip never came back with the room" });
+    } finally {
+      await browser.execute((id) => {
+        window.__termic!.useApp.setState((s: any) => ({
+          tabs: { ...s.tabs, [id!]: (s.tabs[id!] ?? []).filter((t: any) => t.id !== "e2e-second-agent-tab") },
+        }));
+      }, taskId);
+      await browser.execute(() => {
+        for (const el of document.querySelectorAll('[data-testid="task-footer"]')) {
+          (el as HTMLElement).style.width = "";
+        }
+      });
+    }
+  });
+
   // Looking at a tab is how you read its badge. `markAttention` marks
   // unconditionally, focused tab included, and the badge then cleared only on
   // a keystroke in that terminal or on re-activating the task, so the common

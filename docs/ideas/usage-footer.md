@@ -48,10 +48,20 @@ free, but it is a different number and would need its own label.
   two wrote into a single slot. The account in the key is the one the PROCESS
   was spawned with, never the configured one. See
   [agent-accounts.md](../agent-accounts.md#usage-is-keyed-by-account-and-was-not).
-- The chip is leftmost in the footer's right group, so it and the "N blocked"
-  chip grow leftwards and the sandbox status stays pinned rightmost. It
-  self-hides until an account has actually reported, so an agent with no source
-  costs that row no width.
+- The chips are leftmost in the footer's right group, so they and the "N
+  blocked" chip grow leftwards and the sandbox status stays pinned rightmost.
+  Each self-hides until its account has actually reported, so an agent with no
+  source costs that row no width.
+- **One chip per AGENT the task runs**, task's own agent first, not one chip
+  for the task. A task can hold a claude tab and a codex tab, and the footer
+  was bound to `task.cli`: the second agent's quota was nowhere, which is what
+  the reporter came back about on #277. When the bar is too narrow to hold
+  them all (measured: under 780px of footer) the ones the user is not looking
+  at drop, so what survives is the agent whose tab is on screen. They are
+  dropped by a container query rather than unmounted, so a chip off screen
+  keeps reporting and comes back with the room. `lib/footerAgents.ts` decides
+  the set and the order; the order deliberately does NOT follow focus, because
+  a chip that moves when you switch tabs is a chip you have to find again.
 
 Verified live end to end: the generated status line against Claude Code 2.1.260
 in a real PTY, and the RPC against a real codex 0.153.2

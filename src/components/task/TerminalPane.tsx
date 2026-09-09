@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, TerminalSquare, Copy, Check, ChevronUp, ChevronDown, ChevronRight, X, Loader2 } from "lucide-react";
 import { PopoverRoot, PopoverTrigger, PopoverContent } from "@/components/ui/Popover";
 import { useUI } from "@/store/ui";
-import { isUserWatching, useApp } from "@/store/app";
+import { EMPTY_TABS, isUserWatching, useApp } from "@/store/app";
 import { logWorkState } from "@/lib/workStateLog";
 import { usePr } from "@/store/pr";
 import {
@@ -35,8 +35,8 @@ import { IS_MAC, bindingMatches, type ShortcutId } from "@/lib/shortcuts";
 import { registerTerminalDropTarget } from "@/lib/terminalDrop";
 import { HOOK_OSC_TITLE, HOOK_OSC_READY_BODY, hookOscSessionId } from "@/lib/agentHooks";
 import { parseUsageBody } from "@/lib/agentUsage";
-import { AgentChip } from "./AgentChip";
-import { useAgentAccounts } from "@/hooks/useAgentAccounts";
+import { FooterAgentChip } from "./AgentChip";
+import { activeFooterAgent, footerAgentIds, footerAgentKey } from "@/lib/footerAgents";
 import { useAgentUsage } from "@/store/agentUsage";
 import { imageFromClipboard, pastePathText } from "@/lib/clipboardImage";
 import { setupImeReplacementBridge } from "@/lib/ime";
@@ -3173,27 +3173,21 @@ export function FooterBar({ task, sandboxWarning }: {
   // re-renders every task's footer on every task switch.
   const isActiveTask = useApp(s => s.activeTaskId === task.id);
 
-  // The account the task's PRIMARY agent process is running as (GH #278). The
-  // footer's two account-aware chips are about that process, so the answer has
-  // to come from the tab that owns it rather than from the task's setting: a
-  // staged switch changes the setting immediately and the process not at all.
+  // Every agent this task RUNS, not just the one it was created with (GH
+  // #277). A task holding a claude tab and a codex tab used to show one chip
+  // bound to `task.cli`, so the other agent's plan usage was nowhere at all.
   //
-  // Selected as the string, so this footer re-renders when its own agent
-  // restarts on another account and not when any other tab changes.
-  const liveAccount = useApp(s => {
-    const primary = (s.tabs[task.id] || []).find(
-      t => t.type === "terminal" && (t as TerminalTab).cli === (task.cli ?? "claude"),
-    ) as TerminalTab | undefined;
-    // `undefined` when nothing has spawned yet; `null` once a process is
-    // running on the agent's ordinary login. The distinction is load-bearing:
-    // merging them re-keys a running task's usage the moment the user names
-    // their first credential set, and the numbers disappear mid-session.
-    return primary && "liveAccount" in primary ? (primary.liveAccount ?? null) : undefined;
-  });
-  // One owner for the account, shared by the pill and the usage chip: they are
-  // two views of one fact, and fetching it twice is two chances to disagree.
-  const accounts = useAgentAccounts(
-    task.id, task.cli ?? "claude", !!task.docker_sandbox_enabled, liveAccount, isActiveTask);
+  // Both selectors return a STRING, and the unpacking happens out here: a
+  // selector that builds an array hands back a fresh reference on every store
+  // write and re-renders this footer under every keystroke of every task
+  // (docs/performance.md bear trap 8, pinned by store/selectorFanout.test.ts).
+  const agentIds = footerAgentIds(
+    useApp(s => footerAgentKey(s.tabs[task.id] ?? EMPTY_TABS, task.cli ?? "claude")));
+  // Which agent's tab is on screen: the chip that survives a footer too narrow
+  // for all of them.
+  const activeAgent = useApp(
+    s => activeFooterAgent(s.tabs[task.id] ?? EMPTY_TABS, s.activeTab[task.id], task.cli ?? "claude"),
+  );
 
   // no right-split agent queue state needed; split panes show their own queue via SplitView
 
@@ -3238,6 +3232,7 @@ export function FooterBar({ task, sandboxWarning }: {
 
   return (
     <div
+      data-testid="task-footer"
       className={cn(
         // --bottom-bar-h is the shared height for every bottom bar. text-[12.5px]
         // matches the queue/terminal buttons and the right-panel footer tabs.
@@ -3298,14 +3293,20 @@ export function FooterBar({ task, sandboxWarning }: {
             account has spent. They were two chips and two panels, which the
             account pill's own comment already argued against ("forms one unit
             with the usage chip"). */}
-        <AgentChip
-          taskId={task.id}
-          agentId={task.cli ?? "claude"}
-          cwd={task.path}
-          docker={!!task.docker_sandbox_enabled}
-          accounts={accounts}
-          visible={isActiveTask}
-        />
+        {agentIds.map(id => (
+          <FooterAgentChip
+            key={id}
+            taskId={task.id}
+            agentId={id}
+            cwd={task.path}
+            docker={!!task.docker_sandbox_enabled}
+            visible={isActiveTask}
+            // Never true for a single-agent task, which is every task until
+            // somebody opens a second agent in one: nothing to choose between,
+            // so nothing to drop.
+            secondary={agentIds.length > 1 && id !== activeAgent}
+          />
+        ))}
         {mode !== "off" && total > 0 && (
           <DeniedHostsPopover taskId={task.id} cli={task.cli ?? "claude"} count={total} mode={mode} />
         )}
