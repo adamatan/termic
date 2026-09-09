@@ -105,11 +105,15 @@ export function DropdownItem({ children, className, onSelect, disabled, ...data 
  *  `DropdownSub`. */
 export const DropdownSub = DM.Sub;
 
-export function DropdownSubTrigger({ children, className }: {
+/** `data-*` is forwarded here for the same reason it is on `DropdownItem`
+ *  above: a submenu trigger is a row a spec has to find, and silently
+ *  dropping the attribute leaves it hunting for a hook that cannot exist. */
+export function DropdownSubTrigger({ children, className, ...data }: {
   children: ReactNode; className?: string;
-}) {
+} & DataAttrs) {
   return (
     <DM.SubTrigger
+      {...data}
       className={cn(
         // Mirrors DropdownItem, minus the cursor: a submenu trigger opens on
         // hover, it isn't a click target that does something.

@@ -4,7 +4,7 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
-## [1.3.5] - 2026-09-09
+## [1.3.6] - 2026-09-09
 
 Open a task's folder in any app, plus a profiles fix that moved projects.
 
@@ -45,6 +45,14 @@ Open a task's folder in any app, plus a profiles fix that moved projects.
   a task now gets its own chip, and the one whose tab is on screen is the one
   that survives a narrow window.
   ([#277](https://github.com/simion/termic/issues/277))
+
+### Improvements
+- **Existing worktrees moved behind one row in the new-task menu.** A project
+  with worktrees you had made outside Termic listed every one of them at the
+  top level, which pushed the agents (the thing the menu is for) further down
+  the more worktrees you had. They now sit in a submenu called Import
+  worktree, next to Resume, and the row is absent entirely when there is
+  nothing to import.
 
 ### Thanks
 - Vinodkumar Naidu (@nvkvin) for the open-with control, and for following it

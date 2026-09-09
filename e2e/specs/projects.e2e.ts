@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { archiveTask, clickByText, clickMenuItemUntil, clickWhenVisible, dismissOverlays, pointerDrag, requireTermicApi, keysIn, snap, waitForAppShell, waitForText, waitGone, waitVisible } from "../helpers";
+import { archiveTask, clickByText, clickMenuItemUntil, clickWhenVisible, dismissOverlays, pointerDrag, requireTermicApi, keysIn, snap, waitForAppShell, waitForText, waitForTextGone, waitGone, waitVisible } from "../helpers";
 
 // P1: adding/removing a project. Cases: a git repo can be added as a project
 // (shows in the store); removing it drops it. Uses a throwaway temp repo and
@@ -253,6 +253,21 @@ describe("discover repos", () => {
 // listing worktrees that exist on disk but aren't open as tasks. The fixture
 // repo has a pre-seeded `sbcheck` worktree. (We only assert discovery — doing
 // the import + archive would rm the shared worktree.)
+/** Open a Radix trigger. It opens on POINTERDOWN, not click, so a synthetic
+ *  `.click()` leaves the menu shut and every assertion after it looking for
+ *  rows that were never rendered. Same sequence the history scope picker in
+ *  `git.e2e.ts` drives. */
+const openByPointer = async (selector: string) => {
+  await waitVisible(selector);
+  await browser.execute((sel) => {
+    const el = document.querySelector(sel) as HTMLElement;
+    const opts = { bubbles: true, cancelable: true, pointerType: "mouse", button: 0, isPrimary: true, pointerId: 1 } as any;
+    el.dispatchEvent(new PointerEvent("pointerdown", opts));
+    el.dispatchEvent(new PointerEvent("pointerup", opts));
+    el.click();
+  }, selector);
+};
+
 describe("import worktree", () => {
   it("lists importable worktrees for the project", async () => {
     await waitForAppShell();
@@ -268,6 +283,72 @@ describe("import worktree", () => {
       (list as any[]).some((w) => JSON.stringify(w).includes("sbcheck")),
     ).toBe(true);
     await snap("import-worktree.png");
+  });
+
+  // The launcher's SHAPE, which is the half the IPC case above cannot see.
+  // Importable worktrees used to be a flat section: a label plus a row each,
+  // at the top level, pushing the agents down the menu on exactly the projects
+  // that have the most worktrees. It is a submenu now, sitting beside Resume.
+  it("offers importable worktrees behind one row, next to Resume", async () => {
+    await waitForAppShell();
+    const projectId = await browser.execute(() =>
+      window.__termic!.useApp.getState().projects.find((p: any) => p.name === "fixture-repo").id);
+
+    await openByPointer(`[data-testid="project-new-task-${projectId}"]`);
+    await waitVisible('[data-testid="import-worktree-sub"]');
+
+    // ONE row at the top level, whatever the project holds, and the worktrees
+    // themselves are not among the menu's own items until it is opened.
+    const before = await browser.execute(() =>
+      document.body.innerText.includes("sbcheck"));
+    expect(before).toBe(false);
+
+    // Radix opens a submenu on hover; a pointer sequence is what a spec drives.
+    await openByPointer('[data-testid="import-worktree-sub"]');
+    await waitForText("sbcheck");
+    await snap("import-worktree-submenu.png");
+    await browser.keys(["Escape"]);
+    await browser.keys(["Escape"]);
+    await waitForTextGone("Import worktree");
+  });
+
+  // The other half of the ask: a project with nothing to import shows no row
+  // at all, rather than an empty submenu that opens onto nothing.
+  //
+  // Its OWN repo, not another case's leftovers: a project that happens to have
+  // no worktrees today is a test that passes for the wrong reason the moment
+  // something gives it one, and one that bails when the project is missing is
+  // a test that passes having asserted nothing.
+  it("hides the import row entirely when there is nothing to import", async () => {
+    await waitForAppShell();
+    const bare = mkdtempSync(path.join(os.tmpdir(), "e2e-noimport-"));
+    execSync(
+      `git -C "${bare}" init -q && git -C "${bare}" -c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m init`,
+    );
+    let projectId: string | null = null;
+    try {
+      projectId = await browser.execute(async (d) => {
+        const p = await window.__termic!.ipc.projectAdd(d);
+        await window.__termic!.useApp.getState().loadAll();
+        return p.id as string;
+      }, bare);
+
+      await openByPointer(`[data-testid="project-new-task-${projectId}"]`);
+      // The menu IS open, so the missing row is an absence and not a menu that
+      // failed to appear.
+      await waitForText("Advanced…");
+      await waitGone('[data-testid="import-worktree-sub"]');
+      await browser.keys(["Escape"]);
+      await waitForTextGone("Advanced…");
+    } finally {
+      if (projectId) {
+        await browser.execute(async (id) => {
+          await window.__termic!.ipc.projectRemove(id);
+          await window.__termic!.useApp.getState().loadAll();
+        }, projectId);
+      }
+      rmSync(bare, { recursive: true, force: true });
+    }
   });
 });
 

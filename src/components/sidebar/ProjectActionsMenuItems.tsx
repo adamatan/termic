@@ -18,7 +18,7 @@ import { defaultCliFirst, visibleCliIds } from "@/lib/agents";
 import { importQuickWorktree, readNewTaskMode, writeNewTaskMode, type NewTaskMode } from "@/lib/quickTask";
 import { taskImportableWorktrees, taskRestore, projectBranchContext, projectUpdate } from "@/lib/ipc";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
-import { DropdownItem, DropdownLabel, DropdownSeparator, DropdownSub, DropdownSubTrigger, DropdownSubContent } from "@/components/ui/Dropdown";
+import { DropdownItem, DropdownSeparator, DropdownSub, DropdownSubTrigger, DropdownSubContent } from "@/components/ui/Dropdown";
 import { GitBranch, GitBranchPlus, Link2, TerminalSquare, SquareChevronRight, Settings2, FolderGit2, Flag, Check, ChevronRight, History } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Agent, BranchContext, ImportableWorktree, Project } from "@/lib/types";
@@ -123,7 +123,11 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
   // The menu is unmounted while closed, so this runs on open (a cheap
   // `git worktree list`, no working-tree scan) and never goes stale.
   const canImport = !isNonGit && !isMulti;
-  const IMPORT_LIMIT = 3;
+  // Same reasoning as RESUME_LIMIT above: behind a submenu this costs ONE row
+  // in the launcher however many worktrees are listed, so the list can be as
+  // long as the Resume one. It was 3 while every entry pushed the agents
+  // further from the cursor.
+  const IMPORT_LIMIT = 5;
   const [importable, setImportable] = useState<ImportableWorktree[]>([]);
   useEffect(() => {
     if (!canImport) return;
@@ -418,39 +422,56 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
           </div>
         </DropdownItem>
       )}
+      {/* Import and Resume are one group: two errands that reach for something
+          that ALREADY exists, each behind one row. Both self-hide when they
+          have nothing to offer, so the separator belongs to whichever of them
+          renders rather than to either one of them. */}
+      {(importable.length > 0 || archivedTasks.length > 0) && <DropdownSeparator />}
+
       {/* Existing worktrees, one click to adopt. Named by branch (Rust derives
           the task name + CLI), so there's nothing to fill in. Past the first
           few, hand off to the dialog's import mode — the only thing that ever
-          sets the `importMode` seed. */}
+          sets the `importMode` seed.
+          A SUBMENU, like Resume beside it: as a flat section this spent a
+          label plus a row per worktree at the top level, pushing the agents
+          (the thing the menu is for) down the list on exactly the projects
+          that have the most worktrees. */}
       {importable.length > 0 && (
-        <>
-          <DropdownSeparator />
-          <DropdownLabel>Existing worktrees</DropdownLabel>
-          {importable.slice(0, IMPORT_LIMIT).map(wt => (
-            <DropdownItem key={wt.path} onSelect={() => {
-              // Failures must be visible: this one-click path has no dialog
-              // to show them, and a silent no-op reads as a broken button
-              // (e.g. the derived-name collision error, GH #169 review).
-              importQuickWorktree(projectId, wt.path)
-                .catch(err => useUI.getState().pushToast(String(err), "error"));
-            }}>
+        <DropdownSub>
+          <DropdownSubTrigger data-testid="import-worktree-sub" className="w-full justify-between gap-2">
+            <span className="flex min-w-0 items-center gap-2">
               <FolderGit2 className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
-              <div className="min-w-0 flex-1">
-                <div className="truncate">
-                  {wt.branch || <span className="italic text-[var(--color-fg-dim)]">detached {wt.head}</span>}
+              <span className="truncate">Import worktree</span>
+            </span>
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-faint)]" />
+          </DropdownSubTrigger>
+          <DropdownSubContent className="max-w-[320px]">
+            {importable.slice(0, IMPORT_LIMIT).map(wt => (
+              <DropdownItem key={wt.path} onSelect={() => {
+                // Failures must be visible: this one-click path has no dialog
+                // to show them, and a silent no-op reads as a broken button
+                // (e.g. the derived-name collision error, GH #169 review).
+                importQuickWorktree(projectId, wt.path)
+                  .catch(err => useUI.getState().pushToast(String(err), "error"));
+              }}>
+                <FolderGit2 className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate">
+                    {wt.branch || <span className="italic text-[var(--color-fg-dim)]">detached {wt.head}</span>}
+                  </div>
+                  <div className="truncate text-[11px] text-[var(--color-fg-faint)]">{wt.path}</div>
                 </div>
-                <div className="truncate text-[11px] text-[var(--color-fg-faint)]">{wt.path}</div>
-              </div>
-            </DropdownItem>
-          ))}
-          {importable.length > IMPORT_LIMIT && (
-            <DropdownItem onSelect={() => {
-              requestAnimationFrame(() => openNewTask(projectId, { importMode: true }));
-            }}>
-              More…
-            </DropdownItem>
-          )}
-        </>
+              </DropdownItem>
+            ))}
+            {importable.length > IMPORT_LIMIT && (
+              <DropdownItem onSelect={() => {
+                requestAnimationFrame(() => openNewTask(projectId, { importMode: true }));
+              }}>
+                More…
+              </DropdownItem>
+            )}
+          </DropdownSubContent>
+        </DropdownSub>
       )}
 
       {/* Recently archived tasks for this project — a shortcut to
@@ -460,10 +481,8 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
           costing the launcher several rows every time the project had history.
           "More…" hands off to the full page for anything past the limit. */}
       {archivedTasks.length > 0 && (
-        <>
-          <DropdownSeparator />
           <DropdownSub>
-            <DropdownSubTrigger className="w-full justify-between gap-2">
+            <DropdownSubTrigger data-testid="resume-sub" className="w-full justify-between gap-2">
               <span className="flex min-w-0 items-center gap-2">
                 <History className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
                 <span className="truncate">Resume</span>
@@ -503,7 +522,6 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
               )}
             </DropdownSubContent>
           </DropdownSub>
-        </>
       )}
     </>
   );
