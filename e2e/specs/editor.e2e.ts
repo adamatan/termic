@@ -397,6 +397,44 @@ describe("code editor", () => {
     await snap("code-editor-makefile.png");
   });
 
+  it("highlights Terraform blocks and values with the HCL grammar", async () => {
+    await openHighlighted(
+      "main.tf",
+      '# Terraform fixture\nresource "example_service" "demo" {\n  name = "hello ${var.name}"\n  enabled = true\n  count = 2\n}\n',
+      "example_service",
+    );
+    expect(await syntaxLabel()).toBe("HCL");
+    const colors = await browser.execute((id) => {
+      const content = document.querySelector(`[data-task-id="${id}"] .cm-content`)!;
+      const spans = [...content.querySelectorAll(".cm-line span[class]")];
+      return {
+        plain: getComputedStyle(content).color,
+        resource: spans.find(s => s.textContent === "resource")?.textContent,
+        valueColors: ["true", "2"].map(text => {
+          const span = spans.find(s => s.textContent === text);
+          return span ? getComputedStyle(span).color : null;
+        }),
+        comment: spans.some(s => s.textContent?.includes("Terraform fixture")),
+      };
+    }, taskId);
+    expect(colors.resource).toBe("resource");
+    expect(colors.comment).toBe(true);
+    for (const color of colors.valueColors) {
+      expect(color).not.toBeNull();
+      expect(color).not.toBe(colors.plain);
+    }
+    await snap("code-editor-terraform.png");
+  });
+
+  it("switches between Terraform variables, HCL and Terraform JSON", async () => {
+    await openHighlighted("prod.auto.tfvars", 'region = "test-region"\nenabled = true\n', "test-region");
+    expect(await syntaxLabel()).toBe("HCL");
+    await openHighlighted("settings.hcl", 'locals {\n  greeting = "hello"\n}\n', "greeting");
+    expect(await syntaxLabel()).toBe("HCL");
+    await openHighlighted("main.tf.json", '{"locals": {"greeting": "hello"}}\n', "greeting");
+    expect(await syntaxLabel()).toBe("JSON");
+  });
+
   // The whole point of sourcing languages from @codemirror/language-data:
   // there is no PHP entry anywhere in termic, no import, no case in a switch.
   // Highlighting it proves the registry lookup, the async grammar load and the

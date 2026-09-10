@@ -34,6 +34,7 @@ function stream(mode: Parameters<typeof StreamLanguage.define>[0]): LanguageSupp
  *    the registry entry on purpose: being first, it replaces it rather than
  *    sitting next to it in the picker.
  *  - Elixir  — simply absent from the registry.
+ *  - HCL     — absent too, so Terraform files otherwise open as plain text.
  *  - Svelte  — absent, and the HTML fallback it used to get missed `{#if}`
  *    blocks and every `<script>` in the file.
  *  - Astro   — no CodeMirror grammar exists anywhere. `lib/astroMode` builds
@@ -75,6 +76,12 @@ const CUSTOM: LanguageDescription[] = [
     alias: ["ex", "exs"],
     extensions: ["ex", "exs"],
     load: () => import("codemirror-lang-elixir").then(m => m.elixir()),
+  }),
+  LanguageDescription.of({
+    name: "HCL",
+    alias: ["hcl", "terraform", "tf", "tfvars"],
+    extensions: ["tf", "tfvars", "hcl"],
+    load: () => import("@/lib/hclMode").then(m => m.hcl()),
   }),
 ];
 

@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { EditorState } from "@codemirror/state";
+import { highlightingFor, syntaxTree } from "@codemirror/language";
+import { classHighlighter, highlightTree } from "@lezer/highlight";
 import { languages as registry } from "@codemirror/language-data";
 import {
-  OVERLAY, isKnownLanguage, langForId, languageIdForPath, matchLanguage, pickerLanguages,
+  OVERLAY, isKnownLanguage, langForId, langForPath, languageIdForPath, matchLanguage, pickerLanguages,
 } from "./languageExts";
 import { PLAIN_TEXT } from "./languages";
+import { resolveEditorTheme } from "./editorTheme";
 
 const id = languageIdForPath;
 
@@ -74,6 +78,13 @@ describe("languageIdForPath", () => {
     expect(id("test/foo_test.exs")).toBe("Elixir");
   });
 
+  it("recognizes Terraform and HCL files without stealing their JSON variants", () => {
+    for (const path of ["main.tf", "MAIN.TF", "terraform.tfvars", "prod.auto.tfvars", "terragrunt.hcl"])
+      expect(id(path), path).toBe("HCL");
+    for (const path of ["main.tf.json", "terraform.tfvars.json", "prod.auto.tfvars.json"])
+      expect(id(path), path).toBe("JSON");
+  });
+
   it("gives the component formats a real grammar where one exists", () => {
     // These three each have a parser that knows the format. Svelte and Astro
     // used to fall back to HTML here, which read the tags and left every line
@@ -125,6 +136,13 @@ describe("the composed list", () => {
     expect(rows.find(r => r.name === "Properties files")?.keywords).toContain("ini");
   });
 
+  it("offers HCL once and makes it searchable as Terraform", async () => {
+    const rows = pickerLanguages().filter(l => l.name === "HCL");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].keywords).toContain("terraform");
+    expect(await langForId("HCL")).not.toBeNull();
+  });
+
   it("knows the names it hands out, and only those", () => {
     expect(isKnownLanguage("Rust")).toBe(true);
     expect(isKnownLanguage("Makefile")).toBe(true);
@@ -156,5 +174,47 @@ describe("matchLanguage", () => {
     const desc = matchLanguage("src/App.tsx");
     expect(desc?.name).toBe("TSX");
     expect(await desc!.load()).toBeTruthy();
+  });
+});
+
+describe("Terraform highlighting", () => {
+  it("parses and styles HCL blocks, expressions, comments and heredocs", async () => {
+    const doc = [
+      "# Terraform fixture",
+      'resource "example_service" "demo" {',
+      '  name = "hello ${var.name}"',
+      "  enabled = true",
+      "  count = 2",
+      "  labels = [for name in var.names : upper(name)]",
+      "  script = <<-EOT",
+      "    hello ${var.name}",
+      "  EOT",
+      "}",
+      "",
+    ].join("\n");
+    const resolved = await langForPath("main.tf");
+    expect(resolved?.id).toBe("HCL");
+    const state = EditorState.create({ doc, extensions: [resolved!.ext, resolveEditorTheme("auto")] });
+    const tree = syntaxTree(state);
+    const errors: number[] = [];
+    tree.iterate({ enter: node => { if (node.type.isError) errors.push(node.from); } });
+    expect(errors).toEqual([]);
+    const classes = new Set<string>();
+    highlightTree(tree, classHighlighter, (_from, _to, cls) => {
+      for (const name of cls.split(" ")) classes.add(name);
+    });
+    expect(classes).toContain("tok-comment");
+    expect(classes).toContain("tok-string");
+    expect(classes).toContain("tok-number");
+    expect(classes).toContain("tok-bool");
+    // A parser tag alone is not enough: the default theme must actually
+    // assign it a style, or blocks and booleans still look like plain text.
+    const styled: string[] = [];
+    highlightTree(tree, { style: tags => highlightingFor(state, tags) }, (from, to) => {
+      styled.push(doc.slice(from, to));
+    });
+    expect(styled).toContain("resource");
+    expect(styled).toContain("true");
+    expect(styled).toContain('"example_service"');
   });
 });
