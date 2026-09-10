@@ -264,6 +264,14 @@ unknown project or agent, duplicate task), 3 agent stopped needing input, \
         /// Agent CLI id (claude, codex, ...). Default: the project's default agent.
         #[arg(long)]
         agent: Option<String>,
+        /// Model for this task's agent. Appended after --arg values so an
+        /// explicit model wins when the agent uses last-value-wins parsing.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Additional argument for this task's agent. Repeat for multiple
+        /// argv elements; use --arg=VALUE when VALUE begins with a dash.
+        #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
+        agent_args: Vec<String>,
         /// Create an isolated git worktree for the task (the default is
         /// the GUI's remembered mode).
         #[arg(long, conflicts_with = "main")]
@@ -1106,6 +1114,11 @@ pub fn cage_refused(sandbox: Option<&str>, mode: Option<&str>) -> bool {
 /// especially before auto-launch: a typo must never boot the app.
 /// Pure so that no-boot property is testable without an environment.
 fn pre_connect_guard(cmd: &Cmd) -> Result<(), CliError> {
+    if let Cmd::New { model: Some(model), .. } = cmd {
+        if model.trim().is_empty() {
+            return Err(CliError::new(exit_code::ERROR, "the model is empty"));
+        }
+    }
     // `-P` is a selector, never stdin; an empty one fails here rather
     // than as a server lookup.
     if let Cmd::New { library: Some(l), .. }
@@ -1508,6 +1521,8 @@ fn execute_new(
         prompt: _,
         library,
         agent,
+        model,
+        agent_args,
         worktree,
         main,
         base,
@@ -1545,11 +1560,13 @@ fn execute_new(
                 .map_err(|_| CliError::new(exit_code::ERROR, format!("{p} does not exist")))
         })
         .transpose()?;
+    let task_agent_args = compose_task_agent_args(agent_args, model.as_deref());
     let wire = proto::Command::New {
         name: name.clone().unwrap_or_default(),
         prompt,
         prompt_ref: library.clone(),
         agent: agent.clone(),
+        agent_args: task_agent_args,
         mode,
         base: base.clone(),
         from,
@@ -1596,6 +1613,18 @@ fn execute_new(
     };
     let code = n.wait.as_ref().map(|w| w.outcome.exit_code()).unwrap_or(exit_code::OK);
     Ok(Output { stdout: final_stdout(format, &output::new_final_text(&n), &n), code })
+}
+
+/// Generic task args come first. The dedicated flag is deliberately last,
+/// so `--model` is the unambiguous winner if the caller also supplied a
+/// model flag through `--arg` and the agent uses last-value-wins parsing.
+fn compose_task_agent_args(args: &[String], model: Option<&str>) -> Vec<String> {
+    let mut out = args.to_vec();
+    if let Some(model) = model {
+        out.push("--model".into());
+        out.push(model.into());
+    }
+    out
 }
 
 /// The request line caps at 1 MB (proto::MAX_LINE_BYTES) POST-JSON-
@@ -2403,11 +2432,34 @@ mod tests {
         assert!(Cli::try_parse_from([
             "termic", "new", "fix-auth", "-p", "fix it", "--agent", "claude", "--worktree",
             "--base", "develop", "--sandbox", "enforce-fs", "--yolo", "--project", "web",
+            "--arg=--effort", "--arg", "low", "--model", "worker",
             "--open", "--wait", "--timeout", "1h30m",
         ])
         .is_ok());
         // Sandbox values are validated at parse time.
         assert!(Cli::try_parse_from(["termic", "new", "x", "--sandbox", "jail"]).is_err());
+    }
+
+    #[test]
+    fn new_task_args_preserve_argv_and_put_model_last() {
+        let cli = Cli::try_parse_from([
+            "termic", "new", "x", "--arg=--model", "--arg", "default",
+            "--arg=--reasoning-effort", "--arg", "low", "--model", "worker",
+        ])
+        .unwrap();
+        let Cmd::New { model, agent_args, .. } = cli.cmd else { panic!() };
+        assert_eq!(model.as_deref(), Some("worker"));
+        assert_eq!(agent_args, ["--model", "default", "--reasoning-effort", "low"]);
+        assert_eq!(
+            compose_task_agent_args(&agent_args, model.as_deref()),
+            ["--model", "default", "--reasoning-effort", "low", "--model", "worker"],
+        );
+    }
+
+    #[test]
+    fn new_rejects_an_empty_model_before_connecting() {
+        let cmd = Cli::try_parse_from(["termic", "new", "x", "--model", " "]).unwrap().cmd;
+        assert_eq!(pre_connect_guard(&cmd).unwrap_err().message, "the model is empty");
     }
 
     #[test]
@@ -2815,7 +2867,10 @@ mod tests {
             .iter()
             .filter_map(|f| f["flag"].as_str())
             .collect();
-        for f in ["--prompt", "--library", "--agent", "--wait", "--sandbox", "--timeout"] {
+        for f in [
+            "--prompt", "--library", "--agent", "--model", "--arg", "--wait", "--sandbox",
+            "--timeout",
+        ] {
             assert!(flags.contains(&f), "missing {f} in {flags:?}");
         }
         // And the whole machine surface obeys the copy rule.

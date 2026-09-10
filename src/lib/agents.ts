@@ -1076,6 +1076,10 @@ export function spawnArgsForCli(
 
   const composed = [
     ...args,
+    // CLI-created task parameters belong to the default agent only. Keep
+    // them ahead of every termic-managed runtime block, while still after
+    // Settings defaults so the task can select its own model or reasoning.
+    ...(opts.isPrimary && opts.task?.cli === cli ? (opts.task.agent_args ?? []) : []),
     // Before the resume block: codex's resume is a subcommand, and these
     // are root-binary globals.
     ...(opts.unattended ? (UNATTENDED_SPAWN_ARGS[cli] ?? []) : []),
