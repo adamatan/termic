@@ -97,6 +97,16 @@ read that file. (`result` and `logs` below can read a claude agent's last
 message / the rendered terminal stream, but the file you asked for is
 the deliverable you verify.)
 
+Use `--model <id>` to choose a model for one task without changing the
+agent's shared Settings. Use `--arg=<value>` repeatedly for other agent
+arguments; each value is one argv element, so a flag and its value are
+two occurrences. Explicit `--model` is appended after `--arg` values and
+wins when the agent treats the last model flag as authoritative:
+
+    "$TERMIC_CLI" new implement-auth --agent codex \
+      --arg=--reasoning-effort --arg=low --model <model-id> \
+      -p "Implement the approved authentication plan."
+
 Note which half of the protocol applies. A CAGED task cannot report
 back, so the file is the whole channel and you read it on your own
 schedule:

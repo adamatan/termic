@@ -735,6 +735,7 @@ mod tests {
             name: "fix-auth".into(),
             project: "web".into(),
             agent: "claude".into(),
+            agent_args: Vec::new(),
             branch: "fix-auth".into(),
             base_branch: "main".into(),
             path: "/w/fix-auth".into(),

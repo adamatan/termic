@@ -142,6 +142,8 @@ export const taskOpenRepo = (
   /** Resume-args override, applied from the first spawn. Same field as the
    *  task menu's "Resume override" (`taskSetResumeOverride`). */
   resumeOverride?: string,
+  /** Additional argv pinned to this task's default agent. */
+  agentArgs?: string[],
 ) =>
   invoke<Task>("task_open_repo", {
     projectId, cli, name, command,
@@ -151,7 +153,7 @@ export const taskOpenRepo = (
     sandboxAllowedHosts: sandbox?.allowedHosts,
     dockerSandboxEnabled: sandbox?.docker,
     dockerExtraMounts: sandbox?.dockerExtraMounts,
-    resumeSessionId, resumeOverride,
+    resumeSessionId, resumeOverride, agentArgs,
   });
 /** List a project's git worktrees not yet open as tasks (issue #5). */
 export const taskImportableWorktrees = (projectId: string) =>
@@ -174,6 +176,8 @@ export const taskImportWorktree = (
    *  task menu's "Resume override" (`taskSetResumeOverride`). */
   resumeOverride?: string,
   yolo?: boolean,
+  /** Additional argv pinned to this task's default agent. */
+  agentArgs?: string[],
 ) =>
   invoke<Task>("task_import_worktree", {
     projectId, path, name, cli,
@@ -183,7 +187,7 @@ export const taskImportWorktree = (
     sandboxAllowedHosts: sandbox?.allowedHosts,
     dockerSandboxEnabled: sandbox?.docker,
     dockerExtraMounts: sandbox?.dockerExtraMounts,
-    resumeSessionId, resumeOverride, yolo,
+    resumeSessionId, resumeOverride, yolo, agentArgs,
   });
 export const taskArchive  = (id: string, deleteBranch?: boolean) => invoke<void>("task_archive", { id, deleteBranch });
 export const taskRestore  = (id: string) => invoke<Task>("task_restore", { id });

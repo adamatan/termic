@@ -994,6 +994,7 @@ const TOOLS: &[ToolDef] = &[
             // doc's verb list, and widening it is a scope decision.
             prompt_ref: None,
             agent: arg_str(a, "agent")?,
+            agent_args: Vec::new(),
             mode: arg_str(a, "mode")?,
             base: arg_str(a, "base")?,
             from: None,

@@ -169,6 +169,47 @@ describe("spawnArgsForCli", () => {
     expect(args).toContain("--yes");
     expect(args).not.toContain("--dangerously-skip-permissions");
   });
+
+  it("places task args after Settings defaults and before runtime args", () => {
+    mockAgents.push({
+      id: "codex",
+      command: "codex",
+      display_name: "Codex",
+      args: ["--model", "default"],
+      capabilities: {
+        yolo_args: ["--dangerous"],
+        runtime_yolo_command: "",
+        resume_args: ["resume", "--last"],
+      },
+    } as unknown as Agent);
+    const task = {
+      id: "t1", cli: "codex", name: "Worker", branch: "worker", port: 18100,
+      agent_args: ["--effort", "low", "--model", "worker"],
+    } as unknown as import("@/lib/types").Task;
+
+    expect(spawnArgsForCli("codex", {
+      yolo: true, resume: true, isPrimary: true, task,
+    })).toEqual([
+      "--model", "default",
+      "--effort", "low", "--model", "worker",
+      "resume", "--last",
+      "--dangerous",
+    ]);
+  });
+
+  it("does not leak task args into secondary or different-agent tabs", () => {
+    const task = {
+      id: "t1", cli: "codex", name: "Worker", branch: "worker", port: 18100,
+      agent_args: ["--model", "worker"],
+    } as unknown as import("@/lib/types").Task;
+
+    expect(spawnArgsForCli("codex", {
+      yolo: false, resume: false, isPrimary: false, task,
+    })).not.toContain("worker");
+    expect(spawnArgsForCli("claude", {
+      yolo: false, resume: false, isPrimary: true, task,
+    })).not.toContain("--model");
+  });
 });
 
 // ── decideResume (issue #23: per-tab resume) ──────────────────────────

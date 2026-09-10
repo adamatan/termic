@@ -112,6 +112,8 @@ interface NewTaskParams {
   name: string;
   projectId: string;
   agent?: string;
+  /** Ordered argv elements pinned to the task's default agent. */
+  agentArgs?: string[];
   /** "worktree" | "main"; absent = the GUI's remembered mode. */
   mode?: string;
   base?: string;
@@ -173,7 +175,7 @@ async function createTask(p: NewTaskParams, mode: NewTaskMode): Promise<Task> {
     const resume = typeof p.resume === "string" && p.resume ? p.resume : undefined;
     if (mode === "repo_root") {
       const sandbox = pins ? await mainCheckoutSandbox(p.projectId, pins) : undefined;
-      return taskOpenRepo(p.projectId, cli, name, sandbox, undefined, resume);
+      return taskOpenRepo(p.projectId, cli, name, sandbox, undefined, resume, undefined, p.agentArgs);
     }
     if (slugify(name) === "") {
       throw new Error("Task name must contain at least one letter or number.");
@@ -192,6 +194,7 @@ async function createTask(p: NewTaskParams, mode: NewTaskMode): Promise<Task> {
       project_id: p.projectId,
       name,
       cli,
+      agent_args: p.agentArgs,
       base_branch: typeof p.base === "string" && p.base.trim() ? p.base.trim() : null,
       branch,
       resume_session_id: resume,
@@ -238,6 +241,7 @@ async function importTask(p: NewTaskParams): Promise<Task> {
         typeof p.resume === "string" && p.resume ? p.resume : undefined,
         undefined, // resume-args override: dialog-only, no CLI flag for it yet
         p.yolo === true ? true : undefined,
+        p.agentArgs,
       );
     } catch (e) {
       throw classifyCreateError(e);

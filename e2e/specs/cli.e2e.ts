@@ -16,7 +16,7 @@
 // webview RPCs.
 import fs from "node:fs";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import os from "node:os";
 import { dataDir } from "../../wdio.conf.js";
 import { archiveTask, cliRpc as rpc, openTask, requireTermicApi, waitForAppShell, waitForClisDetected } from "../helpers.js";
@@ -854,5 +854,52 @@ describe("termic new --base resolves or refuses (GH report, 1.3.2)", () => {
       try { gitIn(fixture, "branch -q -D e2e-remote-only"); } catch { /* gone */ }
       try { gitIn(fixture, "reset -q --hard " + head); } catch { /* fine */ }
     }
+  });
+});
+
+describe("termic new task parameters (GH #287)", () => {
+  let taskId = "";
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await waitForClisDetected();
+  });
+
+  after(async () => {
+    if (taskId) await archiveTask(taskId);
+  });
+
+  it("persists --arg/--model and passes them to the default agent", async () => {
+    const name = `cli-task-args-${Date.now()}`;
+    const cli = path.resolve("src-tauri/binaries/termic-cli-universal-apple-darwin");
+    const stdout = execFileSync(cli, [
+      "--no-launch", "--json", "new", name,
+      "--agent", "fakeagent", "--project", "fixture-repo", "--worktree", "--open",
+      "--arg=--reasoning-effort", "--arg=low", "--model", "worker",
+    ], {
+      cwd: path.resolve("."),
+      env: { ...process.env, TERMIC_DATA_DIR: dataDir },
+      encoding: "utf8",
+    });
+    const created = JSON.parse(stdout);
+    taskId = created.task.id;
+    expect(created.task.agent_args).toEqual([
+      "--reasoning-effort", "low", "--model", "worker",
+    ]);
+
+    const stored = JSON.parse(fs.readFileSync(path.join(dataDir, "tasks", `${taskId}.json`), "utf8"));
+    expect(stored.agent_args).toEqual(created.task.agent_args);
+
+    await browser.waitUntil(async () => {
+      const logs = await rpc({ cmd: "logs", task: taskId });
+      return logs.ok && String(logs.data?.data ?? "").includes(
+        "--reasoning-effort low --model worker",
+      );
+    }, {
+      timeout: 20_000,
+      interval: 250,
+      timeoutMsg: "the fake agent never received the task-specific argv",
+    });
   });
 });

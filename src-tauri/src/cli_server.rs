@@ -1071,6 +1071,7 @@ fn handle_new(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
         prompt,
         prompt_ref,
         agent,
+        agent_args,
         mode,
         base,
         from,
@@ -1273,6 +1274,7 @@ fn handle_new(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
     let params = serde_json::json!({
         "name": trimmed,
         "agent": agent,
+        "agentArgs": agent_args,
         "mode": mode,
         "base": base,
         "from": from,
@@ -3176,6 +3178,7 @@ fn summarize(
         name: task.name.clone(),
         project,
         agent: task.cli.clone(),
+        agent_args: task.agent_args.clone(),
         branch: task.branch.clone(),
         base_branch: task.base_branch.clone(),
         path: task.path.clone(),
@@ -5749,6 +5752,7 @@ mod tests {
             prompt: None,
             prompt_ref: None,
             agent: None,
+            agent_args: Vec::new(),
             mode: None,
             base: None,
             from: None,
@@ -5769,7 +5773,11 @@ mod tests {
         host.setup_chunks = vec!["npm install\n".into(), "done\n".into()];
         host.script_rpc("new_task", Ok(serde_json::json!({ "taskId": "nw1", "spawned": true })));
         let mut sink = VecSink::default();
-        let reply = handle_request(&req(new_cmd("shiny", Some("web")), Some("tok")), &host, &mut sink);
+        let mut cmd = new_cmd("shiny", Some("web"));
+        if let Command::New { agent_args, .. } = &mut cmd {
+            *agent_args = vec!["--effort".into(), "low".into(), "--model".into(), "worker".into()];
+        }
+        let reply = handle_request(&req(cmd, Some("tok")), &host, &mut sink);
         let Some(ReplyData::New(n)) = reply.data else { panic!("expected new, got {reply:?}") };
         assert_eq!(n.task.id, "nw1");
         assert_eq!(n.task.name, "shiny");
@@ -5785,6 +5793,10 @@ mod tests {
         assert_eq!(calls[0].0, "new_task");
         assert_eq!(calls[0].1["projectId"], "p1");
         assert_eq!(calls[0].1["name"], "shiny");
+        assert_eq!(
+            calls[0].1["agentArgs"],
+            serde_json::json!(["--effort", "low", "--model", "worker"]),
+        );
         assert!(calls[0].1["promptId"].is_null(), "no prompt, no prompt id");
     }
 

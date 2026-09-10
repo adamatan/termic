@@ -428,6 +428,10 @@ pub struct Task {
     pub base_branch: String, // e.g. "master"
     pub path: String,        // worktree absolute path
     pub cli: String,         // claude / gemini / codex
+    /// Ordered argv appended after the selected agent's Settings args.
+    /// This lets concurrently running tasks pin different launch options.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_args: Vec<String>,
     pub port: u16,
     pub created: String,
     pub archived: bool,
@@ -781,6 +785,9 @@ pub struct CreateTaskArgs {
     pub project_id: String,
     pub name: String,
     pub cli: Option<String>,
+    /// Task-owned argv appended after the selected agent's Settings args.
+    #[serde(default)]
+    pub agent_args: Option<Vec<String>>,
     pub base_branch: Option<String>,
     /// Explicit branch name. If omitted, defaults to `slugify(name)`.
     pub branch: Option<String>,
@@ -5469,12 +5476,14 @@ fn task_open_repo(
     docker_extra_mounts: Option<Vec<String>>,
     resume_session_id: Option<String>,
     resume_override: Option<String>,
+    agent_args: Option<Vec<String>>,
 ) -> Result<Task, String> {
     let proj = load_projects_all().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
     // CLI is now explicit — frontend's "+ Open repo with <agent>" passes the
     // chosen agent id. Falls back to project default for older call sites.
     let cli = cli.unwrap_or_else(|| proj.default_cli.clone());
+    let agent_args = agent_args.unwrap_or_default();
     let repo = PathBuf::from(&proj.root_path);
     // ALWAYS re-read current HEAD so a stale cached `branch` doesn't lie
     // (user may have `git checkout`'d a different branch outside termic
@@ -5658,6 +5667,7 @@ fn task_open_repo(
         base_branch: branch,
         path: proj.root_path.clone(),
         cli,
+        agent_args,
         port,
         created: chrono::Utc::now().to_rfc3339(),
         archived: false,
@@ -5792,6 +5802,7 @@ fn task_import_worktree(
     resume_session_id: Option<String>,
     resume_override: Option<String>,
     yolo: Option<bool>,
+    agent_args: Option<Vec<String>>,
 ) -> Result<Task, String> {
     let proj = load_projects_all().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
@@ -5830,6 +5841,7 @@ fn task_import_worktree(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     let cli = cli.unwrap_or_else(|| proj.default_cli.clone());
+    let agent_args = agent_args.unwrap_or_default();
     // Parse `.termic.yaml` once for this creation (extras + sandbox below).
     let repo_cfg = repo_config_for(&proj);
     let extra_names = effective_extra_named_ports_from(&repo_cfg, &proj);
@@ -5918,6 +5930,7 @@ fn task_import_worktree(
         base_branch: branch,
         path: wt_canon,
         cli,
+        agent_args,
         port,
         created: chrono::Utc::now().to_rfc3339(),
         archived: false,
@@ -6235,6 +6248,7 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
         allocate_task_ports(&load_tasks_all(), 0, &extra_names, current_port_range())?;
 
     let cli = args.cli.unwrap_or_else(|| proj.default_cli.clone());
+    let agent_args = args.agent_args.unwrap_or_default();
     // Only "custom" tasks carry a pre-set launch command; agent/shell tasks
     // resolve their command from the registry at spawn. Mirrors task_open_repo.
     let custom_command = if cli == "custom" {
@@ -6310,6 +6324,7 @@ fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String
         base_branch: base_full,
         path: wt_path.to_string_lossy().into_owned(),
         cli,
+        agent_args,
         port,
         created: chrono::Utc::now().to_rfc3339(),
         archived: false,
@@ -6372,6 +6387,9 @@ pub struct CreateMultiArgs {
     pub project_id: String,
     pub name: String,
     pub cli: Option<String>,
+    /// Task-owned argv appended after the selected agent's Settings args.
+    #[serde(default)]
+    pub agent_args: Option<Vec<String>>,
     /// Branch to create on the HOST repo (the multi-repo project's
     /// own repo, where CLAUDE.md / AGENTS.md / .claude/ live).
     pub branch: Option<String>,
@@ -6785,6 +6803,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         .unwrap_or_else(|| if docker_sandbox_enabled { globals.docker_default_extra_mounts.clone() } else { Vec::new() });
 
     let cli = args.cli.unwrap_or_else(|| host.default_cli.clone());
+    let agent_args = args.agent_args.unwrap_or_default();
     // Block base allocated above, before the members were created.
     let port = ws_port;
     emit_create_progress(&app, &task_id, "Worktrees ready, finishing setup…");
@@ -6803,6 +6822,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         base_branch,
         path: wrapper.to_string_lossy().into_owned(),
         cli,
+        agent_args,
         port,
         created: chrono::Utc::now().to_rfc3339(),
         archived: false,
@@ -7074,6 +7094,11 @@ fn task_set_cli(id: String, cli: String) -> Result<Task, String> {
     }
     let mut list = load_tasks_all();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
+    if w.cli != cli {
+        // These flags belong to the agent selected when the task was created.
+        // Do not feed one provider another provider's flags after a switch.
+        w.agent_args.clear();
+    }
     w.cli = cli;
     save_task(w).map_err(|e| e.to_string())?;
     Ok(w.clone())
@@ -19127,7 +19152,11 @@ fn docker_command_preview_sync(task_id: Option<String>, agent_id: Option<String>
     let preview_env = docker_env_for(&settings.agents, &agent_id, &agent.env);
     let agent_base = docker::base_agent_id(&settings.agents, &agent_id).to_string();
     let spec = docker::build_spec(&task, &agent_id, &image, &task.path, task.docker_extra_args.clone(), &preview_env, &agent_extra_dirs, agent_persist_enabled, &docker_allowed_paths, &task.docker_extra_mounts, PREVIEW_PTY_ID, &agent_base, &settings.docker_shared_config_dirs, None);
-    let argv = docker::render_argv(&spec, &agent.command, &agent.args);
+    let mut preview_args = agent.args.clone();
+    if task.cli == agent_id {
+        preview_args.extend(task.agent_args.clone());
+    }
+    let argv = docker::render_argv(&spec, &agent.command, &preview_args);
     Ok(DockerCommandPreview { spec, argv })
 }
 
@@ -27733,6 +27762,20 @@ filename f.rs
                        "created":"2026-01-01T00:00:00Z","archived":false}"#;
         let t: Task = serde_json::from_str(json).expect("legacy task file still parses");
         assert_eq!(t.order, None);
+        assert!(t.agent_args.is_empty());
+    }
+
+    #[test]
+    fn task_agent_args_round_trip_and_empty_args_stay_absent() {
+        let mut task = Task::default();
+        let empty = serde_json::to_value(&task).unwrap();
+        assert!(empty.get("agent_args").is_none());
+
+        task.agent_args = vec!["--reasoning-effort".into(), "low".into()];
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(value["agent_args"], serde_json::json!(["--reasoning-effort", "low"]));
+        let back: Task = serde_json::from_value(value).unwrap();
+        assert_eq!(back.agent_args, task.agent_args);
     }
 
     // ── Extra named ports (GH #196) ─────────────────────────────────

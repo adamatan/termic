@@ -275,6 +275,9 @@ export interface Task {
   base_branch: string;
   path: string;
   cli: string;
+  /** Additional argv pinned to this task's default agent. CLI-created tasks
+   *  use this for per-task model and reasoning overrides. */
+  agent_args?: string[];
   port: number;
   created: string;
   archived: boolean;
@@ -425,6 +428,7 @@ export interface CreateMultiArgs {
   project_id: string;
   name: string;
   cli?: string;
+  agent_args?: string[];
   branch?: string;
   base_branch?: string;
   members: CreateMultiMember[];
@@ -448,6 +452,8 @@ export interface CreateTaskArgs {
   project_id: string;
   name: string;
   cli?: string;
+  /** Additional argv pinned to this task's default agent. */
+  agent_args?: string[];
   base_branch?: string | null;
   branch?: string | null;
   /** Pre-generated task UUID. Pass this if you want to subscribe to

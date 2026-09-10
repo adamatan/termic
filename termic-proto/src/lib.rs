@@ -60,7 +60,11 @@ use std::io::{self, BufRead, Read, Write};
 /// handing its `termic://` deep link to the instance that already owns
 /// the data dir before exiting. termic-cli never sends it, so the bump
 /// is pure bookkeeping for the shared wire shape.
-pub const PROTOCOL_VERSION: u32 = 11;
+///
+/// v12 (GH #287): `new` gains per-task agent arguments. They are persisted
+/// on the task and included in task summaries so callers can verify the
+/// launch they requested.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// serde default for `QuitData::running`.
 pub(crate) fn default_true() -> bool { true }
@@ -243,6 +247,11 @@ pub enum Command {
         prompt_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
+        /// Additional argv elements pinned to the task's default agent.
+        /// The CLI has already expanded `--model` into the final ordered
+        /// vector by the time this crosses the wire.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        agent_args: Vec<String>,
         /// "worktree" | "main". Absent = the GUI's remembered mode.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
@@ -927,6 +936,9 @@ pub struct TaskSummary {
     pub project: String,
     /// Agent CLI id (claude / gemini / codex / custom id).
     pub agent: String,
+    /// Task-owned argv appended after the agent's configured defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_args: Vec<String>,
     pub branch: String,
     pub base_branch: String,
     /// Worktree absolute path (the shared checkout for main-checkout tasks).
@@ -1521,6 +1533,7 @@ mod tests {
                 prompt: Some("fix the login redirect".into()),
                 prompt_ref: Some("builtin:review".into()),
                 agent: Some("claude".into()),
+                agent_args: vec!["--effort".into(), "high".into(), "--model".into(), "opus".into()],
                 mode: Some("worktree".into()),
                 base: Some("develop".into()),
                 from: None,
@@ -1538,6 +1551,7 @@ mod tests {
                 prompt: None,
                 prompt_ref: None,
                 agent: None,
+                agent_args: Vec::new(),
                 mode: None,
                 base: None,
                 from: None,
@@ -1556,6 +1570,7 @@ mod tests {
                 prompt: None,
                 prompt_ref: None,
                 agent: Some("claude".into()),
+                agent_args: Vec::new(),
                 mode: None,
                 base: None,
                 from: Some("/tasks/web/poll-linear".into()),
@@ -1721,6 +1736,7 @@ mod tests {
             name: "fix-auth".into(),
             project: "web".into(),
             agent: "claude".into(),
+            agent_args: vec!["--model".into(), "worker".into()],
             branch: "fix-auth".into(),
             base_branch: "main".into(),
             path: "/Users/x/termic/tasks/web/fix-auth".into(),
