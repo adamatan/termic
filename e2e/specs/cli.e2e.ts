@@ -16,10 +16,10 @@
 // webview RPCs.
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync, execSync } from "node:child_process";
+import { execSync } from "node:child_process";
 import os from "node:os";
 import { dataDir } from "../../wdio.conf.js";
-import { archiveTask, cliRpc as rpc, openTask, requireTermicApi, waitForAppShell, waitForClisDetected } from "../helpers.js";
+import { archiveTask, cliRpc as rpc, openTask, requireTermicApi, runCli, waitForAppShell, waitForClisDetected } from "../helpers.js";
 
 /**
  * Poll a tab's live PTY (spawn is async), through BOTH sides that have to
@@ -872,16 +872,17 @@ describe("termic new task parameters (GH #287)", () => {
 
   it("persists --arg/--model and passes them to the default agent", async () => {
     const name = `cli-task-args-${Date.now()}`;
-    const cli = path.resolve("src-tauri/binaries/termic-cli-universal-apple-darwin");
-    const stdout = execFileSync(cli, [
+    // `runCli` resolves the sidecar this machine actually built (the universal
+    // one only exists when both macOS rustup targets are installed) and
+    // reports a failure in plain text. Spawning it directly threw Node's own
+    // error, whose self-referencing `error` property made wdio's serializer
+    // die with "Converting circular structure to JSON" - so the real reason,
+    // a binary that was never staged under that name, never reached the log.
+    const stdout = runCli([
       "--no-launch", "--json", "new", name,
       "--agent", "fakeagent", "--project", "fixture-repo", "--worktree", "--open",
       "--arg=--reasoning-effort", "--arg=low", "--model", "worker",
-    ], {
-      cwd: path.resolve("."),
-      env: { ...process.env, TERMIC_DATA_DIR: dataDir },
-      encoding: "utf8",
-    });
+    ], { TERMIC_DATA_DIR: dataDir });
     const created = JSON.parse(stdout);
     taskId = created.task.id;
     expect(created.task.agent_args).toEqual([

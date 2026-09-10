@@ -2,6 +2,7 @@
 // declarative by using these; when the UI changes, fix the flow in ONE place.
 // See the `e2e` skill for the full authoring guide.
 
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -1093,6 +1094,66 @@ export function cliRpc(cmd: Record<string, unknown>): Promise<any> {
       reject(e);
     });
   });
+}
+
+/** The staged `termic-cli` sidecar built for THIS machine.
+ *
+ *  `scripts/build-cli.mjs` only lipos `termic-cli-universal-apple-darwin` when
+ *  BOTH macOS rustup targets are installed; with one it stages the host arch
+ *  alone and prints a note saying so. A spec that hardcodes the universal name
+ *  therefore runs only on a machine that happens to have both targets and
+ *  fails identically everywhere else, CI included.
+ *
+ *  Prefers the universal binary when it exists (that is what a release ships),
+ *  falls back to the host arch, and names what it DID find when neither is
+ *  there - "ENOENT" on a path nobody printed is a long way from "run
+ *  `npm run build:cli`". */
+export function cliBinary(): string {
+  const dir = path.resolve("src-tauri/binaries");
+  const triple = process.platform === "darwin"
+    ? (process.arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin")
+    : (process.arch === "arm64" ? "aarch64-unknown-linux-gnu" : "x86_64-unknown-linux-gnu");
+  const candidates = process.platform === "darwin"
+    ? [`termic-cli-universal-apple-darwin`, `termic-cli-${triple}`]
+    : [`termic-cli-${triple}`];
+  for (const name of candidates) {
+    const full = path.join(dir, name);
+    if (fs.existsSync(full)) return full;
+  }
+  const found = fs.existsSync(dir)
+    ? fs.readdirSync(dir).filter(f => f.startsWith("termic-cli-")).join(", ") || "nothing"
+    : "no binaries directory at all";
+  throw new Error(
+    `no termic-cli sidecar for this machine in ${dir}. Looked for ` +
+    `${candidates.join(" then ")}; found ${found}. Run \`npm run build:cli\`.`);
+}
+
+/** Run the sidecar and return its stdout.
+ *
+ *  Never let `execFileSync` throw its own error through. Node attaches a
+ *  self-referencing `error` property to it, so wdio's `JSON.stringify` of the
+ *  thrown value dies with "Converting circular structure to JSON" and the
+ *  actual reason - a missing binary, a non-zero exit, whatever the CLI wrote
+ *  to stderr - never reaches the log. That masked this exact bug through a
+ *  full CI run and a local one. */
+export function runCli(args: string[], env: Record<string, string>): string {
+  try {
+    return execFileSync(cliBinary(), args, {
+      cwd: path.resolve("."),
+      env: { ...process.env, ...env },
+      encoding: "utf8",
+    });
+  } catch (e: any) {
+    const parts = [
+      `termic-cli ${args.join(" ")} failed`,
+      e?.status != null ? `exit ${e.status}` : null,
+      e?.stderr ? `stderr: ${String(e.stderr).trim()}` : null,
+      e?.stdout ? `stdout: ${String(e.stdout).trim()}` : null,
+      e?.message ? `message: ${e.message}` : null,
+    ].filter(Boolean);
+    // A PLAIN Error: the one Node threw carries a circular `error` property.
+    throw new Error(parts.join(" | "));
+  }
 }
 
 /** Assert `window.__termic` is present (i.e. the e2e build exposed state). */
