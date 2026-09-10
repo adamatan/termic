@@ -107,7 +107,7 @@ function tooltipFor(
  * @param language  reads the registry's name for this buffer ("Python",
  *   "Makefile") AT CLICK TIME, so a hand-picked syntax is honoured.
  */
-export function navHint(taskId: string, language: () => string): Extension {
+export function navHint(taskId: string, language: () => string, path?: string): Extension {
   // The click handler needs the field declared beside it; a box breaks the
   // cycle without hoisting either out of this factory, so each editor still
   // gets its own pair.
@@ -141,7 +141,7 @@ export function navHint(taskId: string, language: () => string): Extension {
         // "No code navigation for Plain Text" while the real extension would
         // have served Python.
         const lang = language();
-        const server = lspServerFor(lang);
+        const server = lspServerFor(lang, path);
         const app = useApp.getState();
         const task = app.tasks.find(t => t.id === taskId);
         const project = task ? app.projects.find(p => p.id === task.project_id) : undefined;

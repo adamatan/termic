@@ -70,7 +70,7 @@ export function SearchEverywhereDialog() {
     return s.tabs[taskId]?.find(t => t.id === tabId) || null;
   });
   const activeLspServerId = activeTab?.type === "edit" || activeTab?.type === "external"
-    ? lspServerFor(effectiveLanguageId(activeTab))
+    ? lspServerFor(effectiveLanguageId(activeTab), activeTab.path)
     : null;
 
   const [query, setQuery] = useState("");

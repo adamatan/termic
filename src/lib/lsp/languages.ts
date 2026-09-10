@@ -54,6 +54,8 @@ const SERVER_BY_LSP_ID: Record<string, string> = {
   "objective-cpp": "cpp",
   swift: "swift",
   ruby: "ruby",
+  terraform: "terraform",
+  "terraform-vars": "terraform",
 };
 
 /** Every server id, which is also every language code intelligence can serve.
@@ -63,16 +65,23 @@ const SERVER_BY_LSP_ID: Record<string, string> = {
 export const SERVERS: readonly string[] = [...new Set(Object.values(SERVER_BY_LSP_ID))];
 
 /** The LSP `languageId` for a CodeMirror registry name. */
-export function lspLanguageId(registryName: string | null | undefined): string | null {
+export function lspLanguageId(registryName: string | null | undefined, path?: string): string | null {
   if (!registryName) return null;
+  // The highlighting grammar is shared with other HCL tools, but terraform-ls
+  // accepts neither their .hcl files nor Terraform's JSON variants.
+  if (registryName === "HCL") {
+    if (/\.tf$/i.test(path ?? "")) return "terraform";
+    if (/\.tfvars$/i.test(path ?? "")) return "terraform-vars";
+    return null;
+  }
   return LSP_ID_BY_NAME[registryName] ?? registryName.toLowerCase();
 }
 
 /** Which server would serve this buffer, by the name the Rust host knows it
  *  by. Null means "no navigation for this language", which the UI must show
  *  as an absence rather than as a broken toggle. */
-export function lspServerFor(registryName: string | null | undefined): string | null {
-  const id = lspLanguageId(registryName);
+export function lspServerFor(registryName: string | null | undefined, path?: string): string | null {
+  const id = lspLanguageId(registryName, path);
   return id ? SERVER_BY_LSP_ID[id] ?? null : null;
 }
 
@@ -91,6 +100,7 @@ const LANGUAGE_NAME: Record<string, string> = {
   cpp: "C and C++",
   swift: "Swift",
   ruby: "Ruby",
+  terraform: "Terraform",
 };
 
 export function languageName(server: string): string {

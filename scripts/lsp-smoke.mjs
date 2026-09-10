@@ -88,12 +88,27 @@ function resolveServer(lang, root) {
       const exe = local("bin/ruby-lsp") ?? local(".bundle/bin/ruby-lsp") ?? onPath("ruby-lsp");
       return exe ? [exe, []] : null;
     }
+    case "terraform": {
+      const exe = local("bin/terraform-ls") ?? onPath("terraform-ls")
+        ?? installed("terraform/0.39.0/terraform-ls");
+      return exe ? [exe, ["serve"]] : null;
+    }
     default: return null;
   }
 }
 
 /** What each language's fixture looks like, and what a correct answer is. */
 const CASES = {
+  terraform: {
+    root: path.join(projects, "terraform"),
+    languageId: "terraform",
+    use: { file: "outputs.tf", line: 2, col: 15, name: "Store" },
+    definedIn: "variables.tf",
+    broken: "broken.tf",
+    undefinedName: "this_name_does_not_exist",
+    symbolQuery: "Store",
+    symbolName: 'variable "Store"',
+  },
   typescript: {
     root: path.join(projects, "typescript"),
     languageId: "typescript",
@@ -374,7 +389,7 @@ async function runLanguage(lang, cfg) {
     ]);
     list = Array.isArray(symbols) ? symbols : [];
     defining = list.find(s =>
-      s.name === cfg.symbolQuery && (s.location?.uri ?? "").endsWith(cfg.definedIn));
+      s.name === (cfg.symbolName ?? cfg.symbolQuery) && (s.location?.uri ?? "").endsWith(cfg.definedIn));
     if (defining || Date.now() > symbolDeadline) break;
     await wait(1_000);
   }
@@ -384,9 +399,10 @@ async function runLanguage(lang, cfg) {
     const out = {
       server: path.basename(exe), language: lang, query: cfg.symbolQuery,
       // Recorded so the offline test can assert the RIGHT answer ranks first
-      // rather than a filename pattern that happens to hold for six of the
-      // seven fixtures (`src/lib.rs` is where Rust puts it).
+      // rather than a filename pattern that happens to hold for most of the
+      // fixtures (`src/lib.rs` is where Rust puts it).
       definedIn: cfg.definedIn,
+      ...(cfg.symbolName ? { symbolName: cfg.symbolName } : {}),
       symbols: list.map(s => ({
         name: s.name, kind: s.kind,
         file: (s.location?.uri ?? "").replace(uriFor(cfg.root) + "/", ""),
@@ -421,6 +437,8 @@ async function runLanguage(lang, cfg) {
     }
   }
 
+  const rss = spawnSync("ps", ["-o", "rss=", "-p", String(conn.child.pid)], { encoding: "utf8" });
+  if (rss.status === 0) check("memory", true, `${Math.ceil(Number(rss.stdout.trim()) / 1024)} MB RSS`);
   conn.child.kill("SIGKILL");
   return { lang, server: path.basename(exe), results };
 }

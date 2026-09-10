@@ -131,6 +131,85 @@ async function openSettled(
   );
 }
 
+describe("Terraform code intelligence", () => {
+  let taskId = "";
+  let root = "";
+  const files = ["tf-nav.tf", "tf-nav.auto.tfvars", "tf-nav.hcl", "tf-nav.tf.json"];
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = await openTask("lsp-terraform");
+    root = await taskPath(taskId);
+    mkdirSync(path.join(root, "bin"), { recursive: true });
+    copyFileSync(fakeServer, path.join(root, "bin/terraform-ls"));
+    chmodSync(path.join(root, "bin/terraform-ls"), 0o755);
+    writeFileSync(path.join(root, files[0]), 'variable "Store" {\n  default = "demo"\n}\n');
+    writeFileSync(path.join(root, files[1]), 'Store = "demo"\n');
+    writeFileSync(path.join(root, files[2]), 'locals {\n  store = "demo"\n}\n');
+    writeFileSync(path.join(root, files[3]), '{"variable":{"Store":{"default":"demo"}}}\n');
+    rmSync(path.join(root, ".fake-lsp.json"), { force: true });
+    await clearGrants();
+    await setCodeNavPref(true);
+    await setTypeChecking(true);
+    await browser.execute(() => window.__termic!.usePrefs.getState().setConfirmBeforeCodeIntel(false));
+  });
+
+  after(async () => {
+    await clearGrants();
+    if (root) {
+      await browser.execute(async (r) => {
+        const t = window.__termic!;
+        const servers = await t.invoke("lsp_list") as Array<{ id: string; root: string; language: string }>;
+        for (const s of servers.filter(s => s.root === r && s.language === "terraform"))
+          await t.invoke("lsp_stop", { id: s.id });
+      }, root);
+      for (const rel of [...files, "bin/terraform-ls", ".fake-lsp.json"])
+        rmSync(path.join(root, rel), { force: true });
+    }
+    await setTypeChecking(false);
+    await browser.execute(() => window.__termic!.usePrefs.getState().setConfirmBeforeCodeIntel(true));
+    if (taskId) await archiveTask(taskId);
+  });
+
+  it("offers Terraform navigation without starting the server", async () => {
+    await openSettled(taskId, files[0], "HCL");
+    await waitVisible('[data-testid="code-intel-chip"]');
+    expect(existsSync(path.join(root, ".fake-lsp.json"))).toBe(false);
+    const catalog = await browser.execute(async () => await window.__termic!.invoke("lsp_catalog")) as
+      Array<{ language: string; servers: Array<{ name: string }> }>;
+    expect(catalog.find(c => c.language === "terraform")?.servers[0].name).toBe("terraform-ls");
+  });
+
+  it("serves .tf and .tfvars through one grant with their own protocol ids", async () => {
+    await chipAction("code-intel-turn-on-for-this-task");
+    await waitVisible(`[data-task-id="${taskId}"] .cm-lintRange-error`);
+    expect(await isArmed(root, "terraform")).toBe(true);
+    await openSettled(taskId, files[1], "HCL");
+    await waitVisible(`[data-task-id="${taskId}"] .cm-lintRange-error`);
+    const seen = JSON.parse(readFileSync(path.join(root, ".fake-lsp.json"), "utf8"));
+    expect(seen.opened).toEqual(expect.arrayContaining([
+      expect.objectContaining({ uri: expect.stringContaining(files[0]), languageId: "terraform" }),
+      expect.objectContaining({ uri: expect.stringContaining(files[1]), languageId: "terraform-vars" }),
+    ]));
+    const count = await browser.execute(async (r) => {
+      const servers = await window.__termic!.invoke("lsp_list") as Array<{ root: string; language: string }>;
+      return servers.filter(s => s.root === r && s.language === "terraform").length;
+    }, root);
+    expect(count).toBe(1);
+    await snap("terraform-code-intelligence.png");
+  });
+
+  it("does not send unrelated HCL or JSON to the Terraform server", async () => {
+    for (const [file, language] of [[files[2], "HCL"], [files[3], "JSON"]]) {
+      await openSettled(taskId, file, language);
+      await waitGone('[data-testid="code-intel-chip"]');
+      const seen = JSON.parse(readFileSync(path.join(root, ".fake-lsp.json"), "utf8"));
+      expect(seen.opened.some((d: { uri: string }) => d.uri.endsWith(file))).toBe(false);
+    }
+  });
+});
+
 describe("code intelligence", () => {
   let taskId = "";
   let root = "";

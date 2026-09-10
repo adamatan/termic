@@ -33,6 +33,8 @@ interface Fixture {
   /** Where the query's definition lives, per the smoke harness. Only the
    *  `smoke-*` recordings carry it; the hand-captured ones predate it. */
   definedIn?: string;
+  /** Terraform answers with the block label, e.g. `variable "Store"`. */
+  symbolName?: string;
 }
 
 // The label map is IMPORTED, not copied. A second table here is how kinds 22
@@ -196,7 +198,7 @@ describe("nothing reaches the list that the query cannot explain", () => {
 // server on a fixture project small enough to reason about. These are thinner
 // than the captures above (a two-file project answers with a handful of
 // symbols, not ninety-five), and they are here for BREADTH rather than depth:
-// seven servers now feed this pipeline, each with its own idea of what a
+// eight servers now feed this pipeline, each with its own idea of what a
 // workspace symbol is, and the invariant a reader depends on is the same for
 // all of them.
 describe("every server termic ships, over its recorded answer", () => {
@@ -204,10 +206,10 @@ describe("every server termic ships, over its recorded answer", () => {
     .filter(f => f.startsWith("symbols.smoke-"))
     .map(f => f.replace(/^symbols\.|\.json$/g, ""));
 
-  it("has a recording for each of the seven languages", () => {
+  it("has a recording for each of the eight languages", () => {
     // A missing one means somebody added a language and never ran the smoke
     // harness against it, which is exactly the gap this file exists to close.
-    expect(names.length).toBe(7);
+    expect(names.length).toBe(8);
   });
 
   for (const name of names) {
@@ -218,7 +220,7 @@ describe("every server termic ships, over its recorded answer", () => {
       // (or the language's equivalent) against a project where exactly one
       // definition of it exists, so anything else in first place is the
       // ranking preferring a use, an import binding, or a longer name.
-      expect(out[0].name).toBe(fx.query);
+      expect(out[0].name).toBe(fx.symbolName ?? fx.query);
       // And it is the DEFINITION: the file the smoke harness proved
       // go-to-definition lands in, recorded alongside the answer.
       expect(out[0].file).toBe(fx.definedIn);

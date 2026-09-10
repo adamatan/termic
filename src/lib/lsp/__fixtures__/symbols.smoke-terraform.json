@@ -1,0 +1,15 @@
+{
+ "server": "terraform-ls",
+ "language": "terraform",
+ "query": "Store",
+ "definedIn": "variables.tf",
+ "symbolName": "variable \"Store\"",
+ "symbols": [
+  {
+   "name": "variable \"Store\"",
+   "kind": 5,
+   "file": "variables.tf",
+   "line": 1
+  }
+ ]
+}
