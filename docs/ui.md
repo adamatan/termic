@@ -505,9 +505,9 @@ Four things race to set one editor's language: the initial load, a path change o
 
 ### What termic still owns
 
-Five grammars, because the registry cannot serve them, and a short **overlay** of filename rules, because it does not match the way we need:
+Six grammars, because the registry cannot serve them, and a short **overlay** of filename rules, because it does not match the way we need:
 
-- **Custom grammars**: `Makefile` (hand-written, `lib/makeMode.ts` — `legacy-modes` has ~150 CodeMirror 5 modes and Makefile is not among them; the rule that makes it a Makefile rather than a config file is that a leading TAB opens a recipe, where the line is shell instead of make, and a trailing backslash keeps that state across lines), `ProtoBuf` (`lib/protoMode.ts`; the registry's mode predates proto3, and ours takes the same NAME so it replaces rather than shadows it), `Elixir` (absent upstream), `Svelte` (`@replit/codemirror-lang-svelte`) and `Astro` (`lib/astroMode.ts`, below).
+- **Custom grammars**: `Makefile` (hand-written, `lib/makeMode.ts` — `legacy-modes` has ~150 CodeMirror 5 modes and Makefile is not among them; the rule that makes it a Makefile rather than a config file is that a leading TAB opens a recipe, where the line is shell instead of make, and a trailing backslash keeps that state across lines), `ProtoBuf` (`lib/protoMode.ts`; the registry's mode predates proto3, and ours takes the same NAME so it replaces rather than shadows it), `Elixir` (absent upstream), `Svelte` (`@replit/codemirror-lang-svelte`), `Astro` (`lib/astroMode.ts`, below) and `HCL` (`lib/hclMode.ts`, below).
 - **Overlay rules** (`OVERLAY_RULES`), each reusing the registry entry's own loader: `Dockerfile.dev` (upstream's pattern is anchored `/^Dockerfile$/`), `justfile`, `.env.production`, `.zsh`/`.fish`, `.conf`, `.rake`, `.pyi`, `.mdx`, and the template formats with no grammar anywhere (`.ejs`, `.mustache`, `.twig`, `.njk`) which get tag highlighting from HTML.
 
 **Frameworks.** React and Vue need nothing from us: the registry's JSX / TSX entries cover React, and its Vue entry loads `@codemirror/lang-vue`, a real single-file-component grammar. Svelte and Astro were on the HTML overlay until they read the tags and left every line of actual code grey, which on an `.astro` file means its entire frontmatter block.
@@ -521,6 +521,15 @@ Five grammars, because the registry cannot serve them, and a short **overlay** o
 Template `{expressions}` are attribute values and text, not JavaScript. That is the same trade every HTML-hosted format makes, and it is where a real Astro grammar would start.
 
 Two upstream behaviours to know about. `LanguageDescription.matchFilename` compares the **raw** extension, so `README.MD` matches nothing — `matchLanguage` in `lib/languageExts.ts` does its own two-pass match with the extension lower-cased, and must not be swapped back. And the registry splits JSX/TSX out of JavaScript/TypeScript, so a `.tsx` file's button reads "TSX". `.gradle.kts` is Kotlin, not Groovy, which upstream already gets right.
+
+**HCL.** The registry has no HCL entry. `CUSTOM` lazy-loads
+`codemirror-lang-hcl` for `.tf`, `.tfvars` (including `.auto.tfvars`) and
+`.hcl`, shared by the editor and diff viewer. The syntax picker calls it HCL
+and also matches Terraform; `.tf.json` and `.tfvars.json` stay on JSON.
+`lib/hclMode.ts` preserves the semantic tags and adds keyword/string
+fallbacks for block types, labels and boolean/null literals, which Atom One
+otherwise leaves uncoloured. Highlighting does not format files or start a
+language server.
 
 ## Code intelligence (language servers, GH #174)
 

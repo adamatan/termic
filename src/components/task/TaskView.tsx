@@ -192,7 +192,7 @@ function EditorBreadcrumb({ task }: { task: Task }) {
             the app-wide pref offers it and something can answer for this
             language (GH #174). */}
         {tab.type === "edit" && (
-          <CodeIntelChip task={task} registryName={effectiveLanguageId(tab)} />
+          <CodeIntelChip task={task} registryName={effectiveLanguageId(tab)} path={tab.path} />
         )}
         {tab.type === "edit" && (
           <button

@@ -66,6 +66,16 @@ export interface ServerGuide {
  * completely different for each. `serverGuide` resolves the key from the path.
  */
 const GUIDES: Record<string, ServerGuide> = {
+  "terraform-ls": {
+    name: "terraform-ls",
+    summary: "HashiCorp's Terraform server. Settings go through initializationOptions; it indexes .tf and .tfvars files, not arbitrary HCL or JSON configurations.",
+    configFiles: [],
+    env: [],
+    excludes: "`indexing.ignorePaths` and `indexing.ignoreDirectoryNames` in the Advanced JSON block.",
+    docs: "https://github.com/hashicorp/terraform-ls/blob/main/docs/SETTINGS.md",
+    rawChannel: "init",
+    rawExample: `{\n  "indexing": {\n    "ignoreDirectoryNames": ["vendor"]\n  }\n}`,
+  },
   zuban: {
     name: "zuban",
     summary:

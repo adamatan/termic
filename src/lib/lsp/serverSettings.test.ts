@@ -41,6 +41,13 @@ describe("which server, and how it is configured", () => {
 });
 
 describe("forwarding a raw block", () => {
+  it("sends Terraform settings as initialization options", () => {
+    const raw = { indexing: { ignoreDirectoryNames: ["vendor"] } };
+    expect(serverGuide("/repo/bin/terraform-ls")?.name).toBe("terraform-ls");
+    expect(resolveServerSettings("/repo/bin/terraform-ls", raw))
+      .toEqual({ initializationOptions: raw, settings: {} });
+  });
+
   it("sends it where that server actually reads it", () => {
     // rust-analyzer takes its configuration at initialize; gopls only ever
     // pulls it. Down the wrong channel it is accepted and ignored, which is

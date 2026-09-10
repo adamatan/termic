@@ -35,6 +35,13 @@ src/components/settings/CodeIntelSettings.tsx   how a user configures a server
 
    The rule the two cases share: say which it is, in the row, and never install
    anything the user did not ask for.
+
+   `terraform-ls` uses [HashiCorp ZIPs](https://releases.hashicorp.com/terraform-ls/),
+   not GitHub assets. Its `LspInstall` entry has an empty `repo`, so the
+   version and SHA-256 stay pinned and update checks have no known latest
+   version. ZIP extraction reuses the locked `zip` and `flate2` versions,
+   copying only the named executable and `LICENSE.txt` as regular files
+   after checksum verification.
 3. Add it to `lsp_catalog` too. That command is what Settings lists, and it is
    a SECOND copy of the resolution order in `lsp_resolve_server`: the one thing
    in this subsystem that can silently drift. A server missing from it is a
@@ -69,10 +76,18 @@ src/components/settings/CodeIntelSettings.tsx   how a user configures a server
 | C, C++, Objective-C | clangd | PATH. **Already on every Mac** with the Command Line Tools; `apt install clangd` on Linux, where the binary is versioned (`clangd-18`) so resolution tries those too |
 | Swift | sourcekit-lsp | PATH. Ships with the Command Line Tools on macOS and the Swift toolchain on Linux |
 | Ruby | ruby-lsp | the project's `bin/ruby-lsp` binstub first, then PATH |
+| Terraform (`.tf`, `.tfvars`) | terraform-ls | project's `bin/terraform-ls`, PATH, then termic's pinned download |
 
-The last three cost nothing to install on macOS and are one package on Linux,
-which is why they are PATH-only rather than downloads: an `LspInstall` entry
-that duplicates a binary the machine already has is a liability, not a feature.
+C/C++, Swift and Ruby cost nothing to install on macOS and are one package on
+Linux, which is why they are PATH-only rather than downloads: an `LspInstall`
+entry that duplicates a binary the machine already has is a liability, not a
+feature.
+
+Terraform uses protocol IDs `terraform` for `.tf` and `terraform-vars` for
+`.tfvars`, with one checkout grant for both. The mapping must check the file
+path: generic `.hcl` and Terraform JSON files are not served just because
+they share highlighting. Detection uses `.tf`, `.tfvars` and
+`.terraform.lock.hcl`, not arbitrary HCL files.
 
 Each was proved end to end against the real server before shipping, on a
 fixture in `e2e/fixtures/lsp-projects/<language>`: see "Proving it against real
@@ -134,7 +149,7 @@ repo can read.
 
 ### 6. A settings block sent down the wrong channel is accepted and ignored
 
-rust-analyzer and zuban read their configuration from
+rust-analyzer, zuban and terraform-ls read their configuration from
 `initializationOptions`; gopls and ty only ever pull it via
 `workspace/configuration`. There is no error either way, which makes this the
 most expensive kind of wrong. `ServerGuide.rawChannel` records which, and
@@ -226,9 +241,10 @@ through a dynamic `await import("@/lib/lsp/host")`.
 ### 14. Whatever starts a server discloses what it costs, or is capped
 
 rust-analyzer holds ~3 GB on this repo's own `src-tauri`; gopls has been
-measured at 6.8 GB; zuban at 86 MB on a Django project. "May use significant
-memory" is not consent. The figure is quoted before the first arm, once, with
-a don't-ask-again.
+measured at 6.8 GB; zuban at 86 MB on a Django project; terraform-ls 0.39.0 at
+27 MB on the provider-free fixture (the UI says about 30 MB, not a ceiling).
+"May use significant memory" is not consent. The figure is quoted before the
+first arm, once, with a don't-ask-again.
 
 The path that does NOT ask is `autoStart`, because a standing instruction is
 consent already given. That is why it is capped (`AUTO_START_CAP`): four
@@ -414,7 +430,7 @@ group of every registered server.
 
 ### 18. A server that writes into the checkout has to say so before it starts
 
-Three of the seven do, and none of it is in the protocol:
+Three of the supported language families do, and none of it is in the protocol:
 
 - **clangd** writes its background index to `<checkout>/.cache/clangd`. Without
   `--background-index` it answers find-usages from the open translation unit
@@ -508,7 +524,7 @@ The plan this file replaced (`docs/plans/lsp.md`, deleted when the work
 shipped) listed four things that are still absent. Three are choices rather
 than gaps:
 
-- **A registry for a language termic does not serve.** Adding an eighth
+- **A registry for a language termic does not serve.** Adding another
   language (Elixir, PHP, Java, Zig) means a new slot: extensions, an LSP
   `languageId`, project-detection markers, a display name, a memory figure and
   a catalog row. Parked on purpose. Nobody has asked, detection is something we
@@ -524,7 +540,7 @@ than gaps:
   a problem the first one has not yet been observed to miss.
 
 What IS covered instead: a custom command per language (rule 16b), which runs
-any binary the reader names for one of the seven languages. That is the
+any binary the reader names for a supported language. That is the
 difference between "I want pylsp" (supported) and "I write Elixir" (not).
 
 ## Proving it against real servers
@@ -559,8 +575,9 @@ Two things the harness has to do that a reader would not guess:
   about as committed: clangd needs a `compile_commands.json` whose every path
   is absolute (generated, never committed), and sourcekit-lsp needs the package
   built once. Both are the first-run cost a real user pays too.
-
-All seven languages pass here as of the run that added the last three.
+  Terraform's fixture is provider-free; resource-aware answers in a real
+  project depend on its schemas. The integration does not run
+  `terraform init`, enable `validateOnSave`, or add a formatter.
 
 `--record` writes the raw `workspace/symbol` answers into
 `src/lib/lsp/__fixtures__/`, which `symbolSearch.realservers.test.ts` ranks in

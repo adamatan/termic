@@ -14050,7 +14050,7 @@ struct LspInstall {
     label: &'static str,
     /// The upstream repo, hardcoded. `latest` is resolved WITHIN it, never
     /// across it: the host and the project are decided by this build, only the
-    /// version is not.
+    /// version is not. Empty for a pinned-only release hosted outside GitHub.
     repo: &'static str,
     /// The asset name for this platform in that repo's releases. Upstream
     /// keeps these stable across releases; when one changes, the install fails
@@ -14063,7 +14063,7 @@ struct LspInstall {
     sha256: &'static str,
     /// Roughly what the user is about to download, for the same offer.
     bytes: u64,
-    /// `gz` = one gzipped binary; `tar.gz` = an archive to unpack.
+    /// `gz` = one gzipped binary; `tar.gz` / `zip` = an archive to unpack.
     archive: &'static str,
     /// Path of the executable inside the unpacked directory. Empty for `gz`,
     /// which lands as the binary itself.
@@ -14099,6 +14099,36 @@ fn lsp_install_spec(language: &str) -> Option<LspInstall> {
     let arch = std::env::consts::ARCH;
     let key = (language, os, arch);
     Some(match key {
+        // HashiCorp hosts ZIPs and checksums on releases.hashicorp.com, not
+        // GitHub release assets. Use the tested pin, never infer a new digest.
+        ("terraform", "macos", "aarch64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0", repo: "",
+            asset: "terraform-ls_0.39.0_darwin_arm64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_darwin_arm64.zip",
+            sha256: "6f80fe0b34af184175508f3d9135d8159f5dce4000d9b39540553eb1c267c54b",
+            bytes: 30_705_654, archive: "zip", exe_in_archive: "terraform-ls", args: &["serve"],
+        },
+        ("terraform", "macos", "x86_64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0", repo: "",
+            asset: "terraform-ls_0.39.0_darwin_amd64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_darwin_amd64.zip",
+            sha256: "cc5bbc5b5a39d12d455c0d2b1e4b3a2c1f237d02d2cf819cf5252358f2d674de",
+            bytes: 31_418_012, archive: "zip", exe_in_archive: "terraform-ls", args: &["serve"],
+        },
+        ("terraform", "linux", "aarch64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0", repo: "",
+            asset: "terraform-ls_0.39.0_linux_arm64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_linux_arm64.zip",
+            sha256: "62f32ea22cb78e5e5667ed638ad6e0fbde30ab59228d073c3c9bb249f89c7f5a",
+            bytes: 30_305_656, archive: "zip", exe_in_archive: "terraform-ls", args: &["serve"],
+        },
+        ("terraform", "linux", "x86_64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0", repo: "",
+            asset: "terraform-ls_0.39.0_linux_amd64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_linux_amd64.zip",
+            sha256: "7750edc736845fd8c04ff0fc6332423c12d8275b358668c8c17e8aedc43ef971",
+            bytes: 31_026_533, archive: "zip", exe_in_archive: "terraform-ls", args: &["serve"],
+        },
         // TypeScript 7 is a native Go binary: full TS/TSX navigation with no
         // Node runtime. NOT one file — the executable needs its ~26 MB of
         // sibling `lib.*.d.ts`, and shipping only the binary makes LSP mode
@@ -14228,6 +14258,7 @@ async fn lsp_resolve_asset(spec: &LspInstall) -> ResolvedAsset {
         sha256: spec.sha256.to_string(),
         pinned: true,
     };
+    if spec.repo.is_empty() { return fallback(); }
     let api = format!("https://api.github.com/repos/{}/releases/latest", spec.repo);
     let Ok(client) = reqwest::Client::builder()
         // GitHub rejects an API request with no User-Agent.
@@ -14621,6 +14652,9 @@ fn lsp_resolve_server(root: &Path, language: &str) -> Option<(String, Vec<String
             .or_else(|| local(".bundle/bin/ruby-lsp"))
             .or_else(|| on_path("ruby-lsp"))
             .map(|exe| (exe, vec![])),
+        "terraform" => local("bin/terraform-ls")
+            .or_else(|| on_path("terraform-ls"))
+            .map(|exe| (exe, vec!["serve".to_string()])),
         _ => None,
     };
     // The user's own toolchain wins; termic's download is the fallback, not
@@ -14662,6 +14696,21 @@ async fn lsp_install(language: String) -> Result<String, String> {
     }
     let asset = lsp_resolve_asset(&spec).await;
     lsp_install_version(&language, &spec, &asset).await
+}
+
+/// Unpack the two fixed payload files from a checksum-verified server ZIP.
+fn lsp_unpack_zip(bytes: &[u8], staging: &Path, exe: &str) -> Result<(), String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| e.to_string())?;
+    // Names come from the compiled-in manifest, never archive entries. Copy
+    // only the executable and its licence as regular files; an archive path
+    // or symlink can never write outside the staging directory.
+    for name in [exe, "LICENSE.txt"] {
+        let mut entry = archive.by_name(name).map_err(|e| format!("{name}: {e}"))?;
+        let mut out = fs::File::create(staging.join(name)).map_err(|e| e.to_string())?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Download one resolved asset, verify it, unpack it, and return its
@@ -14750,6 +14799,7 @@ async fn lsp_install_version(
                     let dec = GzDecoder::new(std::io::Cursor::new(&bytes[..]));
                     tar::Archive::new(dec).unpack(&staging).map_err(|e| e.to_string())?;
                 }
+                "zip" => lsp_unpack_zip(&bytes, &staging, exe_rel)?,
                 other => return Err(format!("unknown archive kind: {other}")),
             }
             Ok(())
@@ -15123,6 +15173,19 @@ async fn lsp_catalog() -> Vec<LspCatalogEntry> {
             exe: seek("ruby-lsp"),
             version: None,
             note: "The project's own binstub (`bundle binstubs ruby-lsp`) is used before any copy on your PATH, because a Rails app's gems are the point. Otherwise `gem install ruby-lsp`.",
+        }],
+    });
+
+    let (tf_installed, tf_version) = downloadable("terraform");
+    out.push(LspCatalogEntry {
+        language: "terraform".into(),
+        label: "Terraform",
+        servers: vec![LspCatalogServer {
+            name: "terraform-ls".into(),
+            source: "downloaded",
+            exe: seek("terraform-ls").or(tf_installed),
+            version: tf_version,
+            note: "Project bin/terraform-ls, then PATH, then termic's checksum-verified download. Downloaded only on request. Serves .tf and .tfvars, not arbitrary HCL or Terraform JSON files.",
         }],
     });
 
@@ -24465,11 +24528,23 @@ mod tests {
     }
 
     #[test]
+    fn terraform_uses_the_project_server_with_serve() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("bin")).unwrap();
+        let local = dir.path().join("bin/terraform-ls");
+        fs::write(&local, "#!/bin/sh\n").unwrap();
+        let (exe, args) = lsp_resolve_server(dir.path(), "terraform").unwrap();
+        assert_eq!(Path::new(&exe), local);
+        assert_eq!(args, vec!["serve"]);
+        assert!(lsp_resolve_server(dir.path(), "hcl").is_none());
+    }
+
+    #[test]
     fn every_pinned_server_names_a_digest_and_a_payload() {
         // A pin with an empty digest would download and run an unverified
         // binary against the user's source. The shape is checked here because
         // the list is edited by hand on every upstream release.
-        for lang in ["typescript", "python", "rust"] {
+        for lang in ["typescript", "python", "rust", "terraform"] {
             let spec = lsp_install_spec(lang)
                 .unwrap_or_else(|| panic!("no pinned server for {lang} on this platform"));
             assert_eq!(spec.sha256.len(), 64, "{lang}: not a sha256");
@@ -24481,13 +24556,45 @@ mod tests {
             assert!(!spec.url.contains("/latest/"), "{lang}: unpinned url");
             assert!(spec.url.contains(spec.version), "{lang}: url does not carry the pinned version");
             assert!(spec.bytes > 1_000_000, "{lang}: implausible size");
-            assert!(matches!(spec.archive, "gz" | "tar.gz"), "{lang}: unknown archive kind");
+            assert!(matches!(spec.archive, "gz" | "tar.gz" | "zip"), "{lang}: unknown archive kind");
             if spec.archive == "gz" {
                 assert!(spec.exe_in_archive.is_empty(), "{lang}: a bare gz has no inner path");
             } else {
                 assert!(!spec.exe_in_archive.is_empty(), "{lang}: an archive needs its exe path");
             }
         }
+    }
+
+    #[test]
+    fn terraform_zip_copies_only_the_binary_and_license() {
+        use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+        let dir = tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, text) in [("terraform-ls", "server"), ("LICENSE.txt", "licence"), ("../escaped", "bad")] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        lsp_unpack_zip(&bytes, &staging, "terraform-ls").unwrap();
+        assert_eq!(fs::read_to_string(staging.join("terraform-ls")).unwrap(), "server");
+        assert_eq!(fs::read_to_string(staging.join("LICENSE.txt")).unwrap(), "licence");
+        assert!(!dir.path().join("escaped").exists());
+        assert!(lsp_unpack_zip(&bytes, &staging, "missing").is_err());
+        assert!(lsp_unpack_zip(b"not a zip", &staging, "terraform-ls").is_err());
+    }
+
+    #[test]
+    fn terraform_download_uses_the_tested_pin_without_a_release_api() {
+        let spec = lsp_install_spec("terraform").unwrap();
+        assert!(spec.repo.is_empty());
+        let asset = tauri::async_runtime::block_on(lsp_resolve_asset(&spec));
+        assert!(asset.pinned);
+        assert_eq!(asset.url, spec.url);
+        assert_eq!(asset.sha256, spec.sha256);
+        assert_eq!(spec.args, ["serve"]);
     }
 
     #[test]

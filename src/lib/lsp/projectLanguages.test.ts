@@ -80,6 +80,13 @@ describe("what is worth OFFERING, which is a laxer question", () => {
 });
 
 describe("the languages added after the first four", () => {
+  it("detects Terraform without treating arbitrary HCL or JSON as Terraform", () => {
+    expect(projectLanguages([".terraform.lock.hcl"])).toEqual(["terraform"]);
+    expect(projectLanguages(["main.tf", "variables.tf", "prod.auto.tfvars"])).toEqual(["terraform"]);
+    expect(languagesPresent(["main.tf"])).toEqual(["terraform"]);
+    expect(languagesPresent(["terragrunt.hcl", "main.tf.json", "prod.tfvars.json"])).toEqual([]);
+  });
+
   it("reads a C or C++ project from its build system and its sources", () => {
     // One server answers for the whole C family, so all of these are "cpp".
     expect(projectLanguages(["CMakeLists.txt"])).toContain("cpp");

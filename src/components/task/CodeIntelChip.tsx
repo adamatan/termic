@@ -36,10 +36,11 @@ import { PopoverRoot, PopoverTrigger, PopoverContent } from "@/components/ui/Pop
 import { CodeIntelActions } from "./CodeIntelActions";
 import { useUI } from "@/store/ui";
 
-export function CodeIntelChip({ task, registryName }: {
+export function CodeIntelChip({ task, registryName, path }: {
   task: Task;
   /** CodeMirror registry name for the buffer being edited. */
   registryName: string;
+  path: string;
 }) {
   const offered = usePrefs(s => s.codeIntelligence);
   const askFirst = usePrefs(s => s.confirmBeforeCodeIntel);
@@ -50,7 +51,7 @@ export function CodeIntelChip({ task, registryName }: {
   const setAskFirst = usePrefs(s => s.setConfirmBeforeCodeIntel);
   const project = useApp(s => s.projects.find(p => p.id === task.project_id)) as Project | undefined;
   const root = checkoutRoot(task, project);
-  const server = lspServerFor(registryName);
+  const server = lspServerFor(registryName, path);
   // This checkout AND this language: a Django repo's Python and JavaScript are
   // two separate decisions, because they are two separate processes with two
   // separate memory bills.

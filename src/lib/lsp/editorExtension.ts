@@ -97,8 +97,8 @@ export interface CodeIntelTarget {
 export async function codeIntelExtension(
   target: CodeIntelTarget,
 ): Promise<{ extension: Extension; release: () => void } | null> {
-  const server = lspServerFor(target.registryName);
-  const languageId = lspLanguageId(target.registryName);
+  const server = lspServerFor(target.registryName, target.absPath);
+  const languageId = lspLanguageId(target.registryName, target.absPath);
   if (!server || !languageId) return null;
 
   const { client, release } = acquireClient(target.root, server);

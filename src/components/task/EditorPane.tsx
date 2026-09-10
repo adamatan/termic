@@ -532,7 +532,7 @@ export function EditorPane({ task, tab, active, onContent }: {
               // can serve, and says so plainly for one nothing can. Silence
               // was the old behaviour and it reads as a broken editor.
               // Main-chunk safe by construction (see lib/lsp/navHint.ts).
-              navHint(task.id, () => langIdRef.current ?? resolved.id),
+              navHint(task.id, () => langIdRef.current ?? resolved.id, tab.type === "external" ? tab.path : filePath),
               themeCompRef.current.of(
                 buildTheme(editorFontSize, codeLigatures, editorThemeId),
               ),
@@ -788,7 +788,7 @@ export function EditorPane({ task, tab, active, onContent }: {
   const navRoot = checkoutRoot(task, project);
   // Per checkout AND per language: a repo with Python and JavaScript in it is
   // two servers and two decisions, so arming one must not start the other.
-  const navServer = lspServerFor(syntaxId);
+  const navServer = lspServerFor(syntaxId, tab.type === "external" ? tab.path : filePath);
   const navArmed = useCodeIntel(s =>
     (navServer ? s.grants[grantKey(navRoot, navServer)]?.length ?? 0 : 0) > 0);
   const navOn = codeIntelOffered && navArmed && !isScratch;
