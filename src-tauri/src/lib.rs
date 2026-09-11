@@ -13464,14 +13464,51 @@ fn unique_task_name(base: &str, tasks: &[Task], project_id: &str) -> String {
     }
 }
 
+/// Task name -> the worktree directory name AND, when the caller names no
+/// branch, the branch (`task_create`).
+///
+/// Runs of dashes collapse to ONE. Every character this maps is mapped
+/// INDIVIDUALLY, so "Fix  the   bug" became `fix--the---bug` and the very
+/// ordinary "a - b" became `a---b`: a branch, and a directory, with a double
+/// dash nobody typed. `profiles::slugify` has always collapsed; this one and
+/// its frontend twin did not.
+///
+/// ASCII only, and that is the half that had to be brought into line.
+/// `is_alphanumeric` is Unicode-aware, so this kept `café` and `日本語` while
+/// the frontend's `[^a-z0-9-_]` stripped them, and the SAME task name then
+/// produced a different branch depending on which side derived it: with a
+/// branch prefix set the frontend composed `sim/` from an empty slug (not a
+/// git ref at all), and without one it sent `""` and this function silently
+/// named the branch `日本語`. A name that works or not depending on an
+/// unrelated setting is the bug; `profiles::slugify` already folded non-ASCII
+/// out of a path segment for the same reason, and this is a path segment too.
+///
+/// A name with no ASCII alphanumerics in it now slugifies to "" and is refused
+/// by the caller, with the message the CLI and quick-create already give.
+///
+/// Mirrors `slugify` in src/lib/utils.ts character for character; `utils.test.ts`
+/// and `slugify_collapses_dash_runs` pin the pair against one case list.
 fn slugify(s: &str) -> String {
-    s.trim()
+    let mapped: String = s
+        .trim()
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let mut out = String::with_capacity(mapped.len());
+    let mut prev_dash = false;
+    for c in mapped.chars() {
+        if c == '-' {
+            if !prev_dash {
+                out.push(c);
+            }
+            prev_dash = true;
+        } else {
+            out.push(c);
+            prev_dash = false;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 /// Recursively copy a file or directory. `fs::copy` ONLY handles files, so
@@ -24168,6 +24205,66 @@ mod tests {
         assert!(note.contains("bundle install"), "names the fix: {note}");
         fs::write(dir.path().join("Gemfile.lock"), "").unwrap();
         assert!(ruby_without_lockfile(dir.path()).is_none());
+    }
+
+    /// The one-dash rule, and the case list is SHARED with the frontend.
+    ///
+    /// `slugify` here names the worktree directory and, when the caller gives
+    /// no branch, the branch itself (`task_create`); `slugify` in
+    /// src/lib/utils.ts names `WORKSPACE_SLUG` from the same string. Two
+    /// implementations of one idea, so the rule is pinned on both sides
+    /// against the same inputs — `utils.test.ts` holds the twin of this list.
+    #[test]
+    fn slugify_collapses_dash_runs() {
+        // Every one of these reached a double dash by two different routes:
+        // a substituted character landing beside a typed dash, or two
+        // substituted characters landing beside each other. This one mapped
+        // every character INDIVIDUALLY, so it was the worse of the pair:
+        // "Fix  the   bug" came out `fix--the---bug`.
+        for (input, want) in [
+            ("a - b", "a-b"),
+            ("Fix - auth bug", "fix-auth-bug"),
+            ("a--b", "a-b"),
+            ("fix -- auth", "fix-auth"),
+            ("a------b", "a-b"),
+            ("Fix  the   bug", "fix-the-bug"),
+            ("  --lead", "lead"),
+            ("trail--  ", "trail"),
+            ("---", ""),
+            ("a__b", "a__b"),
+            ("a_-_b", "a_-_b"),
+            // ASCII only, same as the frontend. `is_alphanumeric` is
+            // Unicode-aware and kept these, which is how one task name got two
+            // different branches depending on which side derived it.
+            ("café crème", "caf-cr-me"),
+            ("naïve", "na-ve"),
+            ("mă-duc", "m-duc"),
+            ("🚀 ship it", "ship-it"),
+            ("日本語 heading", "heading"),
+        ] {
+            let got = slugify(input);
+            assert_eq!(got, want, "slugify({input:?})");
+            assert!(!got.contains("--"), "slugify({input:?}) kept a double dash: {got:?}");
+        }
+    }
+
+    /// A name that slugifies to nothing still slugifies to nothing.
+    ///
+    /// `task_create` refuses an empty slug on purpose: `wt_root.join("")` is
+    /// `wt_root`, which exists, and the orphan cleanup would then
+    /// `remove_dir_all` every worktree in the project. Collapsing must not
+    /// turn an all-punctuation name into a bare dash that passes that guard.
+    #[test]
+    fn slugify_still_refuses_to_invent_a_name() {
+        for input in [
+            "", "   ", "!!!", "---", " - - - ", "///",
+            // A name with no ASCII alphanumerics is refused rather than
+            // turned into a branch nobody can type. This used to slip through
+            // here (Unicode-aware) while the frontend refused it.
+            "日本語", "Привет мир", "🚀",
+        ] {
+            assert_eq!(slugify(input), "", "slugify({input:?})");
+        }
     }
 
     #[test]

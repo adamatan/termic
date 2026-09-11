@@ -107,6 +107,70 @@ describe("create task wizard", () => {
     await snap("create-wizard.png");
   });
 
+  // A name that slugs away to nothing. Branch names are a-z0-9-_ (the slug is
+  // a worktree DIRECTORY as well as a git ref), so a non-Latin name leaves
+  // nothing to build one from. This used to compose `sim/` from the prefix and
+  // an empty slug, which is not a ref at all, and the create died several
+  // layers down in git's own words; without a prefix it sent "" and Rust
+  // silently named the branch `日本語` instead. Now: no branch, Create
+  // disabled, and a sentence saying why at the field that is empty.
+  it("says why a name with no a-z0-9 in it cannot become a branch", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+
+    await browser.execute(() => {
+      const proj = window.__termic!.useApp
+        .getState()
+        .projects.find((p: any) => p.name === "fixture-repo");
+      window.__termic!.useUI.getState().openNewTask(proj.id);
+    });
+    await browser.waitUntil(
+      () => browser.execute(() =>
+        !!document.querySelector('[role="dialog"] input[placeholder="fix login bug"]')),
+      { timeout: 8_000, timeoutMsg: "NewTaskDialog never opened" },
+    );
+    // Worktree mode: the branch field only exists there.
+    await clickDialogButton("Worktree");
+
+    const typeName = (value: string) => browser.execute((v) => {
+      const input = document.querySelector(
+        '[role="dialog"] input[placeholder="fix login bug"]',
+      ) as HTMLInputElement;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, "value",
+      )!.set!;
+      setter.call(input, v);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }, value);
+
+    const branchValue = () => browser.execute(() =>
+      (document.querySelector(
+        '[role="dialog"] input[placeholder="feature/fix-login-bug"]',
+      ) as HTMLInputElement | null)?.value ?? null);
+    const createDisabled = () => browser.execute(() =>
+      [...document.querySelectorAll('[role="dialog"] button, button[form="new-task-form"]')]
+        .find(b => b.textContent?.trim() === "Create")?.hasAttribute("disabled") ?? null);
+
+    await typeName("日本語");
+    await waitVisible('[data-testid="name-unslugabble"]');
+    expect(await branchValue()).toBe("");
+    expect(await createDisabled()).toBe(true);
+    const warning = await browser.execute(() =>
+      (document.querySelector('[data-testid="name-unslugabble"]') as HTMLElement)?.innerText ?? "");
+    expect(warning).toContain("at least one letter or number");
+    await snap("new-task-unslugabble.png");
+
+    // An ASCII name clears it and derives a branch again, so the warning is
+    // about THIS name rather than a state the dialog gets stuck in.
+    await typeName("fix login bug");
+    await waitGone('[data-testid="name-unslugabble"]');
+    expect(await branchValue()).toMatch(/fix-login-bug$/);
+    expect(await createDisabled()).toBe(false);
+
+    // Nothing was created, so there is nothing to clean up.
+    await clickDialogButton("Cancel");
+  });
+
   // GH #242: worktree creation used to lock the whole window behind this
   // dialog until `git worktree add` + the file copy finished. Prove the fix
   // at the UI level — the dialog is gone the instant Create is clicked, not
@@ -1050,16 +1114,23 @@ const BRANCH = "e2e-wt-branch";
 
 describe("worktree task", () => {
   let taskId!: string;
+  // The derived-branch case below names no branch, so it cannot be cleaned up
+  // by a constant: whatever Rust derived is what has to be deleted.
+  let derivedId: string | undefined;
+  let derivedBranchName: string | undefined;
   after(async () => {
-    if (taskId) {
-      await browser.execute(async (id) => {
-        await window.__termic!.ipc.taskArchive(id, true); // deleteBranch
+    for (const id of [taskId, derivedId]) {
+      if (!id) continue;
+      await browser.execute(async (i) => {
+        await window.__termic!.ipc.taskArchive(i, true); // deleteBranch
         await window.__termic!.useApp.getState().loadAll();
-      }, taskId);
+      }, id);
     }
     try {
       execSync(`git -C "${fixture}" worktree prune`);
-      execSync(`git -C "${fixture}" branch -D ${BRANCH}`, { stdio: "ignore" });
+      for (const b of [BRANCH, derivedBranchName]) {
+        if (b) execSync(`git -C "${fixture}" branch -D ${b}`, { stdio: "ignore" });
+      }
     } catch {
       /* already gone */
     }
@@ -1088,6 +1159,43 @@ describe("worktree task", () => {
     expect((t as any).branch).toBe(BRANCH);
     expect((t as any).is_main_checkout).not.toBe(true);
     await snap("worktree-task.png");
+  });
+
+  // Every other create in this suite hands `task_create` an explicit branch,
+  // so the DERIVATION had no coverage at all: `slugify` in lib.rs is what
+  // names the branch (and the worktree directory) when the caller names none,
+  // and it mapped each character on its own. A perfectly ordinary task name
+  // with a dash in it produced `e2e-wt---dash-rule`, on disk and in git.
+  it("derives a branch from the name without ever doubling a dash", async () => {
+    const t = await browser.execute(async () => {
+      const proj = window.__termic!.useApp
+        .getState()
+        .projects.find((p: any) => p.name === "fixture-repo");
+      const task = await window.__termic!.ipc.taskCreate({
+        project_id: proj.id,
+        // A space, a typed dash and a space: three separate substitutions,
+        // which is how the run of dashes used to appear.
+        name: "e2e wt - dash rule",
+        cli: "fakeagent",
+        base_branch: "main",
+        // No branch. This is the whole point of the case.
+      });
+      await window.__termic!.useApp.getState().loadAll();
+      return task;
+    });
+    derivedId = (t as any).id;
+    derivedBranchName = (t as any).branch;
+
+    expect(derivedBranchName).toBe("e2e-wt-dash-rule");
+    // Asserted separately from the equality: the rule is "no two dashes in a
+    // row", and it has to hold for any name, not just this one.
+    expect(derivedBranchName).not.toMatch(/--/);
+    // git agrees the branch is really there under that name, and the worktree
+    // directory took the same slug rather than a differently-dashed one.
+    execSync(`git -C "${fixture}" rev-parse --verify refs/heads/${derivedBranchName}`, {
+      stdio: "ignore",
+    });
+    expect(path.basename((t as any).path)).toBe("e2e-wt-dash-rule");
   });
 
   // The case above passes an explicit base ("main"). The PRIMARY path uses the

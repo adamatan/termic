@@ -40,13 +40,20 @@ export function writeNewTaskMode(mode: NewTaskMode) {
 /** Auto-derive a worktree branch from the task name, matching the New Task
  *  dialog exactly: an already-qualified name (contains "/") is branchified
  *  as-is; otherwise `<branchPrefix>/<slug>` (a blank prefix yields a bare
- *  slug). This is what we seed the editable branch field with. */
+ *  slug). This is what we seed the editable branch field with.
+ *
+ *  Empty in, empty OUT, and that includes a name that slugifies away: a
+ *  prefix plus an empty slug composed `sim/`, which is not a git ref, and
+ *  nothing noticed until `git branch` failed with its own wording several
+ *  layers down. The caller refuses an empty branch with the message the CLI
+ *  and quick-create already use. */
 export function derivedBranch(name: string, branchPrefix: string): string {
   const trimmed = name.trim();
   if (!trimmed) return "";
   if (trimmed.includes("/")) return branchify(trimmed);
-  const prefix = branchPrefix.trim().replace(/^\/+|\/+$/g, "");
   const slug = slugify(trimmed);
+  if (!slug) return "";
+  const prefix = branchPrefix.trim().replace(/^\/+|\/+$/g, "");
   return prefix ? `${prefix}/${slug}` : slug;
 }
 

@@ -192,8 +192,16 @@ export function RaceDialog() {
             value={branchMid}
             // Sanitize like slugify but WITHOUT trimming edge dashes, or a
             // dash would vanish as it's typed. startRace slugifies fully.
+            //
+            // Dash RUNS do collapse here, unlike edge dashes: slugify drops
+            // them on the way to the branch, so leaving them in the field
+            // would show a `race/a--b/claude-1` that is never created. A
+            // second dash appearing to do nothing is the honest answer, since
+            // a second dash cannot reach a branch name.
             onChange={e => {
-              setBranchMid(e.target.value.toLowerCase().replace(/[^a-z0-9-_]+/g, "-"));
+              setBranchMid(
+                e.target.value.toLowerCase().replace(/[^a-z0-9-_]+/g, "-").replace(/-{2,}/g, "-"),
+              );
               setBranchEdited(true);
             }}
             placeholder="auto"

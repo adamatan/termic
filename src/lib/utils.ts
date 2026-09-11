@@ -4,9 +4,22 @@ import { twMerge } from "tailwind-merge";
 /** Combine conditional Tailwind classes; later wins on conflicts. */
 export function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)); }
 
-/** "user input" → "user-input"; strips diacritics-ish + lowercases. */
+/** "user input" → "user-input"; strips diacritics-ish + lowercases.
+ *
+ *  Runs of dashes collapse to ONE. The `+` above only collapses a run of
+ *  characters it REPLACES, and `-` is a character it keeps, so anything that
+ *  put dashes next to each other by two different routes got through: the
+ *  ordinary task name "a - b" slugified to "a---b" (space, kept dash, space)
+ *  and became a branch called that. `mă-duc` did the same through a stripped
+ *  letter. Mirrors `slugify` in src-tauri/src/lib.rs, which derives the
+ *  worktree DIRECTORY from the same name (`utils.test.ts` and lib.rs's
+ *  `slugify_collapses_dash_runs` pin the pair against one case list). */
 export function slugify(s: string) {
-  return s.toLowerCase().replace(/[^a-z0-9-_]+/g, "-").replace(/^-+|-+$/g, "");
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9-_]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 /** Like {@link slugify} but PRESERVES slashes, so an already-qualified

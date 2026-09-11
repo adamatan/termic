@@ -550,6 +550,11 @@ export function NewTaskDialog() {
     () => uniqueBranch(derivedBranch(name, branchPrefix), existingBranches),
     [name, branchPrefix, existingBranches],
   );
+  // The name is real but derives no branch at all: every character of it is
+  // outside a-z0-9-_ (an all-punctuation name, or a non-Latin script, which
+  // `slugify` folds out because the slug is a path segment as well as a ref).
+  // Only when the user has not typed their own branch — theirs is theirs.
+  const nameSlugsAway = !!name.trim() && !derived && !branchEdited;
   useEffect(() => { if (!branchEdited) setBranch(derived); }, [derived, branchEdited]);
 
   // Load the project's importable (existing, unopened) worktrees.
@@ -1099,12 +1104,24 @@ export function NewTaskDialog() {
               branch from Linear (“username/my-feature”) is a true one-shot:
               select all, paste, done. No prefix control to fight (#15). */}
           <FieldInline label="Branch name" hint="Auto-fills from the name.">
-            <Input
-              value={branch}
-              onChange={e => { setBranch(e.target.value); setBranchEdited(true); }}
-              placeholder="feature/fix-login-bug"
-              required
-            />
+            <div className="flex flex-col gap-1">
+              <Input
+                value={branch}
+                onChange={e => { setBranch(e.target.value); setBranchEdited(true); }}
+                placeholder="feature/fix-login-bug"
+                required
+              />
+              {/* A name with nothing a branch can be made of. Create is already
+                  disabled on an empty branch, but a dead button explains
+                  nothing: the name looks perfectly good to the person who
+                  typed it. Same sentence the CLI and quick-create give, at the
+                  field that is actually empty. */}
+              {nameSlugsAway && (
+                <p data-testid="name-unslugabble" className="text-[11.5px] text-[var(--color-warn)]">
+                  Task name must contain at least one letter or number. Branch names are a-z, 0-9, dash and underscore, so "{name.trim()}" leaves nothing to build one from. Type a branch name here to use it anyway.
+                </p>
+              )}
+            </div>
           </FieldInline>
 
           {/* The multi-repo host variant's hint is a full sentence (members

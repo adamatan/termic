@@ -68,13 +68,19 @@ export function resolveTaskHref(baseDir: string, href: string, memberDirs: reado
 
 /** GitHub-style heading slug for `#anchor` matching: lowercase, collapse
  *  whitespace runs to a single dash, then drop everything but Unicode
- *  letters/numbers/dash/underscore. Deliberately NOT the same as utils.ts
- *  `slugify` (which also collapses punctuation runs to a single dash):
- *  anchors copied from GitHub keep the double dash a removed punctuation
- *  char leaves behind, e.g. "Step 04 — x" slugs to "step-04--x" (the
- *  em-dash sits between two independently-collapsed whitespace runs, so it
- *  disappears without merging them). Unicode-aware so non-ASCII headings
- *  (e.g. "café") keep their letters instead of being stripped to "caf". */
+ *  letters/numbers/dash/underscore.
+ *
+ *  **This one KEEPS a double dash, and must.** utils.ts `slugify` collapses
+ *  every run of dashes to one, because a slug there becomes a branch name;
+ *  the two rules are opposite on purpose and unifying them would break every
+ *  anchor of this shape. "Step 04 — x" slugs to "step-04--x" here: the
+ *  em-dash sits between two independently-collapsed whitespace runs, so
+ *  removing it leaves both dashes behind, and that is the anchor GitHub
+ *  itself generates and that people copy out of its UI. A link that does not
+ *  match is a link that does not scroll.
+ *
+ *  Unicode-aware so non-ASCII headings (e.g. "café") keep their letters
+ *  instead of being stripped to "caf". */
 export function headingSlug(text: string): string {
   return text
     .trim()
