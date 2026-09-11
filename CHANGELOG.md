@@ -4,6 +4,41 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
+## [1.3.7] - 2026-09-11
+
+Terraform support, per-task agent parameters, and two fixes worth having.
+
+### Features
+- **Terraform.** Syntax highlighting for `.tf`, `.tfvars` and `.hcl` in the
+  editor and the diff viewer, and Terraform joins the languages code
+  navigation can serve: go to definition, find usages, hover types and
+  diagnostics through terraform-ls. Opt-in like every other language, and it
+  will not download a server or run any Terraform command until you ask it to.
+  Thanks to [@yb-yu](https://github.com/yb-yu), who reported it and then built
+  it. ([#289](https://github.com/simion/termic/issues/289))
+- **Per-task agent parameters from the CLI.** `termic new` can now set the
+  model and extra arguments for the agent it starts, without touching the
+  agent's shared Settings: `termic new planner --agent codex --model <id>`, and
+  `--arg` (repeatable) for anything else the CLI takes. A planner task can run
+  a stronger model while the workers it fans out to stay cheap, which is the
+  case that prompted it. Thanks to [@adamatan](https://github.com/adamatan).
+  ([#287](https://github.com/simion/termic/issues/287))
+
+### Bug fixes
+- **A Codex tab could quietly start a fresh session instead of resuming
+  yours.** If anything else still had that conversation open, Codex refuses to
+  reopen it, and Termic was not reading the refusal: the tab started a new
+  session, said nothing about it, and pressing R did the same thing again. The
+  failure is now noticed and reported, and Termic stops retrying the session id
+  that failed. If you hit this, closing the tab and opening a new one is the
+  way back.
+  ([#291](https://github.com/simion/termic/issues/291))
+- **Branch names could carry two dashes in a row.** A task called "fix - auth
+  bug" became the branch `fix---auth-bug`, and the worktree directory took the
+  same name. A run of dashes now collapses to one, in both the branch and the
+  directory, and a name that leaves nothing to build a branch from says so in
+  the New task dialog instead of failing later in git's own words.
+
 ## [1.3.6] - 2026-09-09
 
 Open a task's folder in any app, plus a profiles fix that moved projects.
