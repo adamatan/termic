@@ -19,7 +19,7 @@ import { uriToPath } from "./workspace";
 export const KIND_LABEL: Record<number, string> = {
   2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method",
   7: "property", 8: "field", 9: "constructor", 10: "enum", 11: "interface",
-  12: "function", 13: "variable", 14: "constant",
+  12: "function", 13: "variable", 14: "constant", 15: "string",
   22: "enum member", 23: "struct", 26: "type",
 };
 
@@ -43,8 +43,18 @@ const TYPE_KINDS = new Set([5, 10, 11, 23, 26]);
  *
  * A genuine module-level constant is a variable too, which is why this is only
  * half the rule: see `preferDefinitions`.
+ *
+ * 15 (String) is here for the same reason, found later and in another
+ * language. terraform-ls answers a `.tfvars` file with one String symbol per
+ * assignment, named for the variable and located at the line that sets it, so
+ * a module with dev/stage/prod tfvars answers `Store` with three rows that all
+ * match the query EXACTLY while the `variable "Store"` block that declares it
+ * matches only as a substring. Measured on terraform-ls 0.39.0: the three
+ * assignments led and the declaration came last. An assignment is a binding
+ * whatever the protocol calls it, and nothing else termic serves has ever
+ * answered `workspace/symbol` with a String at all.
  */
-const BINDING_KINDS = new Set([13, 14]);
+const BINDING_KINDS = new Set([13, 14, 15]);
 
 export interface SymbolHit {
   name: string;
@@ -257,11 +267,35 @@ export function keepMatching(hits: SymbolHit[], query: string): SymbolHit[] {
  */
 export function preferDefinitions(hits: SymbolHit[]): SymbolHit[] {
   const defined = new Set<string>();
-  for (const h of hits) if (!BINDING_KINDS.has(h.kindCode)) defined.add(h.name);
+  for (const h of hits) {
+    if (BINDING_KINDS.has(h.kindCode)) continue;
+    for (const name of definedNames(h)) defined.add(name);
+  }
   const kept = defined.size
     ? hits.filter(h => !BINDING_KINDS.has(h.kindCode) || !defined.has(h.name))
     : hits;
   return collapseRepeatedBindings(kept);
+}
+
+/**
+ * Every name a row is the definition OF. Its own, nearly always.
+ *
+ * terraform-ls is the exception, and it is not a quirk: it names a symbol the
+ * way the block is written, so the row declaring `region` is called
+ * `variable "region"` and the row declaring a bucket is called
+ * `resource "aws_s3_bucket" "logs"`. On name equality the declaration of
+ * `region` is not a definition of `region`, so every assignment of it in a
+ * `.tfvars` file survives the filter above and outranks it.
+ *
+ * The full name is KEPT as well as split, rather than normalised down to the
+ * last label. `aws_s3_bucket` is how somebody looks for the S3 bucket in a
+ * module they did not write, and it is the half that normalising would throw
+ * away. A quoted segment inside a workspace symbol's name is HCL's alone: no
+ * other server termic ships has ever produced one.
+ */
+function definedNames(hit: SymbolHit): string[] {
+  const labels = hit.name.match(/"[^"\n]+"/g);
+  return labels ? [hit.name, ...labels.map(l => l.slice(1, -1))] : [hit.name];
 }
 
 /**

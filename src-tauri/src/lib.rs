@@ -15428,6 +15428,82 @@ fn cpp_without_compile_commands(root: &Path) -> Option<String> {
     })
 }
 
+/// A Terraform module that calls a remote module and has never been
+/// initialised.
+///
+/// Observed on terraform-ls 0.39.0, with the control run both ways. Provider
+/// schemas are NOT the problem, which is the part worth knowing: hover on
+/// `resource "aws_eks_cluster"` answers `hashicorp/aws 6.56.0` on a checkout
+/// with no `.terraform` at all, because the server carries the big providers'
+/// schemas itself. Modules are. With `source = "terraform-aws-modules/vpc/aws"`
+/// and nothing unpacked, hover on `module.vpc.vpc_id` returns null and there is
+/// nothing to go to; put a `.terraform/modules` in place and the same hover
+/// answers with the output's own description. A local `source = "./modules/vpc"`
+/// answers either way, which is what makes this about the ones init downloads
+/// rather than about modules in general.
+///
+/// Cheap on purpose: only the `.tf` files at the top of the checkout, which is
+/// where a root module's `module` blocks live.
+fn terraform_without_init(root: &Path) -> Option<String> {
+    if root.join(".terraform").join("modules").is_dir() {
+        return None;
+    }
+    let mut remote: Option<String> = None;
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("tf") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else { continue };
+        if let Some(source) = first_remote_module_source(&text) {
+            remote = Some(source);
+            break;
+        }
+    }
+    let source = remote?;
+    Some(format!(
+        "This module calls `{source}`, which has not been downloaded here: with no \
+         .terraform/modules directory there is nothing behind a `module.` reference to hover or \
+         go to. `terraform init` in this checkout fixes it. Providers are fine either way, the \
+         server carries their schemas itself."
+    ))
+}
+
+/// The source of the first `module` block in one file whose source is not a
+/// path. A local module (`./modules/vpc`) is on disk already and answers
+/// without init; a registry or git source is what has to be fetched.
+///
+/// Deliberately only inside a `module` block: a resource with its own
+/// `source`-shaped attribute is not a module call.
+fn first_remote_module_source(text: &str) -> Option<String> {
+    let mut in_module = false;
+    let mut depth = 0i32;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !in_module {
+            if trimmed.starts_with("module ") || trimmed.starts_with("module\t") {
+                in_module = true;
+                depth = 0;
+            } else {
+                continue;
+            }
+        }
+        depth += trimmed.matches('{').count() as i32;
+        depth -= trimmed.matches('}').count() as i32;
+        if let Some(rest) = trimmed.strip_prefix("source") {
+            if let Some(value) = rest.trim_start().strip_prefix('=') {
+                let value = value.trim().trim_matches('"');
+                if !value.is_empty() && !value.starts_with("./") && !value.starts_with("../") {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        if depth <= 0 {
+            in_module = false;
+        }
+    }
+    None
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LspOffer {
@@ -15474,6 +15550,7 @@ async fn lsp_offer(
         "cpp" => cpp_without_compile_commands(&root_buf),
         "ruby" => ruby_without_lockfile(&root_buf),
         "swift" => swift_without_a_build(&root_buf),
+        "terraform" => terraform_without_init(&root_buf),
         _ => None,
     };
     Ok(LspOffer {
@@ -24265,6 +24342,49 @@ mod tests {
         ] {
             assert_eq!(slugify(input), "", "slugify({input:?})");
         }
+    }
+
+    #[test]
+    fn an_uninitialised_terraform_module_says_so() {
+        // The control was run both ways against terraform-ls 0.39.0: hover on
+        // `module.vpc.vpc_id` answers null with no .terraform/modules, and
+        // answers the module output's own description once one exists.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(terraform_without_init(dir.path()).is_none(), "no .tf files, nothing to say");
+
+        fs::write(
+            dir.path().join("main.tf"),
+            "module \"vpc\" {\n  source  = \"terraform-aws-modules/vpc/aws\"\n  version = \"5.0.0\"\n}\n",
+        )
+        .unwrap();
+        let note = terraform_without_init(dir.path()).expect("a caveat");
+        assert!(note.contains("terraform init"), "names the fix: {note}");
+        assert!(note.contains("terraform-aws-modules/vpc/aws"), "names the module: {note}");
+
+        fs::create_dir_all(dir.path().join(".terraform").join("modules")).unwrap();
+        assert!(terraform_without_init(dir.path()).is_none());
+    }
+
+    #[test]
+    fn a_terraform_module_with_only_local_sources_gets_no_caveat() {
+        // A local module is on disk already: measured, hover and definition
+        // both answer through `source = "./modules/vpc"` with no init at all,
+        // so saying otherwise sends someone to run a command they do not need.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.tf"),
+            "module \"vpc\" {\n  source = \"./modules/vpc\"\n}\n\nmodule \"up\" {\n  source = \"../shared\"\n}\n",
+        )
+        .unwrap();
+        assert!(terraform_without_init(dir.path()).is_none());
+
+        // A resource with its own `source`-shaped attribute is not a module.
+        fs::write(
+            dir.path().join("other.tf"),
+            "resource \"null_resource\" \"x\" {\n  triggers = {\n    source = \"registry.example.com/a/b\"\n  }\n}\n",
+        )
+        .unwrap();
+        assert!(terraform_without_init(dir.path()).is_none(), "only `module` blocks count");
     }
 
     #[test]

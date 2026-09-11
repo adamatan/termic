@@ -214,6 +214,30 @@ somewhere in the answer, and keeps them when it is not (a constant, or
 something from a dependency the server cannot see into, where the import site
 is the only place to go).
 
+**Terraform is the same bug wearing a different mask**, and it took two things
+to fix rather than one. terraform-ls answers a `.tfvars` file with a String
+symbol (kind 15) per assignment, named for the variable and located at the line
+that sets it, so a module with dev / stage / prod tfvars answers `Store` with
+three rows that match the query EXACTLY while the `variable "Store"` block that
+declares it matches only as a substring. Measured: the three assignments led
+and the declaration came last.
+
+- **Kind 15 counts as a binding.** An assignment is a binding whatever the
+  protocol calls it. Nothing else termic serves has ever answered
+  `workspace/symbol` with a String at all, which is what makes that safe.
+- **A row can define a name that is not its own.** terraform-ls names a symbol
+  the way the block is written, so on name equality the declaration of `region`
+  is not a definition of `region`. `definedNames` splits a block's quoted
+  labels out and keeps the full name too: `aws_s3_bucket` is how somebody looks
+  for the S3 bucket in a module they did not write, and normalising the name
+  down to its last label would throw that half away.
+
+Neither half works alone, and the fixture is what keeps them honest: the
+recorded answer only contains the offending row because
+`e2e/fixtures/lsp-projects/terraform` has a `terraform.tfvars` in it. A
+Terraform fixture without one records a single symbol and the whole failure is
+invisible.
+
 ### 11. Follow a declaration to its source
 
 Servers resolve imports through type stubs, so ⌘-clicking a Django model lands
@@ -455,7 +479,19 @@ exits, before answering `initialize`. From inside the app that is
 indistinguishable from a server that failed to start, and the fix is one
 command. `lsp_offer` therefore carries `ruby_without_lockfile`, next to
 `django_without_stubs`, `typescript_without_tsconfig`,
-`cpp_without_compile_commands` and `swift_without_a_build`.
+`cpp_without_compile_commands`, `swift_without_a_build` and
+`terraform_without_init`.
+
+The Terraform one is worth stating precisely, because the obvious version of it
+is wrong. Provider schemas do NOT need `terraform init`: hover on
+`resource "aws_eks_cluster"` answers `hashicorp/aws 6.56.0` on a checkout with
+no `.terraform` at all, because terraform-ls carries the big providers' schemas
+itself. MODULES do. With `source = "terraform-aws-modules/vpc/aws"` and nothing
+unpacked, hover on `module.vpc.vpc_id` returns null and there is nothing to go
+to; put a `.terraform/modules` in place and the same hover answers with the
+module output's own description. A local `source = "./modules/vpc"` answers
+either way. Control run in both directions, which is the only reason the note
+can say "providers are fine" instead of blaming init for everything.
 
 The quieter version of the same thing is a server that starts, answers, and is
 missing most of what it should know: clangd with no compilation database,

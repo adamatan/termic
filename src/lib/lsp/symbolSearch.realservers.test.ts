@@ -122,6 +122,47 @@ describe("what ⇧⇧ shows, over real server answers", () => {
     expect(out[0].file).toBe("src/components/task/EditorPane.tsx");
   });
 
+  it("terraform: a .tfvars assignment is not a declaration of the variable", () => {
+    // The Django bug in a second language, and the reason kind 15 counts as a
+    // binding. terraform-ls answers `Store` with the `variable "Store"` block
+    // that declares it AND a String symbol called `Store` at the line in
+    // terraform.tfvars that assigns it. The assignment matches the query
+    // exactly and the declaration only as a substring, so unranked it leads;
+    // a module with dev/stage/prod tfvars buries the declaration under three.
+    const { fx, hits } = load("smoke-terraform");
+    expect(hits.map(h => [h.name, h.file, h.kindCode])).toEqual([
+      ["Store", "terraform.tfvars", 15],
+      ['variable "Store"', "variables.tf", 5],
+    ]);
+
+    const out = rankSymbols(keepMatching(preferDefinitions(hits), fx.query), fx.query);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ name: 'variable "Store"', file: "variables.tf" });
+  });
+
+  it("terraform: keeps the assignment when nothing in the answer declares it", () => {
+    // The escape hatch has to hold here too. A variable set in a tfvars file
+    // and declared in a module the server did not index has no declaration to
+    // prefer, and an empty list is a worse answer than an imprecise one.
+    const hits = [
+      { name: "Store", kind: "string", kindCode: 15, path: "/repo/prod.tfvars",
+        file: "prod.tfvars", line: 1, server: "terraform" },
+    ];
+    expect(keepMatching(preferDefinitions(hits), "Store")).toHaveLength(1);
+  });
+
+  it("terraform: the resource TYPE is searchable, not just its name", () => {
+    // Why a block's name is kept whole rather than normalised down to its last
+    // label: "the S3 bucket in this module" is a search for `aws_s3_bucket`,
+    // which is the half a rename would throw away.
+    const hits = [
+      { name: 'resource "aws_s3_bucket" "logs"', kind: "class", kindCode: 5,
+        path: "/repo/main.tf", file: "main.tf", line: 3, server: "terraform" },
+    ];
+    expect(keepMatching(preferDefinitions(hits), "aws_s3_bucket")).toHaveLength(1);
+    expect(keepMatching(preferDefinitions(hits), "logs")).toHaveLength(1);
+  });
+
   it("go and rust need no cleaning, and must not be damaged by it", () => {
     // Neither server reports import bindings at all: gopls answers structs,
     // fields and functions, rust-analyzer answers structs. The filter has to

@@ -6,6 +6,12 @@
  "symbolName": "variable \"Store\"",
  "symbols": [
   {
+   "name": "Store",
+   "kind": 15,
+   "file": "terraform.tfvars",
+   "line": 5
+  },
+  {
    "name": "variable \"Store\"",
    "kind": 5,
    "file": "variables.tf",
