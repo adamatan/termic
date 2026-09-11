@@ -958,6 +958,50 @@ export function decideResume(opts: {
   return { kind: "fresh" };
 }
 
+/** What a spawn actually DID about resuming, which is not the same question
+ *  `decideResume` answers.
+ *
+ *  Capture-resume agents (codex, opencode) never reach `decideResume`'s
+ *  id branch: that needs `session_id_args` AND `resume_id_args`, and these
+ *  have only the second. Their resume is composed separately, from the uuid
+ *  termic's own SessionStart hook captured, and handed to the spawn as a
+ *  resume override. Two guards downstream were written against
+ *  `decideResume`'s verdict alone and so could not see it:
+ *
+ *  - the spawn was not counted as a resume at all, so a fast exit never
+ *    reached the resume-failure recovery, and
+ *  - the recovery's "this stored id no longer resolves, clear it" branch was
+ *    gated on `kind === "resume-id"`, a verdict codex cannot produce.
+ *
+ *  Measured against codex 0.153.4: a second Codex on the same thread exits
+ *  rc=1 in 405-512 ms with "thread <id> already has an active writer", well
+ *  inside RESUME_FAILURE_MS. So the exit IS the signal, and it was being
+ *  dropped. */
+export interface SpawnResumeShape {
+  /** The spawn asked the agent to resume something, so a fast exit is a
+   *  resume failure rather than an ordinary crash. A user-typed
+   *  `resumeOverride` is deliberately NOT counted: they asked for that
+   *  specific thing, and silently retrying fresh would ignore them. */
+  isResume: boolean;
+  /** It resumed a SPECIFIC stored session id. A failure then says something
+   *  about that id, which is the only case where dropping it is the fix. */
+  usedStoredSessionId: boolean;
+}
+
+export function spawnResumeShape(opts: {
+  decision: ResumeDecision;
+  /** The composed `resume <uuid>` for a capture-resume agent, when one was
+   *  built (i.e. a uuid is stored and the last attempt did not just fail). */
+  captureResumeOverride?: string;
+}): SpawnResumeShape {
+  const captured = !!opts.captureResumeOverride;
+  const kind = opts.decision.kind;
+  return {
+    isResume: captured || kind === "cwd-resume" || kind === "resume-id",
+    usedStoredSessionId: captured || kind === "resume-id",
+  };
+}
+
 /** Compose the full args list for a spawn. Two resume modes, picked by
  *  the task shape (worktree vs repo-root) — the caller decides
  *  which mode applies and passes the right inputs:

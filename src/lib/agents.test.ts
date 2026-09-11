@@ -21,8 +21,9 @@ vi.mock("@/lib/utils", () => ({
   slugify: (s: string) => s.toLowerCase().replace(/\s+/g, "-"),
 }));
 
-import { resumeIdArgsForCli, cliSupportsCaptureResume, postLaunchCaptureForCli, spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
+import { resumeIdArgsForCli, cliSupportsCaptureResume, postLaunchCaptureForCli, spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, spawnResumeShape, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
 import type { Agent, CliInfo } from "@/lib/types";
+import type { ResumeDecision } from "@/lib/agents";
 
 // ── spawnArgsForCli ───────────────────────────────────────────────────
 
@@ -209,6 +210,71 @@ describe("spawnArgsForCli", () => {
     expect(spawnArgsForCli("claude", {
       yolo: false, resume: false, isPrimary: true, task,
     })).not.toContain("--model");
+  });
+});
+
+// ── spawnResumeShape (GH #291: codex "already has an active writer") ──
+//
+// Two guards in TerminalPane used to read `decideResume`'s verdict directly,
+// and a capture-resume agent's resume is not in that verdict: codex and
+// opencode have `resume_id_args` but no `session_id_args`, so
+// `cliSupportsIdSession` is false and `decideResume` can NEVER return
+// "resume-id" for them. Their `codex resume <uuid>` is composed separately
+// from the uuid the SessionStart hook captured.
+//
+// Reproduced against codex 0.153.4: a second Codex on the same thread exits
+// rc=1 in 405-512 ms with "thread <id> already has an active writer", well
+// inside RESUME_FAILURE_MS (2000). The exit was the signal and both guards
+// dropped it, so the tab silently started a fresh session on every spawn and
+// never said why, which is what made clicking R look like it did nothing.
+describe("spawnResumeShape", () => {
+  const shape = (kind: ResumeDecision["kind"], captureResumeOverride?: string) =>
+    spawnResumeShape({
+      decision: kind === "override"
+        ? { kind, override: "--resume x" }
+        : { kind } as ResumeDecision,
+      captureResumeOverride,
+    });
+
+  it("counts a capture-resume spawn as a resume, whatever decideResume said", () => {
+    // THE regression. A codex tab whose worktree has no `has_resumable_history`
+    // still resumes by its stored uuid, and decideResume calls that "fresh".
+    // `lastSpawnWasResumeRef` was false, so the fast-exit recovery never ran.
+    expect(shape("fresh", "resume abc").isResume).toBe(true);
+    expect(shape("cwd-resume", "resume abc").isResume).toBe(true);
+  });
+
+  it("knows a capture-resume spawn used a STORED id", () => {
+    // The other half: the "that id did not resolve, drop it and say so"
+    // branch was gated on kind === "resume-id", which codex cannot produce.
+    expect(shape("fresh", "resume abc").usedStoredSessionId).toBe(true);
+    expect(shape("resume-id").usedStoredSessionId).toBe(true);
+  });
+
+  it("still treats the id-capable agents exactly as before", () => {
+    expect(shape("resume-id")).toEqual({ isResume: true, usedStoredSessionId: true });
+    expect(shape("cwd-resume")).toEqual({ isResume: true, usedStoredSessionId: false });
+    expect(shape("mint")).toEqual({ isResume: false, usedStoredSessionId: false });
+    expect(shape("fresh")).toEqual({ isResume: false, usedStoredSessionId: false });
+  });
+
+  it("leaves a user-typed resume override alone", () => {
+    // They asked for that specific thing. Retrying fresh behind their back
+    // would ignore them, so an override is not a resume for this purpose.
+    expect(shape("override")).toEqual({ isResume: false, usedStoredSessionId: false });
+  });
+
+  it("a cwd-resume failure does not drop a stored id it never used", () => {
+    // `codex resume --last` addresses no id, so there is nothing to clear:
+    // clearing would throw away a pointer the failure said nothing about.
+    expect(shape("cwd-resume").usedStoredSessionId).toBe(false);
+  });
+
+  it("is inert once the previous resume already failed", () => {
+    // TerminalPane stops composing captureResumeOverride after a failed
+    // resume, so the retry is a fresh spawn and must not be read as one more
+    // resume attempt — that is what stops the respawn loop.
+    expect(shape("fresh", undefined)).toEqual({ isResume: false, usedStoredSessionId: false });
   });
 });
 

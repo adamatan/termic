@@ -50,7 +50,7 @@ import * as ipc from "@/lib/ipc";
 import { maybeRebuildDockerImageForLaunch } from "@/lib/dockerDailyRebuild";
 import { loginShell, loginShellArgs } from "@/lib/loginShell";
 import { usePrefs, useResolvedThemeFull, currentTerminalStack, currentTerminalTheme, currentColorFgBg, currentMinimumContrastRatio } from "@/store/prefs";
-import { spawnArgsForCli, spawnCommandForCli, tryToggleYoloLive, envForCli, agentDisplayName, cliSupportsIdSession, cliSupportsCaptureResume, postLaunchCaptureForCli, decideResume, resumeIdArgsForCli, workDoneCapable, terminalLaunchCommand, isTerminalCli, classifyAgentTitle, compileSignals, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS, STICKY_DONE_MS, ATTENTION_ECHO_MS, builtinBaseId, BUILTIN_OUTPUT_SIGNALS, resolveAgent } from "@/lib/agents";
+import { spawnArgsForCli, spawnCommandForCli, tryToggleYoloLive, envForCli, agentDisplayName, cliSupportsIdSession, cliSupportsCaptureResume, postLaunchCaptureForCli, decideResume, spawnResumeShape, resumeIdArgsForCli, workDoneCapable, terminalLaunchCommand, isTerminalCli, classifyAgentTitle, compileSignals, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS, STICKY_DONE_MS, ATTENTION_ECHO_MS, builtinBaseId, BUILTIN_OUTPUT_SIGNALS, resolveAgent } from "@/lib/agents";
 import { recordTitle, noteSubmit, noteDone } from "@/lib/agentSignalLog";
 import { MessageQueueButton } from "./MessageQueueButton";
 import { ReviewCommentsBar } from "./ReviewCommentsBar";
@@ -2028,6 +2028,11 @@ const captureArmedRef = useRef(false);
       : undefined;
     const resumeKnown = decision.kind === "resume-id";
     const shouldResume = decision.kind === "cwd-resume";
+    // What this spawn actually did about resuming. NOT `decision.kind` alone:
+    // a capture-resume agent (codex, opencode) resumes through
+    // `captureResumeOverride`, which decideResume never sees. Pure + unit
+    // tested in lib/agents.ts, for the same reason decideResume is.
+    const resumeShape = spawnResumeShape({ decision, captureResumeOverride });
 
     // PTY spawn flow needs the webview to have laid the container out first,
     // otherwise fit.fit() returns 0×0 and we spawn a PTY with garbage dims.
@@ -2066,7 +2071,7 @@ const captureArmedRef = useRef(false);
         // Override owns its own "session not found" handling (claude shows
         // the resume picker), so it never counts as a resume for the fast-
         // exit fallback — only real resume-id / cwd-resume spawns do.
-        lastSpawnWasResumeRef.current = shouldResume || (useIdResume && resumeKnown);
+        lastSpawnWasResumeRef.current = resumeShape.isResume;
         hasHistoryLocalRef.current = false;
         // Agent: resolve the executable through the registry (users can
         // repoint `claude` etc. in Settings → Agent CLIs). Shell / custom:
@@ -2449,15 +2454,24 @@ const captureArmedRef = useRef(false);
             // makes the immediate retry skip resume even before the
             // task prop refreshes.
             failedResumeRef.current = true;
-            if (decision.kind === "resume-id") {
-              // This tab's stored uuid no longer resolves, so clear the slot
-              // and let the immediate retry mint a fresh session. Say so once,
+            if (resumeShape.usedStoredSessionId) {
+              // This tab's stored uuid did not resolve, so clear the slot and
+              // let the immediate retry mint a fresh session. Say so once,
               // now: termic losing its pointer does NOT delete the transcript,
               // and every id-resuming agent has its own picker for it
-              // (`claude --resume`, `opencode session list`). We used to stash
-              // the uuid and offer a "Resume it" banner instead; it outlived
-              // the failure it described, never cleared itself, and came back
-              // on every relaunch worded as if nothing had gone wrong.
+              // (`claude --resume`, `codex resume`, `opencode session list`).
+              // We used to stash the uuid and offer a "Resume it" banner
+              // instead; it outlived the failure it described, never cleared
+              // itself, and came back on every relaunch worded as if nothing
+              // had gone wrong.
+              //
+              // Reached by codex/opencode now too. It was gated on
+              // `decision.kind === "resume-id"`, which a capture-resume agent
+              // cannot produce, so a codex tab pointed at a session it could
+              // not open started a fresh one on every spawn and never said
+              // why. Measured cause: a SECOND Codex holding the same thread
+              // ("already has an active writer"), which is what made clicking
+              // R look like it did nothing.
               useUI.getState().pushToast(
                 `Couldn't resume the previous ${agentDisplayName(tab.cli)} session. Started a fresh one.`,
                 "info",
